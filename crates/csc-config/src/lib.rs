@@ -239,7 +239,7 @@ impl Default for NetworkExtras {
 /// layout[host][edge] = neighbor
 pub type LayoutMap = BTreeMap<String, BTreeMap<String, String>>;
 
-/// One screen block on the arrangement desk. `x`/`y` are grid cells; up is negative `y`.
+/// One screen block. `x`/`y` are pixels from the keyboard host at the center; up is negative `y`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScreenPlace {
     pub name: String,

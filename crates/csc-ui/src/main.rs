@@ -69,6 +69,7 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
                 "launchAtLogin": false,
                 "hostName": "",
                 "localIpv4": [],
+                "localNics": [],
                 "discoveryPort": 24900,
                 "linkState": "",
                 "pendingPeer": null,
@@ -81,6 +82,24 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
         return Ok(cors_headers(Response::builder())
             .header(CONTENT_TYPE, "application/json")
             .body(Cow::Owned(body))?);
+    }
+
+    if path == "/logs" && method == Method::GET {
+        match ipc_client::get_logs() {
+            Ok(v) => {
+                let body = serde_json::to_vec(&v)?;
+                return Ok(cors_headers(Response::builder())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(body))?);
+            }
+            Err(e) => {
+                let body = serde_json::to_vec(&json!({"text": "", "error": e.to_string()}))?;
+                return Ok(cors_headers(Response::builder())
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(body))?);
+            }
+        }
     }
 
     if path == "/config" && method == Method::GET {

@@ -20,7 +20,7 @@ use crate::switch::SwitchController;
 use anyhow::Context;
 use csc_config::{default_config_path, default_log_path, Config};
 use csc_platform::{create_clipboard, create_input_injector, create_screen_info, query_host_net_info};
-use csc_proto::{AppStatus, ClipOfferPayload, encode_switch_leave_bin, SwitchPayload};
+use csc_proto::{AppStatus, ClipOfferPayload, LocalNic, encode_switch_leave_bin, SwitchPayload};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,18 +29,21 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-fn init_logging(cfg: &Config) -> anyhow::Result<()> {
+fn log_path_of(cfg: &Config) -> PathBuf {
+    if !cfg.log.file.is_empty() {
+        PathBuf::from(&cfg.log.file)
+    } else {
+        default_log_path()
+    }
+}
+
+fn init_logging(cfg: &Config, log_path: &std::path::Path) -> anyhow::Result<()> {
     let level = if !cfg.log.level.is_empty() {
         cfg.log.level.as_str()
     } else {
         cfg.log_level.as_str()
     };
     let filter = EnvFilter::try_new(format!("info,csc_core={level}")).unwrap_or_default();
-    let log_path = if !cfg.log.file.is_empty() {
-        PathBuf::from(&cfg.log.file)
-    } else {
-        default_log_path()
-    };
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -95,11 +98,25 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
 
-    let cfg = Config::load_or_create(&config_path)?;
-    init_logging(&cfg)?;
+    let mut cfg = Config::load_or_create(&config_path)?;
+    let log_path = log_path_of(&cfg);
+    init_logging(&cfg, &log_path)?;
     let _lock = single_instance_lock()?;
 
     let host = query_host_net_info();
+    if cfg.search_address.is_empty() {
+        if let Some(nic) = host
+            .nics
+            .iter()
+            .find(|n| n.kind == "ethernet")
+            .or(host.nics.first())
+        {
+            cfg.search_address = nic.address.clone();
+            if let Err(e) = cfg.save(&config_path) {
+                warn!("save default search address: {e:#}");
+            }
+        }
+    }
     info!(
         "Cross-SystemConnect-core starting name={} host={} ips={:?}",
         cfg.name, host.host_name, host.ipv4_addresses
@@ -127,6 +144,15 @@ async fn main() -> anyhow::Result<()> {
         launch_at_login: cfg.gui.launch_at_login,
         host_name: host.host_name.clone(),
         local_ipv4: host.ipv4_addresses.clone(),
+        local_nics: host
+            .nics
+            .iter()
+            .map(|n| LocalNic {
+                address: n.address.clone(),
+                kind: n.kind.clone(),
+                name: n.name.clone(),
+            })
+            .collect(),
         discovery_port: cfg.control_port,
         link_state: match cfg.role {
             csc_config::Role::Server => "searching".into(),
@@ -152,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         prompt: prompt.clone(),
         net_reload,
         layout_reload,
+        log_path,
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
@@ -190,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
     let mut remote_x = 0i32;
     let mut remote_y = 0i32;
     let mut tick = tokio::time::interval(Duration::from_millis(8));
+    let mut next_nic = Instant::now();
 
     loop {
         tokio::select! {
@@ -209,6 +237,22 @@ async fn main() -> anyhow::Result<()> {
                         cfg.switch_cfg.clone(),
                         ScreenLayout::load(&cfg.layout),
                     );
+                }
+                if Instant::now() >= next_nic {
+                    next_nic = Instant::now() + Duration::from_secs(3);
+                    let host = query_host_net_info();
+                    let mut s = status.write().await;
+                    s.host_name = host.host_name;
+                    s.local_ipv4 = host.ipv4_addresses;
+                    s.local_nics = host
+                        .nics
+                        .into_iter()
+                        .map(|n| LocalNic {
+                            address: n.address,
+                            kind: n.kind,
+                            name: n.name,
+                        })
+                        .collect();
                 }
                 {
                     let ns = net.status.read().await.clone();
@@ -261,9 +305,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Some(InboundEvent::Hello(h)) => {
                         info!("HELLO from {}", h.host_name);
-                        let mut s = status.write().await;
-                        s.connected = true;
-                        s.peer_name = h.host_name;
                     }
                     Some(InboundEvent::Heartbeat) => {}
                     Some(InboundEvent::SwitchEnter(p)) => {

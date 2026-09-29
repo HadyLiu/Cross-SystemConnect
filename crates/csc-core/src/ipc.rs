@@ -23,6 +23,8 @@ pub struct AppState {
     pub net_reload: watch::Sender<u64>,
     /// Bumped when the screen arrangement changes. Does not drop connections.
     pub layout_reload: watch::Sender<u64>,
+    /// File the core logger is appending to.
+    pub log_path: PathBuf,
 }
 
 pub async fn run_ipc(state: Arc<AppState>) -> anyhow::Result<()> {
@@ -209,7 +211,7 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 "reject" => Choice::Reject,
                 _ => return IpcResponse::err(req.id, "decision must be trust, once, or reject"),
             };
-            match state.prompt.resolve(host, choice).await {
+            match state.prompt.resolve(&state.status, host, choice).await {
                 Ok(()) => IpcResponse::ok(req.id, json!({"ok": true})),
                 Err(e) => IpcResponse::err(req.id, e),
             }
@@ -224,6 +226,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             s.sharing_enabled = enabled;
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
+        "get_logs" | "getLogs" => {
+            let text = read_log_tail(&state.log_path, 48 * 1024);
+            IpcResponse::ok(req.id, json!({"text": text}))
+        }
         "quit" => {
             let quit_tx = state.quit_tx.clone();
             tokio::spawn(async move {
@@ -235,6 +241,32 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
         }
         other => IpcResponse::err(req.id, format!("unknown method: {other}")),
     }
+}
+
+fn read_log_tail(path: &std::path::Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = meta.len();
+    let start = len.saturating_sub(max);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        if let Some(i) = text.find('\n') {
+            text.drain(..=i);
+        }
+    }
+    text
 }
 
 async fn refresh_status_from_config(state: &AppState, cfg: &Config) {

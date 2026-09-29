@@ -121,6 +121,10 @@ pub fn save_config(body: Value) -> anyhow::Result<Value> {
     call("save_config", body)
 }
 
+pub fn get_logs() -> anyhow::Result<Value> {
+    call("get_logs", json!({}))
+}
+
 pub fn resolve_peer(host_name: &str, decision: &str) -> anyhow::Result<Value> {
     call(
         "resolve_peer",

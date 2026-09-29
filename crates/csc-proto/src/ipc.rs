@@ -51,6 +51,9 @@ pub struct AppStatus {
     pub launch_at_login: bool,
     pub host_name: String,
     pub local_ipv4: Vec<String>,
+    /// Ethernet first, then Wi-Fi. Virtual adapters are omitted.
+    #[serde(default)]
+    pub local_nics: Vec<LocalNic>,
     /// UDP/TCP port the server searches and the client announces on.
     #[serde(default)]
     pub discovery_port: u16,
@@ -66,6 +69,15 @@ pub struct AppStatus {
     /// For example `10.10.10.0/24` when search is bound to 10.10.10.10.
     #[serde(default)]
     pub search_subnet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNic {
+    pub address: String,
+    /// `ethernet` or `wifi`.
+    pub kind: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

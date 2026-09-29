@@ -39,9 +39,12 @@ body{
 .main{flex:1;min-width:0;display:flex;flex-direction:column}
 .top{
   display:flex;align-items:center;justify-content:space-between;
-  padding:16px 22px 8px;
+  padding:16px 22px 8px;gap:12px;
 }
 .top h1{margin:0;font-size:20px;font-weight:650}
+.top-side{display:flex;align-items:center;gap:12px;min-width:0}
+#msg{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+#msg.ok{color:var(--ok)}#msg.err{color:var(--danger)}
 .pill{
   display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;
   background:var(--card);border:1px solid var(--line);color:var(--muted);font-size:12px;
@@ -61,40 +64,18 @@ body{
 .ip-chip:hover{border-color:var(--accent);color:#fff}
 .ip-chip.on{border-color:var(--accent);background:rgba(59,130,246,.22);color:#fff}
 .desk{
-  position:relative;height:360px;margin-top:10px;border-radius:12px;overflow:hidden;
-  background:
-    linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px),
-    #101218;
-  background-size:24px 24px, 24px 24px, auto;border:1px solid var(--line);touch-action:none;
+  position:relative;height:420px;margin-top:10px;border-radius:12px;overflow:hidden;
+  background:#101218;border:1px solid var(--line);touch-action:none;
 }
 .mon{
   position:absolute;width:132px;height:84px;border-radius:10px;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;gap:2px;cursor:grab;user-select:none;text-align:center;padding:6px;
+  align-items:center;justify-content:center;gap:2px;user-select:none;text-align:center;padding:6px;
 }
-.mon:active{cursor:grabbing}
-.mon.local{background:#6d4cc4;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.28)}
-.mon.peer{background:#3a3f4b;color:#fff;border:1px solid #5c6373}
+.mon.local{background:#6d4cc4;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.28);cursor:default;z-index:1}
+.mon.peer{background:#3a3f4b;color:#fff;border:1px solid #5c6373;cursor:grab;z-index:2}
+.mon.peer:active{cursor:grabbing}
 .mon .nm{font-size:14px;font-weight:700;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mon .sub{font-size:11px;opacity:.8}
-.tray{display:flex;flex-wrap:wrap;gap:8px;min-height:28px;margin-top:8px}
-.tray .mon{position:relative;width:120px;height:64px}
-.grid9{
-  display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:520px;margin:8px auto 0;
-}
-.cell{
-  aspect-ratio:1.35;border-radius:12px;border:1px dashed var(--line);background:var(--card2);
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
-  cursor:pointer;padding:8px;text-align:center;transition:border-color .15s,background .15s;
-}
-.cell:hover{border-color:var(--accent)}
-.cell.filled{border-style:solid;border-color:#3b82f6;background:rgba(59,130,246,.12)}
-.cell.center{
-  cursor:default;border-style:solid;border-color:#22c55e;background:rgba(34,197,94,.14);
-}
-.cell .pos{font-size:10px;color:var(--muted);letter-spacing:.04em}
-.cell .nm{font-size:13px;font-weight:650;word-break:break-all;max-width:100%}
-.cell .act{font-size:11px;color:var(--accent)}
 .card{
   background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
   padding:var(--pad);min-height:120px;
@@ -103,7 +84,7 @@ body{
 .card h2 .sub{margin-left:auto;font-size:12px;font-weight:500;color:var(--muted)}
 .stat-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .stat{background:var(--card2);border-radius:10px;padding:12px}
-.stat .k{color:var(--muted);font-size:11px}.stat .v{margin-top:4px;font-size:15px;font-weight:650}
+.stat .k{color:var(--muted);font-size:11px}.stat .v{margin-top:4px;font-size:15px;font-weight:650;word-break:break-all}
 .row{display:flex;align-items:center;gap:10px;margin:8px 0}
 .row label.f{flex:0 0 110px;color:var(--muted)}
 .row > :not(label.f){flex:1;min-width:0}
@@ -122,19 +103,12 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
 }
 .seg button.on{background:rgba(59,130,246,.18);border-color:var(--accent);color:#fff}
 .hint{color:var(--muted);font-size:12px;margin:6px 0 0}
-.foot{
-  display:flex;align-items:center;gap:10px;justify-content:flex-end;
-  padding:12px 22px;border-top:1px solid var(--line);background:rgba(0,0,0,.15);
-}
-#msg{flex:1;color:var(--muted);font-size:12px}
-#msg.ok{color:var(--ok)}#msg.err{color:var(--danger)}
-.btn{
-  appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);
-  border-radius:10px;padding:8px 16px;font:inherit;cursor:pointer;min-width:88px;
-}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover{background:var(--accent2)}
 .stack{display:flex;flex-direction:column;gap:14px}
+.logbox{
+  margin:0;height:480px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+  background:#101218;color:#d5d8e0;border-radius:10px;padding:12px;
+  font:12px/1.45 Consolas,ui-monospace,monospace;
+}
 .modal{
   display:none;position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.55);
   align-items:center;justify-content:center;padding:18px;
@@ -147,6 +121,12 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
 .modal-card h2{margin:0 0 8px;font-size:16px}
 .modal-actions{display:flex;gap:10px;margin-top:16px}
 .modal-actions .btn{flex:1}
+.btn{
+  appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);
+  border-radius:10px;padding:8px 16px;font:inherit;cursor:pointer;min-width:88px;
+}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent2)}
 .btn.on{box-shadow:inset 0 0 0 1px #fff}
 </style>
 </head>
@@ -156,55 +136,45 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
   <nav class="nav" id="nav">
     <button type="button" class="active" data-page="home"><span class="ico">⌂</span><span>首页</span></button>
     <button type="button" data-page="layout"><span class="ico">▦</span><span>布局</span></button>
-    <button type="button" data-page="clipboard"><span class="ico">⧉</span><span>剪贴板</span></button>
-    <button type="button" data-page="transfer"><span class="ico">⇪</span><span>文件</span></button>
-    <button type="button" data-page="hotkeys"><span class="ico">⌨</span><span>快捷键</span></button>
-    <button type="button" data-page="window"><span class="ico">▢</span><span>窗口</span></button>
+    <button type="button" data-page="settings"><span class="ico">⚙</span><span>设置</span></button>
     <button type="button" data-page="logs"><span class="ico">☰</span><span>日志</span></button>
-    <button type="button" data-page="advanced"><span class="ico">⚙</span><span>高级</span></button>
   </nav>
 </aside>
 <div class="main">
   <div class="top">
     <h1 id="title">首页</h1>
-    <div class="pill"><span class="dot" id="dot"></span><span id="pillText">加载中…</span></div>
+    <div class="top-side">
+      <span id="msg"></span>
+      <div class="pill"><span class="dot" id="dot"></span><span id="pillText">加载中…</span></div>
+    </div>
   </div>
   <div class="content">
     <section class="page active" id="page-home">
-      <div class="stack">
-        <div class="grid">
-          <div class="card">
-            <h2>运行状态 <span class="sub" id="st_role">—</span></h2>
-            <div class="stat-row">
-              <div class="stat"><div class="k">连接</div><div class="v" id="st_conn">—</div></div>
-              <div class="stat"><div class="k">对端</div><div class="v" id="st_peer">—</div></div>
-              <div class="stat"><div class="k">活动屏幕</div><div class="v" id="st_screen">—</div></div>
-              <div class="stat"><div class="k">键鼠共享</div><div class="v" id="st_share">—</div></div>
-            </div>
-          </div>
-          <div class="card">
-            <h2>本机信息</h2>
-            <div class="row"><label class="f">计算机名</label><input id="host_name" type="text" readonly/></div>
-            <div class="row"><label class="f">显示名称</label><input id="name" type="text"/></div>
-            <div class="row"><label class="f">本机模式</label>
-              <div class="seg" id="roleSeg">
-                <button type="button" data-v="server">键鼠主机</button>
-                <button type="button" data-v="client">被控端</button>
-              </div>
-            </div>
-            <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
-            <p class="hint" id="portHint">键鼠主机搜索默认端口并连接客户端；被控端向该端口发送本机信息。保存后生效。</p>
-            <p class="hint" id="ipHint">本机 IPv4，点击选择要搜索的局域网</p>
-            <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
+      <div class="grid">
+        <div class="card">
+          <h2>运行状态 <span class="sub" id="st_role">—</span></h2>
+          <div class="stat-row">
+            <div class="stat"><div class="k">连接</div><div class="v" id="st_conn">—</div></div>
+            <div class="stat"><div class="k">对端</div><div class="v" id="st_peer">—</div></div>
+            <div class="stat"><div class="k">活动屏幕</div><div class="v" id="st_screen">—</div></div>
+            <div class="stat"><div class="k">键鼠共享</div><div class="v" id="st_share">—</div></div>
           </div>
         </div>
-        <div class="grid">
-          <div class="card">
-            <h2>心跳 / 其它</h2>
-            <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
-            <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
-            <label class="check"><input id="prevent_sleep" type="checkbox"/><span>运行时防止休眠</span></label>
+        <div class="card">
+          <h2>本机信息</h2>
+          <div class="row"><label class="f">计算机名</label><input id="name" type="text" autocomplete="off"/></div>
+          <p class="hint" id="osNameHint">只在本软件中使用，不会修改 Windows 或 Linux 的计算机名。</p>
+          <div class="row"><label class="f">本机模式</label>
+            <div class="seg" id="roleSeg">
+              <button type="button" data-v="server">键鼠主机</button>
+              <button type="button" data-v="client">被控端</button>
+            </div>
           </div>
+          <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
+          <div class="row"><label class="f">端口</label><input id="control_port" type="number" min="1" max="65535" placeholder="24900"/></div>
+          <p class="hint" id="portHint">不修改则使用默认端口 24900。</p>
+          <p class="hint" id="ipHint">以太网和 Wi-Fi 都会列出，默认选中以太网</p>
+          <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
         </div>
       </div>
     </section>
@@ -212,8 +182,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
       <div class="stack">
         <div class="card">
           <h2>屏幕位置</h2>
-          <p class="hint">先在首页选中直连网卡（例如 10.10.10.10），保存后只搜索该网段。搜到的电脑出现在下方，拖到桌面上排列。方块挨在一起就能从边缘穿到下一台，多台可以排成一排或上下相邻。</p>
-          <div class="tray" id="peerTray"></div>
+          <p class="hint">键鼠主机固定在中间。连上的电脑出现在周围，拖动方块选择从哪一边穿过去。没有连接时只显示主机。</p>
           <div class="desk" id="desk"></div>
         </div>
         <div class="card">
@@ -226,60 +195,64 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         </div>
       </div>
     </section>
-    <section class="page" id="page-clipboard">
-      <div class="card">
-        <h2>剪贴板</h2>
-        <label class="check"><input id="clip_enabled" type="checkbox"/><span>启用剪贴板共享</span></label>
-        <label class="check"><input id="clip_text" type="checkbox"/><span>文本</span></label>
-        <label class="check"><input id="clip_image" type="checkbox"/><span>图片</span></label>
-        <label class="check"><input id="clip_files" type="checkbox"/><span>文件</span></label>
-        <div class="row"><label class="f">内联 MB</label><input id="max_inline_mb" type="number"/></div>
-        <div class="row"><label class="f">总上限 MB</label><input id="max_total_mb" type="number"/></div>
-      </div>
-    </section>
-    <section class="page" id="page-transfer">
-      <div class="card">
-        <h2>文件传输</h2>
-        <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
-        <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text"/></div>
-        <div class="row"><label class="f">单次上限</label><input id="ft_max_size_mb" type="number"/></div>
-        <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限速保流畅</span></label>
-        <div class="row"><label class="f">MiB/s</label><input id="ft_max_speed_mibs" type="number"/></div>
-      </div>
-    </section>
-    <section class="page" id="page-hotkeys">
-      <div class="card">
-        <h2>快捷键</h2>
-        <div class="row"><label class="f">锁定屏幕</label><input id="lock_screen" type="text"/></div>
-        <div class="row"><label class="f">切回服务端</label><input id="return_to_server" type="text"/></div>
-        <div class="row"><label class="f">切换共享</label><input id="toggle_enable" type="text"/></div>
-      </div>
-    </section>
-    <section class="page" id="page-window">
-      <div class="card">
-        <h2>窗口 / 托盘</h2>
-        <label class="check"><input id="auto_hide" type="checkbox"/><span>启动后驻留托盘</span></label>
-        <label class="check"><input id="close_to_tray" type="checkbox"/><span>关闭设置后继续驻留</span></label>
-        <label class="check"><input id="launch_at_login" type="checkbox"/><span>开机自启</span></label>
+    <section class="page" id="page-settings">
+      <div class="stack">
+        <div class="card">
+          <h2>心跳 / 其它</h2>
+          <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
+          <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
+          <label class="check"><input id="prevent_sleep" type="checkbox"/><span>运行时防止休眠</span></label>
+        </div>
+        <div class="card">
+          <h2>剪贴板</h2>
+          <label class="check"><input id="clip_enabled" type="checkbox"/><span>启用剪贴板共享</span></label>
+          <label class="check"><input id="clip_text" type="checkbox"/><span>文本</span></label>
+          <label class="check"><input id="clip_image" type="checkbox"/><span>图片</span></label>
+          <label class="check"><input id="clip_files" type="checkbox"/><span>文件</span></label>
+          <div class="row"><label class="f">内联 MB</label><input id="max_inline_mb" type="number"/></div>
+          <div class="row"><label class="f">总上限 MB</label><input id="max_total_mb" type="number"/></div>
+        </div>
+        <div class="card">
+          <h2>文件传输</h2>
+          <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
+          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text"/></div>
+          <div class="row"><label class="f">单次上限</label><input id="ft_max_size_mb" type="number"/></div>
+          <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限速保流畅</span></label>
+          <div class="row"><label class="f">MiB/s</label><input id="ft_max_speed_mibs" type="number"/></div>
+        </div>
+        <div class="card">
+          <h2>快捷键</h2>
+          <div class="row"><label class="f">锁定屏幕</label><input id="lock_screen" type="text"/></div>
+          <div class="row"><label class="f">切回服务端</label><input id="return_to_server" type="text"/></div>
+          <div class="row"><label class="f">切换共享</label><input id="toggle_enable" type="text"/></div>
+        </div>
+        <div class="card">
+          <h2>窗口 / 托盘</h2>
+          <label class="check"><input id="auto_hide" type="checkbox"/><span>启动后驻留托盘</span></label>
+          <label class="check"><input id="close_to_tray" type="checkbox"/><span>关闭设置后继续驻留</span></label>
+          <label class="check"><input id="launch_at_login" type="checkbox"/><span>开机自启</span></label>
+        </div>
+        <div class="card">
+          <h2>日志设置</h2>
+          <div class="row"><label class="f">级别</label>
+            <select id="log_level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
+          <label class="check"><input id="log_to_file" type="checkbox"/><span>写入文件</span></label>
+          <div class="row"><label class="f">路径</label><input id="log_file" type="text"/></div>
+          <p class="hint">实时内容在「日志」页。修改路径后，重新启动才会写入新文件。</p>
+        </div>
+        <div class="card">
+          <h2>进入 / 离开命令</h2>
+          <label class="check"><input id="enable_enter_command" type="checkbox"/><span>进入本机时执行</span></label>
+          <div class="row"><label class="f">命令</label><input id="enter_command" type="text"/></div>
+          <label class="check"><input id="enable_exit_command" type="checkbox"/><span>离开本机时执行</span></label>
+          <div class="row"><label class="f">命令</label><input id="exit_command" type="text"/></div>
+        </div>
       </div>
     </section>
     <section class="page" id="page-logs">
       <div class="card">
-        <h2>日志</h2>
-        <div class="row"><label class="f">级别</label>
-          <select id="log_level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
-        <label class="check"><input id="log_to_file" type="checkbox"/><span>写入文件</span></label>
-        <div class="row"><label class="f">路径</label><input id="log_file" type="text"/></div>
-      </div>
-    </section>
-    <section class="page" id="page-advanced">
-      <div class="card">
-        <h2>进入 / 离开命令</h2>
-        <label class="check"><input id="enable_enter_command" type="checkbox"/><span>进入本机时执行</span></label>
-        <div class="row"><label class="f">命令</label><input id="enter_command" type="text"/></div>
-        <label class="check"><input id="enable_exit_command" type="checkbox"/><span>离开本机时执行</span></label>
-        <div class="row"><label class="f">命令</label><input id="exit_command" type="text"/></div>
-        <p class="hint">切换本机模式后保存，会按默认端口重新搜索或发送。</p>
+        <h2>日志 <span class="sub" id="logMeta">实时</span></h2>
+        <pre class="logbox" id="logView">等待日志…</pre>
       </div>
     </section>
   </div>
@@ -292,238 +265,250 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <button type="button" class="btn primary on" id="peerOnce">✓ 仅本次</button>
         <button type="button" class="btn" id="peerReject">拒绝</button>
       </div>
-      <p class="hint">默认勾选「仅本次」。信任后下次不再询问；拒绝或仅本次，下次连接仍会询问。</p>
+      <p class="hint">默认勾选「仅本次」。信任后下次不再询问；拒绝或仅本次，下次连接仍会询问。搜索不会停，后面的电脑会排队询问。</p>
     </div>
-  </div>
-  <div class="foot">
-    <span id="msg"></span>
-    <button type="button" class="btn" id="refresh">刷新</button>
-    <button type="button" class="btn primary" id="save">保存</button>
   </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const titles={home:'首页',layout:'布局',clipboard:'剪贴板',transfer:'文件',hotkeys:'快捷键',window:'窗口',logs:'日志',advanced:'高级'};
+const titles={home:'首页',layout:'布局',settings:'设置',logs:'日志'};
 document.querySelectorAll('#nav button').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b===btn));
     document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+btn.dataset.page));
     $('title').textContent=titles[btn.dataset.page]||'';
     if(btn.dataset.page==='layout') renderDesk();
+    if(btn.dataset.page==='logs') refreshLogs();
   };
 });
 function setRole(v){
   $('role').value=v;
   document.querySelectorAll('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  scheduleSave();
 }
 document.querySelectorAll('#roleSeg button').forEach(b=>b.onclick=()=>setRole(b.dataset.v));
+
+let ready=false;
+let saveTimer=null;
+let saving=false;
+let saveQueued=false;
 let selectedIp='';
-let knownIps=[];
+let knownNics=[];
+let places=[];
+let livePeers=[];
+let liveSig='';
+let drag=null;
+let placesDirty=false;
+const SLOTS=[[210,0],[-210,0],[0,150],[0,-150],[210,150],[-210,150],[210,-150],[-210,-150]];
+
+function computerName(){
+  return ($('name').value||'').trim();
+}
 function subnetOf(ip){
   const p=(ip||'').split('.');
   if(p.length!==4||p.some(x=>x===''||Number.isNaN(Number(x)))) return '';
   return p[0]+'.'+p[1]+'.'+p[2]+'.0/24';
 }
-function updateSubnetHint(){
-  const sub=subnetOf(selectedIp);
-  if($('ipHint')){
-    $('ipHint').textContent=sub?('已选 '+selectedIp+'，搜索网段 '+sub):'本机 IPv4，点击选择要搜索的局域网';
-  }
+function kindLabel(kind){
+  if(kind==='ethernet') return '以太网';
+  if(kind==='wifi') return 'Wi-Fi';
+  return '网卡';
 }
-function renderIps(ips){
-  knownIps=ips||[];
+function updateSubnetHint(){
+  const nic=knownNics.find(n=>n.address===selectedIp);
+  const sub=subnetOf(selectedIp);
+  if(!$('ipHint')) return;
+  if(!selectedIp){
+    $('ipHint').textContent='以太网和 Wi-Fi 都会列出，默认选中以太网';
+    return;
+  }
+  const label=nic?kindLabel(nic.kind):'已选';
+  $('ipHint').textContent=sub?(label+' '+selectedIp+'，搜索网段 '+sub):('已选 '+selectedIp);
+}
+function nicList(raw, fallback){
+  if(Array.isArray(raw)&&raw.length){
+    return raw.filter(n=>n&&n.address).map(n=>({address:n.address, kind:n.kind||'', name:n.name||''}));
+  }
+  return (fallback||[]).filter(Boolean).map(ip=>({address:ip, kind:'', name:''}));
+}
+function renderIps(nics){
+  const rank=k=>k==='ethernet'?0:k==='wifi'?1:2;
+  knownNics=(nics||[]).slice().sort((a,b)=>rank(a.kind)-rank(b.kind));
+  if(!knownNics.some(n=>n.address===selectedIp)){
+    const eth=knownNics.find(n=>n.kind==='ethernet');
+    selectedIp=(eth||knownNics[0]||{}).address||'';
+    if(ready&&selectedIp) scheduleSave();
+  }
   const box=$('ip_list');
   box.innerHTML='';
-  if(!knownIps.length){
-    box.innerHTML='<span class="hint">未检测到可用 IPv4</span>';
+  if(!knownNics.length){
+    box.innerHTML='<span class="hint">未检测到以太网或 Wi-Fi 的 IPv4</span>';
     updateSubnetHint();
     return;
   }
-  knownIps.forEach(ip=>{
+  knownNics.forEach(n=>{
     const b=document.createElement('button');
-    b.type='button'; b.className='ip-chip'+(ip===selectedIp?' on':''); b.textContent=ip;
-    b.onclick=()=>{ selectedIp=ip; renderIps(knownIps); };
+    b.type='button';
+    b.className='ip-chip'+(n.address===selectedIp?' on':'');
+    b.textContent=kindLabel(n.kind)+'  '+n.address;
+    if(n.name) b.title=n.name;
+    b.onclick=()=>{ selectedIp=n.address; renderIps(knownNics); scheduleSave(); };
     box.appendChild(b);
   });
   updateSubnetHint();
 }
-let screens=[];
-let trayPeers=[];
-let drag=null;
-const CELL_W=150, CELL_H=102;
-function localName(){
-  const n=($('name').value||'').trim();
-  return n||'本机';
+function portValue(){
+  const n=Number($('control_port').value);
+  if(!Number.isInteger(n)||n<1||n>65535) return 24900;
+  return n;
 }
-function ensureLocal(){
-  const name=localName();
-  let local=screens.find(s=>s.local);
-  if(!local){
-    local={name, x:0, y:0, local:true};
-    screens.unshift(local);
-  } else if(local.name!==name){
-    local.name=name;
+function loadPlaces(list, self){
+  const raw=(list||[]).filter(s=>s&&s.name&&s.name!==self).map(s=>({
+    name:String(s.name), x:Number(s.x)||0, y:Number(s.y)||0
+  }));
+  const grid=raw.length>0&&raw.every(s=>Math.abs(s.x)<=4&&Math.abs(s.y)<=4);
+  places=raw.map(s=>grid?{name:s.name, x:s.x*210, y:s.y*150}:s);
+}
+function slotForNew(){
+  const used=new Set(places.map(s=>s.x+','+s.y));
+  for(const s of SLOTS){
+    if(!used.has(s[0]+','+s[1])) return {x:s[0], y:s[1]};
   }
-  screens.forEach(s=>{ if(s!==local) s.local=false; });
+  const i=places.length;
+  return {x:210+((i%3)*40), y:((i%2)?150:-150)};
 }
-function screensFromLayout(layout, name){
-  const list=[{name, x:0, y:0, local:true}];
-  const seen=new Set([name]);
-  const q=[{name, x:0, y:0}];
-  const dir={right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1]};
-  while(q.length){
-    const cur=q.shift();
-    const edges=layout[cur.name]||{};
-    Object.keys(edges).forEach(e=>{
-      const n=edges[e];
-      if(!n||seen.has(n)||!dir[e]) return;
-      seen.add(n);
-      const p={name:n, x:cur.x+dir[e][0], y:cur.y+dir[e][1], local:false};
-      list.push(p); q.push(p);
-    });
-  }
-  return list;
+function ensurePlace(name){
+  let pos=places.find(s=>s.name===name);
+  if(pos) return pos;
+  const slot=slotForNew();
+  pos={name, x:slot.x, y:slot.y};
+  places.push(pos);
+  placesDirty=true;
+  return pos;
 }
-function layoutFromScreens(list){
-  const at=(x,y)=>list.find(s=>s.x===x&&s.y===y);
+function layoutFromPlaces(){
+  const host=computerName()||'本机';
+  const peers=livePeers.map(p=>places.find(s=>s.name===p.name)).filter(Boolean);
+  const sides={right:[],left:[],top:[],bottom:[]};
+  peers.forEach(p=>{
+    const side=Math.abs(p.x)>=Math.abs(p.y)?(p.x>=0?'right':'left'):(p.y>=0?'bottom':'top');
+    sides[side].push(p);
+  });
+  sides.right.sort((a,b)=>a.x-b.x);
+  sides.left.sort((a,b)=>b.x-a.x);
+  sides.bottom.sort((a,b)=>a.y-b.y);
+  sides.top.sort((a,b)=>b.y-a.y);
   const out={};
-  list.forEach(s=>{
-    const link=(dx,dy,edge)=>{
-      const n=at(s.x+dx, s.y+dy);
-      if(!n||n.name===s.name) return;
-      (out[s.name]||(out[s.name]={}))[edge]=n.name;
-    };
-    link(1,0,'right'); link(-1,0,'left'); link(0,-1,'top'); link(0,1,'bottom');
-  });
+  const link=(a,edge,b)=>{ (out[a]||(out[a]={}))[edge]=b; };
+  const chain=(list,fwd,back)=>{
+    if(!list.length) return;
+    link(host,fwd,list[0].name);
+    link(list[0].name,back,host);
+    for(let i=0;i<list.length-1;i++){
+      link(list[i].name,fwd,list[i+1].name);
+      link(list[i+1].name,back,list[i].name);
+    }
+  };
+  chain(sides.right,'right','left');
+  chain(sides.left,'left','right');
+  chain(sides.bottom,'bottom','top');
+  chain(sides.top,'top','bottom');
   return out;
-}
-function cellFromPoint(clientX, clientY){
-  const desk=$('desk');
-  const r=desk.getBoundingClientRect();
-  const x=Math.round((clientX-r.left-r.width/2)/CELL_W);
-  const y=Math.round((clientY-r.top-r.height/2)/CELL_H);
-  return {x, y};
-}
-function freeCell(name, x, y){
-  const used=new Set(screens.filter(s=>s.name!==name).map(s=>s.x+','+s.y));
-  if(!used.has(x+','+y)) return {x, y};
-  for(let r=1;r<10;r++){
-    for(let dy=-r;dy<=r;dy++){
-      for(let dx=-r;dx<=r;dx++){
-        if(Math.max(Math.abs(dx),Math.abs(dy))!==r) continue;
-        const nx=x+dx, ny=y+dy;
-        if(!used.has(nx+','+ny)) return {x:nx, y:ny};
-      }
-    }
-  }
-  return {x:x+1, y};
-}
-function placePeer(name, x, y, address){
-  const cell=freeCell(name, x, y);
-  let s=screens.find(t=>t.name===name);
-  if(!s){
-    s={name, x:cell.x, y:cell.y, local:false, address:address||''};
-    screens.push(s);
-  } else {
-    s.x=cell.x; s.y=cell.y;
-    if(address) s.address=address;
-  }
-  trayPeers=trayPeers.filter(p=>p.name!==name);
-  renderDesk();
-}
-function renderDesk(){
-  if(drag) return;
-  ensureLocal();
-  const desk=$('desk');
-  const tray=$('peerTray');
-  if(!desk||!tray) return;
-  desk.innerHTML='';
-  tray.innerHTML='';
-  const placed=new Set(screens.map(s=>s.name));
-  if(!trayPeers.length){
-    tray.innerHTML=screens.some(s=>!s.local)
-      ? '<span class="hint">双击客户端方块可移回这里。拖动方块改变穿屏位置。</span>'
-      : '<span class="hint">搜到的电脑会显示在这里，拖到下方桌面排列</span>';
-  }
-  trayPeers.forEach(p=>{
-    if(placed.has(p.name)) return;
-    const el=makeMon(p.name, p.address||p.hostName||'', false);
-    el.onpointerdown=e=>startDrag(e, {name:p.name, address:p.address||'', fromTray:true});
-    tray.appendChild(el);
-  });
-  screens.forEach(s=>{
-    const el=makeMon(s.name, s.local?'本机':(s.address||'客户端'), s.local);
-    const pos=cellPx(s.x, s.y);
-    el.style.left=pos.left+'px';
-    el.style.top=pos.top+'px';
-    el.onpointerdown=e=>startDrag(e, {name:s.name, fromTray:false});
-    if(!s.local){
-      el.ondblclick=()=>{
-        screens=screens.filter(t=>t.name!==s.name);
-        renderDesk();
-      };
-    }
-    desk.appendChild(el);
-  });
 }
 function makeMon(name, sub, local){
   const el=document.createElement('div');
   el.className='mon '+(local?'local':'peer');
   el.innerHTML='<div class="nm"></div><div class="sub"></div>';
-  el.querySelector('.nm').textContent=name;
+  el.querySelector('.nm').textContent=name||'本机';
   el.querySelector('.sub').textContent=sub;
   return el;
 }
-function cellPx(x, y){
-  const desk=$('desk');
-  const w=desk.clientWidth||640;
-  let minX=0, maxX=0, minY=0, maxY=0;
-  screens.forEach(s=>{
-    minX=Math.min(minX,s.x); maxX=Math.max(maxX,s.x);
-    minY=Math.min(minY,s.y); maxY=Math.max(maxY,s.y);
-  });
-  const gridW=(maxX-minX+1)*CELL_W;
-  const ox=Math.max(16,(w-gridW)/2)-minX*CELL_W;
-  const oy=28-minY*CELL_H;
-  return {left:ox+x*CELL_W, top:oy+y*CELL_H};
+function placeStyle(el, x, y){
+  el.style.left='calc(50% + '+x+'px)';
+  el.style.top='calc(50% + '+y+'px)';
+  el.style.transform='translate(-50%,-50%)';
 }
-function startDrag(e, info){
+function renderDesk(){
+  if(drag) return;
+  const desk=$('desk');
+  if(!desk) return;
+  const host=computerName()||'本机';
+  desk.innerHTML='';
+  const hostEl=makeMon(host,'键鼠主机',true);
+  placeStyle(hostEl,0,0);
+  desk.appendChild(hostEl);
+  livePeers.forEach(p=>{
+    if(!p.name||p.name===host) return;
+    const pos=ensurePlace(p.name);
+    const el=makeMon(p.name, p.address||'已连接', false);
+    placeStyle(el, pos.x, pos.y);
+    el.onpointerdown=e=>startDrag(e, p.name);
+    desk.appendChild(el);
+  });
+  if(placesDirty&&ready){
+    placesDirty=false;
+    scheduleSave();
+  }
+}
+function startDrag(e, name){
   if(e.button!==0) return;
   e.preventDefault();
   const el=e.currentTarget;
   el.setPointerCapture(e.pointerId);
-  drag={...info, el, px:e.clientX, py:e.clientY};
+  drag={name, el};
   el.style.zIndex='5';
 }
 document.addEventListener('pointermove', e=>{
   if(!drag) return;
-  const desk=$('desk');
-  const r=desk.getBoundingClientRect();
-  if(drag.el.parentElement!==desk){
-    desk.appendChild(drag.el);
-  }
-  drag.el.style.left=(e.clientX-r.left-66)+'px';
-  drag.el.style.top=(e.clientY-r.top-42)+'px';
+  const r=$('desk').getBoundingClientRect();
+  const x=e.clientX-(r.left+r.width/2);
+  const y=e.clientY-(r.top+r.height/2);
+  placeStyle(drag.el, x, y);
 });
 document.addEventListener('pointerup', e=>{
   if(!drag) return;
-  const info=drag;
+  const name=drag.name;
   drag=null;
-  const cell=cellFromPoint(e.clientX, e.clientY);
-  placePeer(info.name, cell.x, cell.y, info.address||'');
+  const r=$('desk').getBoundingClientRect();
+  let x=Math.round(e.clientX-(r.left+r.width/2));
+  let y=Math.round(e.clientY-(r.top+r.height/2));
+  const limX=Math.max(80, r.width/2-80);
+  const limY=Math.max(60, r.height/2-50);
+  x=Math.max(-limX, Math.min(limX, x));
+  y=Math.max(-limY, Math.min(limY, y));
+  if(Math.abs(x)<80&&Math.abs(y)<56){
+    if(Math.abs(x)>=Math.abs(y)) x=x<0?-80:80;
+    else y=y<0?-56:56;
+  }
+  let pos=places.find(s=>s.name===name);
+  if(!pos){ pos={name,x,y}; places.push(pos); }
+  else { pos.x=x; pos.y=y; }
+  renderDesk();
+  scheduleSave();
 });
-function syncDiscovered(list){
-  const placed=new Set(screens.filter(s=>!s.local).map(s=>s.name));
-  trayPeers=(list||[]).filter(p=>p&&p.name&&!placed.has(p.name)).map(p=>({
-    name:p.name, hostName:p.hostName||'', address:p.address||''
-  }));
-  screens.forEach(s=>{
-    const hit=(list||[]).find(p=>p.name===s.name);
-    if(hit&&hit.address) s.address=hit.address;
+function syncLive(names, discovered){
+  const next=(names||[]).filter(n=>n).map(name=>{
+    const hit=(discovered||[]).find(p=>p&&(p.name===name||p.hostName===name));
+    return {name, address:hit&&hit.address?hit.address:''};
   });
+  const sig=next.map(p=>p.name+'@'+p.address).join('|');
+  if(sig===liveSig) return;
+  liveSig=sig;
+  livePeers=next;
   renderDesk();
 }
-$('name').addEventListener('input',()=>{ ensureLocal(); if(!drag) renderDesk(); });
+$('name').addEventListener('input',()=>{ if(!drag) renderDesk(); });
+
+function scheduleSave(){
+  if(!ready) return;
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(saveNow, 450);
+}
+document.querySelector('.content').addEventListener('input', e=>{
+  if(e.target&&e.target.id==='control_port') return;
+  scheduleSave();
+});
+document.querySelector('.content').addEventListener('change', scheduleSave);
 
 async function getConfig(){
   const r=await fetch('http://csc.localhost/config');
@@ -539,118 +524,156 @@ async function getStatus(){
   if(!r.ok) throw new Error('getStatus HTTP '+r.status);
   return r.json();
 }
-
-async function load(){
+async function getLogs(){
+  const r=await fetch('http://csc.localhost/logs');
+  if(!r.ok) throw new Error('logs HTTP '+r.status);
+  return r.json();
+}
+function saveBody(){
+  const host=computerName();
+  const screens=[{name:host||'本机', x:0, y:0}].concat(places.map(s=>({name:s.name, x:s.x, y:s.y})));
+  return {
+    role:$('role').value,
+    name:host,
+    search_address:selectedIp,
+    control_port:portValue(),
+    screens,
+    layout:layoutFromPlaces(),
+    switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
+            double_tap_window_ms:Number($('double_tap_window_ms').value),
+            corner_dead_zone_px:Number($('corner_dead_zone_px').value),
+            relative_mouse_moves:$('relative_mouse_moves').checked},
+    clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
+               files:$('clip_files').checked,max_inline_mb:Number($('max_inline_mb').value),
+               max_total_mb:Number($('max_total_mb').value)},
+    file_transfer:{enabled:$('ft_enabled').checked,receive_dir:$('ft_receive_dir').value,
+                   max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
+                   max_speed_mibs:Number($('ft_max_speed_mibs').value)},
+    hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value,
+             toggle_enable:$('toggle_enable').value},
+    gui:{theme:'dark',launch_at_login:$('launch_at_login').checked,
+         prevent_sleep:$('prevent_sleep').checked,auto_hide:$('auto_hide').checked,
+         close_to_tray:$('close_to_tray').checked},
+    log:{level:$('log_level').value,to_file:$('log_to_file').checked,file:$('log_file').value},
+    network:{heartbeat_enabled:$('heartbeat_enabled').checked,heartbeat_ms:Number($('heartbeat_ms').value)},
+    enable_enter_command:$('enable_enter_command').checked, enter_command:$('enter_command').value,
+    enable_exit_command:$('enable_exit_command').checked, exit_command:$('exit_command').value,
+    log_level:$('log_level').value
+  };
+}
+async function saveNow(){
+  if(!ready) return;
+  if(saving){ saveQueued=true; return; }
+  saving=true;
   const msg=$('msg');
   try{
-  const cfg=await getConfig();
-  if(cfg.error){ msg.className='err'; msg.textContent='内核未就绪: '+cfg.error; return; }
-  const g=cfg.gui||{}, l=cfg.log||{}, ft=cfg.file_transfer||{}, n=cfg.network||{};
-  $('name').value=cfg.name||''; setRole(cfg.role||'client');
-  $('prevent_sleep').checked=!!g.prevent_sleep;
-  $('auto_hide').checked=g.auto_hide!==false; $('close_to_tray').checked=g.close_to_tray!==false;
-  $('launch_at_login').checked=!!g.launch_at_login;
-  $('heartbeat_enabled').checked=n.heartbeat_enabled!==false;
-  $('heartbeat_ms').value=n.heartbeat_ms||5000;
-  selectedIp=cfg.search_address||'';
-  if(Array.isArray(cfg.screens)&&cfg.screens.length){
-    screens=cfg.screens.map(s=>({name:s.name, x:Number(s.x)||0, y:Number(s.y)||0, local:false, address:''}));
-  } else {
-    screens=screensFromLayout(cfg.layout||{}, localName());
+    const j=await saveConfig(saveBody());
+    if(j&&j.ok){ msg.className='ok'; msg.textContent='已保存'; }
+    else { msg.className='err'; msg.textContent='保存失败: '+((j&&j.error)||'unknown'); }
+  }catch(e){
+    msg.className='err'; msg.textContent='保存失败: '+(e&&e.message?e.message:e);
+  }finally{
+    saving=false;
+    if(saveQueued){ saveQueued=false; saveNow(); }
   }
-  ensureLocal();
-  renderDesk();
-  const sw=cfg.switch||{};
-  $('edge_delay_ms').value=sw.edge_delay_ms||0;
-  $('double_tap_edge').checked=!!sw.double_tap_edge;
-  $('double_tap_window_ms').value=sw.double_tap_window_ms||250;
-  $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
-  $('relative_mouse_moves').checked=!!sw.relative_mouse_moves;
-  const clip=cfg.clipboard||{};
-  $('clip_enabled').checked=clip.enabled!==false;
-  $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
-  $('clip_files').checked=!!clip.files;
-  $('max_inline_mb').value=clip.max_inline_mb||1; $('max_total_mb').value=clip.max_total_mb||64;
-  $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
-  $('ft_max_size_mb').value=ft.max_size_mb||10240;
-  $('ft_limit_speed').checked=ft.limit_speed!==false; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
-  const hk=cfg.hotkeys||{};
-  $('lock_screen').value=hk.lock_screen||'ScrollLock';
-  $('return_to_server').value=hk.return_to_server||'Ctrl+Alt+Home';
-  $('toggle_enable').value=hk.toggle_enable||'Ctrl+Alt+Pause';
-  $('log_level').value=(l.level||cfg.log_level||'info');
-  $('log_to_file').checked=!!l.to_file; $('log_file').value=l.file||'';
-  $('enable_enter_command').checked=!!cfg.enable_enter_command;
-  $('enter_command').value=cfg.enter_command||'';
-  $('enable_exit_command').checked=!!cfg.enable_exit_command;
-  $('exit_command').value=cfg.exit_command||'';
-  await refreshStatus();
-  msg.className='ok'; msg.textContent='已加载';
+}
+async function load(){
+  ready=false;
+  const msg=$('msg');
+  try{
+    const cfg=await getConfig();
+    if(cfg.error){ msg.className='err'; msg.textContent='内核未就绪: '+cfg.error; return; }
+    const g=cfg.gui||{}, l=cfg.log||{}, ft=cfg.file_transfer||{}, n=cfg.network||{};
+    $('name').value=cfg.name||'';
+    setRole(cfg.role||'client');
+    $('control_port').value=cfg.control_port||24900;
+    $('prevent_sleep').checked=!!g.prevent_sleep;
+    $('auto_hide').checked=g.auto_hide!==false; $('close_to_tray').checked=g.close_to_tray!==false;
+    $('launch_at_login').checked=!!g.launch_at_login;
+    $('heartbeat_enabled').checked=n.heartbeat_enabled!==false;
+    $('heartbeat_ms').value=n.heartbeat_ms||5000;
+    selectedIp=cfg.search_address||'';
+    loadPlaces(cfg.screens, computerName());
+    renderDesk();
+    const sw=cfg.switch||{};
+    $('edge_delay_ms').value=sw.edge_delay_ms||0;
+    $('double_tap_edge').checked=!!sw.double_tap_edge;
+    $('double_tap_window_ms').value=sw.double_tap_window_ms||250;
+    $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
+    $('relative_mouse_moves').checked=!!sw.relative_mouse_moves;
+    const clip=cfg.clipboard||{};
+    $('clip_enabled').checked=clip.enabled!==false;
+    $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
+    $('clip_files').checked=!!clip.files;
+    $('max_inline_mb').value=clip.max_inline_mb||1; $('max_total_mb').value=clip.max_total_mb||64;
+    $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
+    $('ft_max_size_mb').value=ft.max_size_mb||10240;
+    $('ft_limit_speed').checked=ft.limit_speed!==false; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
+    const hk=cfg.hotkeys||{};
+    $('lock_screen').value=hk.lock_screen||'ScrollLock';
+    $('return_to_server').value=hk.return_to_server||'Ctrl+Alt+Home';
+    $('toggle_enable').value=hk.toggle_enable||'Ctrl+Alt+Pause';
+    $('log_level').value=(l.level||cfg.log_level||'info');
+    $('log_to_file').checked=!!l.to_file; $('log_file').value=l.file||'';
+    $('enable_enter_command').checked=!!cfg.enable_enter_command;
+    $('enter_command').value=cfg.enter_command||'';
+    $('enable_exit_command').checked=!!cfg.enable_exit_command;
+    $('exit_command').value=cfg.exit_command||'';
+    const savedIp=cfg.search_address||'';
+    await refreshStatus();
+    ready=true;
+    if((selectedIp&&selectedIp!==savedIp)||placesDirty) scheduleSave();
+    msg.className='ok'; msg.textContent='已加载';
   }catch(e){
     msg.className='err'; msg.textContent='加载失败: '+(e&&e.message?e.message:e);
   }
 }
+function peerNames(s){
+  return (s.peerName||'').split(',').map(x=>x.trim()).filter(Boolean);
+}
 async function refreshStatus(){
   if(document.hidden) return;
   const s=await getStatus();
-  const on=!!s.connected;
+  const names=peerNames(s);
+  const on=names.length>0||!!s.connected;
   const port=s.discoveryPort||24900;
   const server=s.role==='server';
   $('dot').className='dot'+(on?' on':'');
-  $('pillText').textContent=on?('已连接 · '+(s.peerName||'对端')):(server?('正在搜索端口 '+port):('正在向端口 '+port+' 发送'));
-  $('st_conn').textContent=on?'已连接':(server?'搜索中':'发送中');
-  $('st_peer').textContent=s.peerName||'(无)';
+  $('pillText').textContent=names.length
+    ?('已连接 '+names.length+' 台')
+    :(server?('正在搜索端口 '+port):('正在向端口 '+port+' 发送'));
+  $('st_conn').textContent=names.length?('已连接 '+names.length+' 台'):(server?'搜索中':'发送中');
+  $('st_peer').textContent=names.length?names.join('、'):'(无)';
   $('st_screen').textContent=s.activeScreen||'(本地)';
   $('st_share').textContent=s.sharingEnabled?'开启':'暂停';
-  $('st_role').textContent=(s.localName||'')+' · '+(server?'键鼠主机':'被控端');
+  $('st_role').textContent=(s.localName||computerName()||'')+' · '+(server?'键鼠主机':'被控端');
   const sub=s.searchSubnet||subnetOf(selectedIp);
-  if($('portHint')) $('portHint').textContent='发现端口 '+port+'。'+(sub?('当前搜索网段 '+sub+'。'):'点击本机 IPv4 选择网段。')+' 保存后生效。';
-  showPeer(s.pendingPeer);
-  if(typeof s.launchAtLogin==='boolean') $('launch_at_login').checked=s.launchAtLogin;
-  $('host_name').value=s.hostName||'';
-  if(s.hostName && (!$('name').value || $('name').value==='LOCAL-PC')){
-    $('name').value=s.hostName;
-    ensureLocal();
+  if($('portHint')) $('portHint').textContent='不修改则使用默认端口 24900。当前发现端口 '+port+(sub?('，搜索网段 '+sub+'。'):'。');
+  if(s.hostName){
+    $('osNameHint').textContent='系统计算机名是 '+s.hostName+'，这里的名称只在本软件中使用，不会修改它。';
   }
-  renderIps(s.localIpv4||[]);
-  if(!drag) syncDiscovered(s.discovered||[]);
+  showPeer(s.pendingPeer);
+  if(typeof s.launchAtLogin==='boolean' && document.activeElement!==$('launch_at_login')){
+    $('launch_at_login').checked=s.launchAtLogin;
+  }
+  renderIps(nicList(s.localNics, s.localIpv4));
+  if(!drag) syncLive(names, s.discovered||[]);
+  if($('page-logs').classList.contains('active')) refreshLogs();
 }
-$('save').onclick=async()=>{
-  const msg=$('msg'); msg.className=''; msg.textContent='保存中…';
+async function refreshLogs(){
+  const box=$('logView');
+  if(!box) return;
+  const nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
   try{
-    const body={
-      role:$('role').value, name:$('name').value,
-      search_address:selectedIp,
-      screens:screens.map(s=>({name:s.name, x:s.x, y:s.y})),
-      layout:layoutFromScreens(screens),
-      switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
-              double_tap_window_ms:Number($('double_tap_window_ms').value),
-              corner_dead_zone_px:Number($('corner_dead_zone_px').value),
-              relative_mouse_moves:$('relative_mouse_moves').checked},
-      clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
-                 files:$('clip_files').checked,max_inline_mb:Number($('max_inline_mb').value),
-                 max_total_mb:Number($('max_total_mb').value)},
-      file_transfer:{enabled:$('ft_enabled').checked,receive_dir:$('ft_receive_dir').value,
-                     max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
-                     max_speed_mibs:Number($('ft_max_speed_mibs').value)},
-      hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value,
-               toggle_enable:$('toggle_enable').value},
-      gui:{theme:'dark',launch_at_login:$('launch_at_login').checked,
-           prevent_sleep:$('prevent_sleep').checked,auto_hide:$('auto_hide').checked,
-           close_to_tray:$('close_to_tray').checked},
-      log:{level:$('log_level').value,to_file:$('log_to_file').checked,file:$('log_file').value},
-      network:{heartbeat_enabled:$('heartbeat_enabled').checked,heartbeat_ms:Number($('heartbeat_ms').value)},
-      enable_enter_command:$('enable_enter_command').checked, enter_command:$('enter_command').value,
-      enable_exit_command:$('enable_exit_command').checked, exit_command:$('exit_command').value,
-      log_level:$('log_level').value
-    };
-    const j=await saveConfig(body);
-    if(j&&j.ok){ msg.className='ok'; msg.textContent='已保存'; }
-    else { msg.className='err'; msg.textContent='失败: '+((j&&j.error)||'unknown'); }
-  }catch(e){ msg.className='err'; msg.textContent='失败: '+e.message; }
-};
-$('refresh').onclick=refreshStatus;
-document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshStatus(); });
+    const j=await getLogs();
+    const text=(j&&j.text)||'';
+    box.textContent=text||(j&&j.error?'暂无日志: '+j.error:'暂无日志');
+    if($('logMeta')) $('logMeta').textContent=text?('最近 '+text.split('\n').length+' 行'):'实时';
+    if(nearBottom) box.scrollTop=box.scrollHeight;
+  }catch(e){
+    box.textContent='读取日志失败: '+(e&&e.message?e.message:e);
+  }
+}
 let peerShown='';
 let deciding=false;
 function showPeer(p){
@@ -696,7 +719,7 @@ $('peerTrust').onclick=()=>decidePeer('trust');
 $('peerOnce').onclick=()=>decidePeer('once');
 $('peerReject').onclick=()=>decidePeer('reject');
 load();
-setInterval(refreshStatus, 1000);
+setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);
 </script>
 </body>
 </html>
