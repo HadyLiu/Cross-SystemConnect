@@ -1,0 +1,132 @@
+use bytes::{Buf, BufMut, BytesMut};
+use thiserror::Error;
+
+pub const MAGIC: u16 = 0x5343; // 'C''S' LE
+pub const VERSION: u8 = 1;
+pub const HEADER_SIZE: usize = 12;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgType {
+    Hello = 0x01,
+    Heartbeat = 0x02,
+    SwitchEnter = 0x10,
+    SwitchLeave = 0x11,
+    MouseMove = 0x20,
+    MouseButton = 0x21,
+    MouseWheel = 0x22,
+    Key = 0x23,
+    ClipOffer = 0x30,
+    ClipRequest = 0x31,
+    ClipData = 0x32,
+    DragBegin = 0x40,
+    DragCancel = 0x41,
+    FileRequest = 0x50,
+    FileData = 0x51,
+    FileEnd = 0x52,
+    FileCancel = 0x53,
+    FileError = 0x54,
+}
+
+impl MsgType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0x01 => Self::Hello,
+            0x02 => Self::Heartbeat,
+            0x10 => Self::SwitchEnter,
+            0x11 => Self::SwitchLeave,
+            0x20 => Self::MouseMove,
+            0x21 => Self::MouseButton,
+            0x22 => Self::MouseWheel,
+            0x23 => Self::Key,
+            0x30 => Self::ClipOffer,
+            0x31 => Self::ClipRequest,
+            0x32 => Self::ClipData,
+            0x40 => Self::DragBegin,
+            0x41 => Self::DragCancel,
+            0x50 => Self::FileRequest,
+            0x51 => Self::FileData,
+            0x52 => Self::FileEnd,
+            0x53 => Self::FileCancel,
+            0x54 => Self::FileError,
+            _ => return None,
+        })
+    }
+}
+
+pub const FLAG_JSON_PAYLOAD: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub version: u8,
+    pub msg_type: MsgType,
+    pub flags: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum FrameError {
+    #[error("incomplete frame")]
+    Incomplete,
+    #[error("bad magic")]
+    BadMagic,
+    #[error("unsupported version {0}")]
+    BadVersion(u8),
+    #[error("unknown message type {0:#x}")]
+    BadType(u8),
+}
+
+pub fn encode_frame(msg_type: MsgType, payload: &[u8], flags: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+    out.put_u16_le(MAGIC);
+    out.put_u8(VERSION);
+    out.put_u8(msg_type as u8);
+    out.put_u32_le(flags);
+    out.put_u32_le(payload.len() as u32);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Try decode one frame from the front of `buf`. On success advances buf.
+pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
+    if buf.len() < HEADER_SIZE {
+        return Ok(None);
+    }
+    let magic = u16::from_le_bytes([buf[0], buf[1]]);
+    if magic != MAGIC {
+        return Err(FrameError::BadMagic);
+    }
+    let version = buf[2];
+    if version != VERSION {
+        return Err(FrameError::BadVersion(version));
+    }
+    let ty = MsgType::from_u8(buf[3]).ok_or(FrameError::BadType(buf[3]))?;
+    let flags = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+    if buf.len() < HEADER_SIZE + len {
+        return Ok(None);
+    }
+    buf.advance(HEADER_SIZE);
+    let payload = buf.split_to(len).to_vec();
+    Ok(Some(Frame {
+        version,
+        msg_type: ty,
+        flags,
+        payload,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_heartbeat() {
+        let raw = encode_frame(MsgType::Heartbeat, b"hi", 0);
+        let mut buf = BytesMut::from(&raw[..]);
+        let f = try_decode_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(f.msg_type, MsgType::Heartbeat);
+        assert_eq!(f.payload, b"hi");
+        assert!(buf.is_empty());
+    }
+}

@@ -1,0 +1,27 @@
+{
+  "bind_address": "0.0.0.0",
+  "clipboard": {
+    "files": true,
+    "image": true,
+    "max_inline_mb": 1,
+    "max_total_mb": 64,
+    "text": true
+  },
+  "control_port": 24900,
+  "data_port": 24901,
+  "hotkeys": {
+    "lock_screen": "ScrollLock",
+    "return_to_server": "Ctrl+Alt+Home",
+    "toggle_enable": "Ctrl+Alt+Pause"
+  },
+  "layout": {},
+  "log_level": "info",
+  "role": "server",
+  "server_address": "",
+  "switch": {
+    "corner_dead_zone_px": 10,
+    "double_tap_edge": false,
+    "edge_delay_ms": 0
+  },
+  "tls": false
+}

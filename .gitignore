@@ -1,0 +1,25 @@
+# 生成产物与本地文件（勿提交）
+/target/
+**/target/
+**/*.pdb
+**/*.ilk
+**/*.exp
+**/*.obj
+**/*.o
+*.log
+*.tmp
+.cache/
+
+# Rust / 编辑器
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# 测试与覆盖率
+*.profraw
+*.profdata
+/coverage/

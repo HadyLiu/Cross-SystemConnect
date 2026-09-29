@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Cross-SystemConnect</title>
+<style>
+:root{
+  --bg:#14161e;--side:#1a1c24;--card:#22252f;--card2:#2a2e3a;
+  --text:#e8eaed;--muted:#8b93a7;--line:#2f3442;
+  --accent:#3b82f6;--accent2:#2563eb;--ok:#22c55e;--off:#6b7280;--danger:#ef4444;
+  --radius:14px;--pad:18px;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  font:13px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif;
+  color:var(--text);background:var(--bg);
+  display:flex;min-height:100%;
+}
+.side{
+  width:228px;flex:0 0 228px;background:var(--side);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;padding:14px 10px;
+}
+.brand{display:flex;align-items:center;gap:10px;padding:8px 10px 18px}
+.logo{
+  width:32px;height:32px;border-radius:9px;object-fit:cover;display:block;background:#1a1c24;
+}
+.brand b{font-size:12px;line-height:1.25}
+.nav{display:flex;flex-direction:column;gap:4px;flex:1}
+.nav button{
+  appearance:none;border:0;background:transparent;color:var(--muted);
+  display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;
+  font:inherit;cursor:pointer;text-align:left;
+}
+.nav button:hover{background:rgba(255,255,255,.04);color:var(--text)}
+.nav button.active{background:var(--accent);color:#fff}
+.nav .ico{width:18px;opacity:.9}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 22px 8px;
+}
+.top h1{margin:0;font-size:20px;font-weight:650}
+.pill{
+  display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;
+  background:var(--card);border:1px solid var(--line);color:var(--muted);font-size:12px;
+}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--off)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+.content{flex:1;overflow:auto;padding:8px 22px 22px}
+.page{display:none}
+.page.active{display:block}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.side{width:72px;flex-basis:72px}.brand b,.nav span{display:none}.grid{grid-template-columns:1fr}}
+.ip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.ip-chip{
+  appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);
+  border-radius:999px;padding:6px 12px;font:inherit;cursor:pointer;
+}
+.ip-chip:hover{border-color:var(--accent);color:#fff}
+.ip-chip.on{border-color:var(--accent);background:rgba(59,130,246,.22);color:#fff}
+.desk{
+  position:relative;height:360px;margin-top:10px;border-radius:12px;overflow:hidden;
+  background:
+    linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px),
+    #101218;
+  background-size:24px 24px, 24px 24px, auto;border:1px solid var(--line);touch-action:none;
+}
+.mon{
+  position:absolute;width:132px;height:84px;border-radius:10px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:2px;cursor:grab;user-select:none;text-align:center;padding:6px;
+}
+.mon:active{cursor:grabbing}
+.mon.local{background:#6d4cc4;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.28)}
+.mon.peer{background:#3a3f4b;color:#fff;border:1px solid #5c6373}
+.mon .nm{font-size:14px;font-weight:700;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mon .sub{font-size:11px;opacity:.8}
+.tray{display:flex;flex-wrap:wrap;gap:8px;min-height:28px;margin-top:8px}
+.tray .mon{position:relative;width:120px;height:64px}
+.grid9{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:520px;margin:8px auto 0;
+}
+.cell{
+  aspect-ratio:1.35;border-radius:12px;border:1px dashed var(--line);background:var(--card2);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
+  cursor:pointer;padding:8px;text-align:center;transition:border-color .15s,background .15s;
+}
+.cell:hover{border-color:var(--accent)}
+.cell.filled{border-style:solid;border-color:#3b82f6;background:rgba(59,130,246,.12)}
+.cell.center{
+  cursor:default;border-style:solid;border-color:#22c55e;background:rgba(34,197,94,.14);
+}
+.cell .pos{font-size:10px;color:var(--muted);letter-spacing:.04em}
+.cell .nm{font-size:13px;font-weight:650;word-break:break-all;max-width:100%}
+.cell .act{font-size:11px;color:var(--accent)}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:var(--pad);min-height:120px;
+}
+.card h2{margin:0 0 12px;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+.card h2 .sub{margin-left:auto;font-size:12px;font-weight:500;color:var(--muted)}
+.stat-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:var(--card2);border-radius:10px;padding:12px}
+.stat .k{color:var(--muted);font-size:11px}.stat .v{margin-top:4px;font-size:15px;font-weight:650}
+.row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.row label.f{flex:0 0 110px;color:var(--muted)}
+.row > :not(label.f){flex:1;min-width:0}
+.check{display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--text)}
+.check input{accent-color:var(--accent)}
+input[type=text],input[type=number],select,textarea{
+  width:100%;padding:8px 10px;border-radius:10px;border:1px solid var(--line);
+  background:var(--card2);color:var(--text);font:inherit;outline:none;
+}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,monospace;font-size:12px}
+.seg{display:flex;gap:8px}
+.seg button{
+  flex:1;appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--muted);
+  border-radius:10px;padding:10px 8px;font:inherit;cursor:pointer;
+}
+.seg button.on{background:rgba(59,130,246,.18);border-color:var(--accent);color:#fff}
+.hint{color:var(--muted);font-size:12px;margin:6px 0 0}
+.foot{
+  display:flex;align-items:center;gap:10px;justify-content:flex-end;
+  padding:12px 22px;border-top:1px solid var(--line);background:rgba(0,0,0,.15);
+}
+#msg{flex:1;color:var(--muted);font-size:12px}
+#msg.ok{color:var(--ok)}#msg.err{color:var(--danger)}
+.btn{
+  appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);
+  border-radius:10px;padding:8px 16px;font:inherit;cursor:pointer;min-width:88px;
+}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent2)}
+.stack{display:flex;flex-direction:column;gap:14px}
+.modal{
+  display:none;position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.55);
+  align-items:center;justify-content:center;padding:18px;
+}
+.modal.show{display:flex}
+.modal-card{
+  width:min(460px,100%);background:var(--card);border:1px solid var(--line);
+  border-radius:16px;padding:20px;
+}
+.modal-card h2{margin:0 0 8px;font-size:16px}
+.modal-actions{display:flex;gap:10px;margin-top:16px}
+.modal-actions .btn{flex:1}
+.btn.on{box-shadow:inset 0 0 0 1px #fff}
+</style>
+</head>
+<body>
+<aside class="side">
+  <div class="brand"><img class="logo" src="/icon.png" alt=""/><b>Cross-SystemConnect</b></div>
+  <nav class="nav" id="nav">
+    <button type="button" class="active" data-page="home"><span class="ico">⌂</span><span>首页</span></button>
+    <button type="button" data-page="layout"><span class="ico">▦</span><span>布局</span></button>
+    <button type="button" data-page="clipboard"><span class="ico">⧉</span><span>剪贴板</span></button>
+    <button type="button" data-page="transfer"><span class="ico">⇪</span><span>文件</span></button>
+    <button type="button" data-page="hotkeys"><span class="ico">⌨</span><span>快捷键</span></button>
+    <button type="button" data-page="window"><span class="ico">▢</span><span>窗口</span></button>
+    <button type="button" data-page="logs"><span class="ico">☰</span><span>日志</span></button>
+    <button type="button" data-page="advanced"><span class="ico">⚙</span><span>高级</span></button>
+  </nav>
+</aside>
+<div class="main">
+  <div class="top">
+    <h1 id="title">首页</h1>
+    <div class="pill"><span class="dot" id="dot"></span><span id="pillText">加载中…</span></div>
+  </div>
+  <div class="content">
+    <section class="page active" id="page-home">
+      <div class="stack">
+        <div class="grid">
+          <div class="card">
+            <h2>运行状态 <span class="sub" id="st_role">—</span></h2>
+            <div class="stat-row">
+              <div class="stat"><div class="k">连接</div><div class="v" id="st_conn">—</div></div>
+              <div class="stat"><div class="k">对端</div><div class="v" id="st_peer">—</div></div>
+              <div class="stat"><div class="k">活动屏幕</div><div class="v" id="st_screen">—</div></div>
+              <div class="stat"><div class="k">键鼠共享</div><div class="v" id="st_share">—</div></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>本机信息</h2>
+            <div class="row"><label class="f">计算机名</label><input id="host_name" type="text" readonly/></div>
+            <div class="row"><label class="f">显示名称</label><input id="name" type="text"/></div>
+            <div class="row"><label class="f">本机模式</label>
+              <div class="seg" id="roleSeg">
+                <button type="button" data-v="server">键鼠主机</button>
+                <button type="button" data-v="client">被控端</button>
+              </div>
+            </div>
+            <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
+            <p class="hint" id="portHint">键鼠主机搜索默认端口并连接客户端；被控端向该端口发送本机信息。保存后生效。</p>
+            <p class="hint" id="ipHint">本机 IPv4，点击选择要搜索的局域网</p>
+            <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="card">
+            <h2>心跳 / 其它</h2>
+            <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
+            <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
+            <label class="check"><input id="prevent_sleep" type="checkbox"/><span>运行时防止休眠</span></label>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-layout">
+      <div class="stack">
+        <div class="card">
+          <h2>屏幕位置</h2>
+          <p class="hint">先在首页选中直连网卡（例如 10.10.10.10），保存后只搜索该网段。搜到的电脑出现在下方，拖到桌面上排列。方块挨在一起就能从边缘穿到下一台，多台可以排成一排或上下相邻。</p>
+          <div class="tray" id="peerTray"></div>
+          <div class="desk" id="desk"></div>
+        </div>
+        <div class="card">
+          <h2>边缘切换</h2>
+          <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
+          <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
+          <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
+          <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
+          <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-clipboard">
+      <div class="card">
+        <h2>剪贴板</h2>
+        <label class="check"><input id="clip_enabled" type="checkbox"/><span>启用剪贴板共享</span></label>
+        <label class="check"><input id="clip_text" type="checkbox"/><span>文本</span></label>
+        <label class="check"><input id="clip_image" type="checkbox"/><span>图片</span></label>
+        <label class="check"><input id="clip_files" type="checkbox"/><span>文件</span></label>
+        <div class="row"><label class="f">内联 MB</label><input id="max_inline_mb" type="number"/></div>
+        <div class="row"><label class="f">总上限 MB</label><input id="max_total_mb" type="number"/></div>
+      </div>
+    </section>
+    <section class="page" id="page-transfer">
+      <div class="card">
+        <h2>文件传输</h2>
+        <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
+        <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text"/></div>
+        <div class="row"><label class="f">单次上限</label><input id="ft_max_size_mb" type="number"/></div>
+        <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限速保流畅</span></label>
+        <div class="row"><label class="f">MiB/s</label><input id="ft_max_speed_mibs" type="number"/></div>
+      </div>
+    </section>
+    <section class="page" id="page-hotkeys">
+      <div class="card">
+        <h2>快捷键</h2>
+        <div class="row"><label class="f">锁定屏幕</label><input id="lock_screen" type="text"/></div>
+        <div class="row"><label class="f">切回服务端</label><input id="return_to_server" type="text"/></div>
+        <div class="row"><label class="f">切换共享</label><input id="toggle_enable" type="text"/></div>
+      </div>
+    </section>
+    <section class="page" id="page-window">
+      <div class="card">
+        <h2>窗口 / 托盘</h2>
+        <label class="check"><input id="auto_hide" type="checkbox"/><span>启动后驻留托盘</span></label>
+        <label class="check"><input id="close_to_tray" type="checkbox"/><span>关闭设置后继续驻留</span></label>
+        <label class="check"><input id="launch_at_login" type="checkbox"/><span>开机自启</span></label>
+      </div>
+    </section>
+    <section class="page" id="page-logs">
+      <div class="card">
+        <h2>日志</h2>
+        <div class="row"><label class="f">级别</label>
+          <select id="log_level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
+        <label class="check"><input id="log_to_file" type="checkbox"/><span>写入文件</span></label>
+        <div class="row"><label class="f">路径</label><input id="log_file" type="text"/></div>
+      </div>
+    </section>
+    <section class="page" id="page-advanced">
+      <div class="card">
+        <h2>进入 / 离开命令</h2>
+        <label class="check"><input id="enable_enter_command" type="checkbox"/><span>进入本机时执行</span></label>
+        <div class="row"><label class="f">命令</label><input id="enter_command" type="text"/></div>
+        <label class="check"><input id="enable_exit_command" type="checkbox"/><span>离开本机时执行</span></label>
+        <div class="row"><label class="f">命令</label><input id="exit_command" type="text"/></div>
+        <p class="hint">切换本机模式后保存，会按默认端口重新搜索或发送。</p>
+      </div>
+    </section>
+  </div>
+  <div class="modal" id="peerModal">
+    <div class="modal-card">
+      <h2>客户端连接请求</h2>
+      <p id="peerText"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="peerTrust">信任</button>
+        <button type="button" class="btn primary on" id="peerOnce">✓ 仅本次</button>
+        <button type="button" class="btn" id="peerReject">拒绝</button>
+      </div>
+      <p class="hint">默认勾选「仅本次」。信任后下次不再询问；拒绝或仅本次，下次连接仍会询问。</p>
+    </div>
+  </div>
+  <div class="foot">
+    <span id="msg"></span>
+    <button type="button" class="btn" id="refresh">刷新</button>
+    <button type="button" class="btn primary" id="save">保存</button>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const titles={home:'首页',layout:'布局',clipboard:'剪贴板',transfer:'文件',hotkeys:'快捷键',window:'窗口',logs:'日志',advanced:'高级'};
+document.querySelectorAll('#nav button').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b===btn));
+    document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+btn.dataset.page));
+    $('title').textContent=titles[btn.dataset.page]||'';
+    if(btn.dataset.page==='layout') renderDesk();
+  };
+});
+function setRole(v){
+  $('role').value=v;
+  document.querySelectorAll('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+}
+document.querySelectorAll('#roleSeg button').forEach(b=>b.onclick=()=>setRole(b.dataset.v));
+let selectedIp='';
+let knownIps=[];
+function subnetOf(ip){
+  const p=(ip||'').split('.');
+  if(p.length!==4||p.some(x=>x===''||Number.isNaN(Number(x)))) return '';
+  return p[0]+'.'+p[1]+'.'+p[2]+'.0/24';
+}
+function updateSubnetHint(){
+  const sub=subnetOf(selectedIp);
+  if($('ipHint')){
+    $('ipHint').textContent=sub?('已选 '+selectedIp+'，搜索网段 '+sub):'本机 IPv4，点击选择要搜索的局域网';
+  }
+}
+function renderIps(ips){
+  knownIps=ips||[];
+  const box=$('ip_list');
+  box.innerHTML='';
+  if(!knownIps.length){
+    box.innerHTML='<span class="hint">未检测到可用 IPv4</span>';
+    updateSubnetHint();
+    return;
+  }
+  knownIps.forEach(ip=>{
+    const b=document.createElement('button');
+    b.type='button'; b.className='ip-chip'+(ip===selectedIp?' on':''); b.textContent=ip;
+    b.onclick=()=>{ selectedIp=ip; renderIps(knownIps); };
+    box.appendChild(b);
+  });
+  updateSubnetHint();
+}
+let screens=[];
+let trayPeers=[];
+let drag=null;
+const CELL_W=150, CELL_H=102;
+function localName(){
+  const n=($('name').value||'').trim();
+  return n||'本机';
+}
+function ensureLocal(){
+  const name=localName();
+  let local=screens.find(s=>s.local);
+  if(!local){
+    local={name, x:0, y:0, local:true};
+    screens.unshift(local);
+  } else if(local.name!==name){
+    local.name=name;
+  }
+  screens.forEach(s=>{ if(s!==local) s.local=false; });
+}
+function screensFromLayout(layout, name){
+  const list=[{name, x:0, y:0, local:true}];
+  const seen=new Set([name]);
+  const q=[{name, x:0, y:0}];
+  const dir={right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1]};
+  while(q.length){
+    const cur=q.shift();
+    const edges=layout[cur.name]||{};
+    Object.keys(edges).forEach(e=>{
+      const n=edges[e];
+      if(!n||seen.has(n)||!dir[e]) return;
+      seen.add(n);
+      const p={name:n, x:cur.x+dir[e][0], y:cur.y+dir[e][1], local:false};
+      list.push(p); q.push(p);
+    });
+  }
+  return list;
+}
+function layoutFromScreens(list){
+  const at=(x,y)=>list.find(s=>s.x===x&&s.y===y);
+  const out={};
+  list.forEach(s=>{
+    const link=(dx,dy,edge)=>{
+      const n=at(s.x+dx, s.y+dy);
+      if(!n||n.name===s.name) return;
+      (out[s.name]||(out[s.name]={}))[edge]=n.name;
+    };
+    link(1,0,'right'); link(-1,0,'left'); link(0,-1,'top'); link(0,1,'bottom');
+  });
+  return out;
+}
+function cellFromPoint(clientX, clientY){
+  const desk=$('desk');
+  const r=desk.getBoundingClientRect();
+  const x=Math.round((clientX-r.left-r.width/2)/CELL_W);
+  const y=Math.round((clientY-r.top-r.height/2)/CELL_H);
+  return {x, y};
+}
+function freeCell(name, x, y){
+  const used=new Set(screens.filter(s=>s.name!==name).map(s=>s.x+','+s.y));
+  if(!used.has(x+','+y)) return {x, y};
+  for(let r=1;r<10;r++){
+    for(let dy=-r;dy<=r;dy++){
+      for(let dx=-r;dx<=r;dx++){
+        if(Math.max(Math.abs(dx),Math.abs(dy))!==r) continue;
+        const nx=x+dx, ny=y+dy;
+        if(!used.has(nx+','+ny)) return {x:nx, y:ny};
+      }
+    }
+  }
+  return {x:x+1, y};
+}
+function placePeer(name, x, y, address){
+  const cell=freeCell(name, x, y);
+  let s=screens.find(t=>t.name===name);
+  if(!s){
+    s={name, x:cell.x, y:cell.y, local:false, address:address||''};
+    screens.push(s);
+  } else {
+    s.x=cell.x; s.y=cell.y;
+    if(address) s.address=address;
+  }
+  trayPeers=trayPeers.filter(p=>p.name!==name);
+  renderDesk();
+}
+function renderDesk(){
+  if(drag) return;
+  ensureLocal();
+  const desk=$('desk');
+  const tray=$('peerTray');
+  if(!desk||!tray) return;
+  desk.innerHTML='';
+  tray.innerHTML='';
+  const placed=new Set(screens.map(s=>s.name));
+  if(!trayPeers.length){
+    tray.innerHTML=screens.some(s=>!s.local)
+      ? '<span class="hint">双击客户端方块可移回这里。拖动方块改变穿屏位置。</span>'
+      : '<span class="hint">搜到的电脑会显示在这里，拖到下方桌面排列</span>';
+  }
+  trayPeers.forEach(p=>{
+    if(placed.has(p.name)) return;
+    const el=makeMon(p.name, p.address||p.hostName||'', false);
+    el.onpointerdown=e=>startDrag(e, {name:p.name, address:p.address||'', fromTray:true});
+    tray.appendChild(el);
+  });
+  screens.forEach(s=>{
+    const el=makeMon(s.name, s.local?'本机':(s.address||'客户端'), s.local);
+    const pos=cellPx(s.x, s.y);
+    el.style.left=pos.left+'px';
+    el.style.top=pos.top+'px';
+    el.onpointerdown=e=>startDrag(e, {name:s.name, fromTray:false});
+    if(!s.local){
+      el.ondblclick=()=>{
+        screens=screens.filter(t=>t.name!==s.name);
+        renderDesk();
+      };
+    }
+    desk.appendChild(el);
+  });
+}
+function makeMon(name, sub, local){
+  const el=document.createElement('div');
+  el.className='mon '+(local?'local':'peer');
+  el.innerHTML='<div class="nm"></div><div class="sub"></div>';
+  el.querySelector('.nm').textContent=name;
+  el.querySelector('.sub').textContent=sub;
+  return el;
+}
+function cellPx(x, y){
+  const desk=$('desk');
+  const w=desk.clientWidth||640;
+  let minX=0, maxX=0, minY=0, maxY=0;
+  screens.forEach(s=>{
+    minX=Math.min(minX,s.x); maxX=Math.max(maxX,s.x);
+    minY=Math.min(minY,s.y); maxY=Math.max(maxY,s.y);
+  });
+  const gridW=(maxX-minX+1)*CELL_W;
+  const ox=Math.max(16,(w-gridW)/2)-minX*CELL_W;
+  const oy=28-minY*CELL_H;
+  return {left:ox+x*CELL_W, top:oy+y*CELL_H};
+}
+function startDrag(e, info){
+  if(e.button!==0) return;
+  e.preventDefault();
+  const el=e.currentTarget;
+  el.setPointerCapture(e.pointerId);
+  drag={...info, el, px:e.clientX, py:e.clientY};
+  el.style.zIndex='5';
+}
+document.addEventListener('pointermove', e=>{
+  if(!drag) return;
+  const desk=$('desk');
+  const r=desk.getBoundingClientRect();
+  if(drag.el.parentElement!==desk){
+    desk.appendChild(drag.el);
+  }
+  drag.el.style.left=(e.clientX-r.left-66)+'px';
+  drag.el.style.top=(e.clientY-r.top-42)+'px';
+});
+document.addEventListener('pointerup', e=>{
+  if(!drag) return;
+  const info=drag;
+  drag=null;
+  const cell=cellFromPoint(e.clientX, e.clientY);
+  placePeer(info.name, cell.x, cell.y, info.address||'');
+});
+function syncDiscovered(list){
+  const placed=new Set(screens.filter(s=>!s.local).map(s=>s.name));
+  trayPeers=(list||[]).filter(p=>p&&p.name&&!placed.has(p.name)).map(p=>({
+    name:p.name, hostName:p.hostName||'', address:p.address||''
+  }));
+  screens.forEach(s=>{
+    const hit=(list||[]).find(p=>p.name===s.name);
+    if(hit&&hit.address) s.address=hit.address;
+  });
+  renderDesk();
+}
+$('name').addEventListener('input',()=>{ ensureLocal(); if(!drag) renderDesk(); });
+
+async function getConfig(){
+  const r=await fetch('http://csc.localhost/config');
+  if(!r.ok) throw new Error('getConfig HTTP '+r.status);
+  return r.json();
+}
+async function saveConfig(body){
+  const r=await fetch('http://csc.localhost/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
+}
+async function getStatus(){
+  const r=await fetch('http://csc.localhost/status');
+  if(!r.ok) throw new Error('getStatus HTTP '+r.status);
+  return r.json();
+}
+
+async function load(){
+  const msg=$('msg');
+  try{
+  const cfg=await getConfig();
+  if(cfg.error){ msg.className='err'; msg.textContent='内核未就绪: '+cfg.error; return; }
+  const g=cfg.gui||{}, l=cfg.log||{}, ft=cfg.file_transfer||{}, n=cfg.network||{};
+  $('name').value=cfg.name||''; setRole(cfg.role||'client');
+  $('prevent_sleep').checked=!!g.prevent_sleep;
+  $('auto_hide').checked=g.auto_hide!==false; $('close_to_tray').checked=g.close_to_tray!==false;
+  $('launch_at_login').checked=!!g.launch_at_login;
+  $('heartbeat_enabled').checked=n.heartbeat_enabled!==false;
+  $('heartbeat_ms').value=n.heartbeat_ms||5000;
+  selectedIp=cfg.search_address||'';
+  if(Array.isArray(cfg.screens)&&cfg.screens.length){
+    screens=cfg.screens.map(s=>({name:s.name, x:Number(s.x)||0, y:Number(s.y)||0, local:false, address:''}));
+  } else {
+    screens=screensFromLayout(cfg.layout||{}, localName());
+  }
+  ensureLocal();
+  renderDesk();
+  const sw=cfg.switch||{};
+  $('edge_delay_ms').value=sw.edge_delay_ms||0;
+  $('double_tap_edge').checked=!!sw.double_tap_edge;
+  $('double_tap_window_ms').value=sw.double_tap_window_ms||250;
+  $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
+  $('relative_mouse_moves').checked=!!sw.relative_mouse_moves;
+  const clip=cfg.clipboard||{};
+  $('clip_enabled').checked=clip.enabled!==false;
+  $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
+  $('clip_files').checked=!!clip.files;
+  $('max_inline_mb').value=clip.max_inline_mb||1; $('max_total_mb').value=clip.max_total_mb||64;
+  $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
+  $('ft_max_size_mb').value=ft.max_size_mb||10240;
+  $('ft_limit_speed').checked=ft.limit_speed!==false; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
+  const hk=cfg.hotkeys||{};
+  $('lock_screen').value=hk.lock_screen||'ScrollLock';
+  $('return_to_server').value=hk.return_to_server||'Ctrl+Alt+Home';
+  $('toggle_enable').value=hk.toggle_enable||'Ctrl+Alt+Pause';
+  $('log_level').value=(l.level||cfg.log_level||'info');
+  $('log_to_file').checked=!!l.to_file; $('log_file').value=l.file||'';
+  $('enable_enter_command').checked=!!cfg.enable_enter_command;
+  $('enter_command').value=cfg.enter_command||'';
+  $('enable_exit_command').checked=!!cfg.enable_exit_command;
+  $('exit_command').value=cfg.exit_command||'';
+  await refreshStatus();
+  msg.className='ok'; msg.textContent='已加载';
+  }catch(e){
+    msg.className='err'; msg.textContent='加载失败: '+(e&&e.message?e.message:e);
+  }
+}
+async function refreshStatus(){
+  if(document.hidden) return;
+  const s=await getStatus();
+  const on=!!s.connected;
+  const port=s.discoveryPort||24900;
+  const server=s.role==='server';
+  $('dot').className='dot'+(on?' on':'');
+  $('pillText').textContent=on?('已连接 · '+(s.peerName||'对端')):(server?('正在搜索端口 '+port):('正在向端口 '+port+' 发送'));
+  $('st_conn').textContent=on?'已连接':(server?'搜索中':'发送中');
+  $('st_peer').textContent=s.peerName||'(无)';
+  $('st_screen').textContent=s.activeScreen||'(本地)';
+  $('st_share').textContent=s.sharingEnabled?'开启':'暂停';
+  $('st_role').textContent=(s.localName||'')+' · '+(server?'键鼠主机':'被控端');
+  const sub=s.searchSubnet||subnetOf(selectedIp);
+  if($('portHint')) $('portHint').textContent='发现端口 '+port+'。'+(sub?('当前搜索网段 '+sub+'。'):'点击本机 IPv4 选择网段。')+' 保存后生效。';
+  showPeer(s.pendingPeer);
+  if(typeof s.launchAtLogin==='boolean') $('launch_at_login').checked=s.launchAtLogin;
+  $('host_name').value=s.hostName||'';
+  if(s.hostName && (!$('name').value || $('name').value==='LOCAL-PC')){
+    $('name').value=s.hostName;
+    ensureLocal();
+  }
+  renderIps(s.localIpv4||[]);
+  if(!drag) syncDiscovered(s.discovered||[]);
+}
+$('save').onclick=async()=>{
+  const msg=$('msg'); msg.className=''; msg.textContent='保存中…';
+  try{
+    const body={
+      role:$('role').value, name:$('name').value,
+      search_address:selectedIp,
+      screens:screens.map(s=>({name:s.name, x:s.x, y:s.y})),
+      layout:layoutFromScreens(screens),
+      switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
+              double_tap_window_ms:Number($('double_tap_window_ms').value),
+              corner_dead_zone_px:Number($('corner_dead_zone_px').value),
+              relative_mouse_moves:$('relative_mouse_moves').checked},
+      clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
+                 files:$('clip_files').checked,max_inline_mb:Number($('max_inline_mb').value),
+                 max_total_mb:Number($('max_total_mb').value)},
+      file_transfer:{enabled:$('ft_enabled').checked,receive_dir:$('ft_receive_dir').value,
+                     max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
+                     max_speed_mibs:Number($('ft_max_speed_mibs').value)},
+      hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value,
+               toggle_enable:$('toggle_enable').value},
+      gui:{theme:'dark',launch_at_login:$('launch_at_login').checked,
+           prevent_sleep:$('prevent_sleep').checked,auto_hide:$('auto_hide').checked,
+           close_to_tray:$('close_to_tray').checked},
+      log:{level:$('log_level').value,to_file:$('log_to_file').checked,file:$('log_file').value},
+      network:{heartbeat_enabled:$('heartbeat_enabled').checked,heartbeat_ms:Number($('heartbeat_ms').value)},
+      enable_enter_command:$('enable_enter_command').checked, enter_command:$('enter_command').value,
+      enable_exit_command:$('enable_exit_command').checked, exit_command:$('exit_command').value,
+      log_level:$('log_level').value
+    };
+    const j=await saveConfig(body);
+    if(j&&j.ok){ msg.className='ok'; msg.textContent='已保存'; }
+    else { msg.className='err'; msg.textContent='失败: '+((j&&j.error)||'unknown'); }
+  }catch(e){ msg.className='err'; msg.textContent='失败: '+e.message; }
+};
+$('refresh').onclick=refreshStatus;
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshStatus(); });
+let peerShown='';
+let deciding=false;
+function showPeer(p){
+  const modal=$('peerModal');
+  if(!modal) return;
+  if(!p||!p.hostName){
+    peerShown='';
+    modal.classList.remove('show');
+    return;
+  }
+  if(peerShown===p.hostName && modal.classList.contains('show')) return;
+  peerShown=p.hostName;
+  const who=(p.name&&p.name!==p.hostName)?(p.name+'（'+p.hostName+'）'):(p.name||p.hostName);
+  $('peerText').textContent=who+' 请求连接，来自 '+(p.address||'未知地址')+'。';
+  modal.classList.add('show');
+  $('peerOnce').focus();
+}
+async function decidePeer(decision){
+  if(deciding||!peerShown) return;
+  deciding=true;
+  const host=peerShown;
+  try{
+    const r=await fetch('http://csc.localhost/peer-decision',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({hostName:host, decision})
+    });
+    const j=await r.json();
+    if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
+    peerShown='';
+    $('peerModal').classList.remove('show');
+    const msg=$('msg');
+    msg.className='ok';
+    msg.textContent=decision==='trust'?'已信任，下次不再询问':(decision==='once'?'已允许本次连接':'已拒绝');
+  }catch(e){
+    const msg=$('msg');
+    msg.className='err';
+    msg.textContent='处理失败: '+(e&&e.message?e.message:e);
+  }finally{
+    deciding=false;
+  }
+}
+$('peerTrust').onclick=()=>decidePeer('trust');
+$('peerOnce').onclick=()=>decidePeer('once');
+$('peerReject').onclick=()=>decidePeer('reject');
+load();
+setInterval(refreshStatus, 1000);
+</script>
+</body>
+</html>
