@@ -43,10 +43,10 @@
 cargo build --release -p csc-core -p csc-ui
 
 # 推荐入口：托盘 UI（自动启动内核）
-./target/x86_64-pc-windows-gnu/release/Cross-SystemConnect.exe
+./target/release/Cross-SystemConnect.exe
 
 # 仅内核
-./target/x86_64-pc-windows-gnu/release/Cross-SystemConnect-core.exe
+./target/release/Cross-SystemConnect-core.exe
 ```
 
 配置：`%APPDATA%\Cross-SystemConnect\config.json`（会自动迁移旧版 `%APPDATA%\CSC\`）。  

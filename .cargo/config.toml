@@ -1,6 +1,5 @@
-[build]
-target = "x86_64-pc-windows-gnu"
-
+# Applied only when building the Windows GNU target.
+# Do not set [build] target here: that forces Linux to cross-compile for Windows.
 [target.x86_64-pc-windows-gnu]
 linker = "gcc"
 ar = "ar"
