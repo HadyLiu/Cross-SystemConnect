@@ -1,6 +1,7 @@
 # 生成产物与本地文件（勿提交）
 /target/
 **/target/
+/dist/
 **/*.pdb
 **/*.ilk
 **/*.exp

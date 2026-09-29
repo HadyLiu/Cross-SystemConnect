@@ -19,8 +19,10 @@ use crate::prompt::PeerPrompt;
 use crate::switch::SwitchController;
 use anyhow::Context;
 use csc_config::{default_config_path, default_log_path, Config};
-use csc_platform::{create_clipboard, create_input_injector, create_screen_info, query_host_net_info};
-use csc_proto::{AppStatus, ClipOfferPayload, LocalNic, encode_switch_leave_bin, SwitchPayload};
+use csc_platform::{
+    create_clipboard, create_input_injector, create_screen_info, query_host_net_info,
+};
+use csc_proto::{encode_switch_leave_bin, AppStatus, ClipOfferPayload, LocalNic, SwitchPayload};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;

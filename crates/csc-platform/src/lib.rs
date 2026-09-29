@@ -3,11 +3,11 @@
 mod host;
 mod traits;
 
-#[cfg(windows)]
-pub mod win;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
 mod stub;
+#[cfg(windows)]
+pub mod win;
 
 pub use host::*;
 pub use traits::*;

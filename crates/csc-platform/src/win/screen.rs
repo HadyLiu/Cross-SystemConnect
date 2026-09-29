@@ -1,5 +1,7 @@
 use crate::traits::{ScreenInfo, ScreenSize};
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+};
 
 pub struct WinScreenInfo;
 

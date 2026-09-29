@@ -11,7 +11,9 @@ const TRAY_SIZE: u32 = 32;
 
 pub fn app_tray_icon() -> tray_icon::Icon {
     match load_rgba(TRAY_SIZE) {
-        Ok((rgba, w, h)) => tray_icon::Icon::from_rgba(rgba, w, h).unwrap_or_else(|_| fallback_icon()),
+        Ok((rgba, w, h)) => {
+            tray_icon::Icon::from_rgba(rgba, w, h).unwrap_or_else(|_| fallback_icon())
+        }
         Err(_) => fallback_icon(),
     }
 }

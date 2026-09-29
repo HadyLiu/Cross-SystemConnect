@@ -12,18 +12,13 @@ pub const APP_DIR_NAME: &str = "Cross-SystemConnect";
 /// Legacy directory used by older builds.
 pub const LEGACY_APP_DIR_NAME: &str = "CSC";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Default is client. A saved config may override this to server (keyboard host).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Server,
+    #[default]
     Client,
-}
-
-impl Default for Role {
-    fn default() -> Self {
-        // Default: client; saved config may override to server (KM host).
-        Self::Client
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,7 +429,11 @@ fn rename_layout_host(layout: &mut LayoutMap, from: &str, to: &str) {
         let hk = if host == from { to } else { host.as_str() };
         let mut e2 = BTreeMap::new();
         for (edge, neighbor) in edges {
-            let n = if neighbor == from { to } else { neighbor.as_str() };
+            let n = if neighbor == from {
+                to
+            } else {
+                neighbor.as_str()
+            };
             e2.insert(edge.clone(), n.to_string());
         }
         next.insert(hk.to_string(), e2);
@@ -450,8 +449,8 @@ impl Config {
             info!("Created default config at {}", path.display());
             return Ok(cfg);
         }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         let mut cfg: Config = serde_json::from_str(&text)
             .with_context(|| format!("parse config {}", path.display()))?;
         if cfg.name.is_empty() {
@@ -547,5 +546,15 @@ mod tests {
         assert_eq!(cfg.control_port, 24900);
         assert_eq!(cfg.server_address, "192.168.1.9");
         assert_eq!(cfg.trusted_peers, vec!["Other-PC".to_string()]);
+    }
+
+    #[test]
+    fn trust_matches_name_without_case() {
+        let mut cfg = Config::default();
+        assert!(cfg.trust_peer(" Desk "));
+        assert!(!cfg.trust_peer("desk"));
+        assert!(cfg.is_trusted_peer("DESK"));
+        assert!(!cfg.is_trusted_peer("  "));
+        assert!(!cfg.trust_peer(""));
     }
 }

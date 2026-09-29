@@ -1,7 +1,6 @@
 //! Chunked file transfer with xxHash64.
 #![allow(dead_code)] // API ready; wire to data-channel sessions incrementally
 
-
 use crate::path_safe::sanitize_relative_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -92,11 +91,7 @@ impl FileTransfer {
         Ok(hasher.digest())
     }
 
-    pub fn begin_receive(
-        &mut self,
-        transfer_id: u64,
-        relative: &str,
-    ) -> anyhow::Result<()> {
+    pub fn begin_receive(&mut self, transfer_id: u64, relative: &str) -> anyhow::Result<()> {
         let rel = sanitize_relative_path(relative)
             .ok_or_else(|| anyhow::anyhow!("unsafe path: {relative}"))?;
         let path = self.receive_root.join(&rel);

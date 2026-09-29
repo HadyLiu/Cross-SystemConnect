@@ -151,7 +151,12 @@ pub fn broadcast_targets(port: u16, local_ips: &[String]) -> Vec<SocketAddr> {
     out
 }
 
-pub fn is_own_announce(host_name: &str, local_host: &str, src_ip: &str, local_ips: &[String]) -> bool {
+pub fn is_own_announce(
+    host_name: &str,
+    local_host: &str,
+    src_ip: &str,
+    local_ips: &[String],
+) -> bool {
     if !local_host.is_empty() && host_name.eq_ignore_ascii_case(local_host) {
         return true;
     }
@@ -231,9 +236,15 @@ mod tests {
     #[test]
     fn broadcast_includes_global_and_subnet() {
         let targets = broadcast_targets(24900, &["192.168.1.20".into(), "127.0.0.1".into()]);
-        assert!(targets.iter().any(|a| a.ip().is_multicast() || a.ip().to_string() == "255.255.255.255"));
-        assert!(targets.iter().any(|a| a.ip().to_string() == "192.168.1.255"));
-        assert!(!targets.iter().any(|a| a.ip().to_string().starts_with("127.")));
+        assert!(targets
+            .iter()
+            .any(|a| a.ip().is_multicast() || a.ip().to_string() == "255.255.255.255"));
+        assert!(targets
+            .iter()
+            .any(|a| a.ip().to_string() == "192.168.1.255"));
+        assert!(!targets
+            .iter()
+            .any(|a| a.ip().to_string().starts_with("127.")));
     }
 
     #[test]
@@ -243,10 +254,15 @@ mod tests {
         assert!(targets.iter().any(|a| a.ip().to_string() == "10.10.10.1"));
         assert!(targets.iter().any(|a| a.ip().to_string() == "10.10.10.254"));
         assert!(!targets.iter().any(|a| a.ip().to_string() == "10.10.10.10"));
-        assert!(!targets.iter().any(|a| !a.ip().to_string().starts_with("10.10.10.")));
+        assert!(!targets
+            .iter()
+            .any(|a| !a.ip().to_string().starts_with("10.10.10.")));
         assert!(same_subnet24("10.10.10.10", "10.10.10.20"));
         assert!(!same_subnet24("10.10.10.10", "192.168.1.8"));
-        assert_eq!(subnet_label("10.10.10.10").as_deref(), Some("10.10.10.0/24"));
+        assert_eq!(
+            subnet_label("10.10.10.10").as_deref(),
+            Some("10.10.10.0/24")
+        );
     }
 
     #[test]

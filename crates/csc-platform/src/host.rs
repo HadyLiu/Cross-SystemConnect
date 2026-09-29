@@ -19,7 +19,7 @@ pub struct HostNetInfo {
 impl HostNetInfo {
     pub fn set_nics(&mut self, mut nics: Vec<LocalNic>) {
         nics.retain(|n| usable_unicast_v4(&n.address));
-        nics.sort_by(|a, b| nic_rank(&a.kind).cmp(&nic_rank(&b.kind)));
+        nics.sort_by_key(|nic| nic_rank(&nic.kind));
         self.ipv4_addresses = nics.iter().map(|n| n.address.clone()).collect();
         self.nics = nics;
     }
@@ -199,8 +199,14 @@ mod tests {
         assert!(usable_unicast_v4("192.168.0.88"));
         assert!(!usable_unicast_v4("127.0.0.1"));
         assert!(!usable_unicast_v4("169.254.1.2"));
-        assert!(looks_virtual("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter"));
-        assert!(looks_virtual("以太网 4", "VirtualBox Host-Only Ethernet Adapter"));
+        assert!(looks_virtual(
+            "vEthernet (WSL)",
+            "Hyper-V Virtual Ethernet Adapter"
+        ));
+        assert!(looks_virtual(
+            "以太网 4",
+            "VirtualBox Host-Only Ethernet Adapter"
+        ));
         assert!(!looks_virtual("以太网", "Intel(R) Ethernet Connection"));
         assert!(!looks_virtual("WLAN", "Intel(R) Wi-Fi 6 AX201"));
 

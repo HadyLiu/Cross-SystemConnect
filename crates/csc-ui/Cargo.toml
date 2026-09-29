@@ -18,7 +18,7 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 
 tao = "0.30"
-wry = "0.47"
+wry = { version = "0.47", features = ["linux-body"] }
 tray-icon = "0.19"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -20,10 +20,22 @@ use wry::{
     WebViewBuilder,
 };
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 enum UserEvent {
     ShowSettings,
     Quit,
     ToggleShare,
+}
+
+fn app_title() -> String {
+    format!("Cross-SystemConnect v{APP_VERSION}")
+}
+
+fn index_html() -> Vec<u8> {
+    include_str!("../ui/index.html")
+        .replace("__CSC_VERSION__", APP_VERSION)
+        .into_bytes()
 }
 
 fn cors_headers(builder: wry::http::response::Builder) -> wry::http::response::Builder {
@@ -51,10 +63,9 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
     }
 
     if path == "/" || path == "/index.html" {
-        let html = include_str!("../ui/index.html");
         return Ok(cors_headers(Response::builder())
             .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(Cow::Borrowed(html.as_bytes()))?);
+            .body(Cow::Owned(index_html()))?);
     }
 
     if path == "/status" && method == Method::GET {
@@ -119,7 +130,8 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
             }
         }
     } else if path == "/peer-decision" && method == Method::POST {
-        let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
         let host = body.get("hostName").and_then(|v| v.as_str()).unwrap_or("");
         let decision = body.get("decision").and_then(|v| v.as_str()).unwrap_or("");
         match ipc_client::resolve_peer(host, decision) {
@@ -161,10 +173,22 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
     }
 }
 
+fn start_url() -> &'static str {
+    #[cfg(windows)]
+    {
+        "http://csc.localhost/"
+    }
+    #[cfg(not(windows))]
+    {
+        "csc://localhost/"
+    }
+}
+
 fn build_webview(window: &tao::window::Window) -> wry::Result<wry::WebView> {
     let builder = WebViewBuilder::new()
-        .with_custom_protocol("csc".into(), move |_webview_id, request| {
-            match handle_http(request) {
+        .with_custom_protocol(
+            "csc".into(),
+            move |_webview_id, request| match handle_http(request) {
                 Ok(r) => r.map(Into::into),
                 Err(e) => {
                     let body = format!("{e:#}").into_bytes();
@@ -175,10 +199,12 @@ fn build_webview(window: &tao::window::Window) -> wry::Result<wry::WebView> {
                         .unwrap()
                         .map(Into::into)
                 }
-            }
-        })
-        // WebView2: use http://{scheme}.localhost so fetch() works
-        .with_url("http://csc.localhost/")
+            },
+        )
+        // Windows WebView2 only intercepts http://{scheme}.localhost.
+        // Linux WebKit serves the custom scheme itself; http://csc.localhost
+        // is a real connection and fails with "Connection refused".
+        .with_url(start_url())
         .with_devtools(true);
 
     #[cfg(any(
@@ -218,7 +244,11 @@ fn main() -> anyhow::Result<()> {
                 .append(true)
                 .open(&path)
             {
-                fmt().with_env_filter(filter).with_writer(file).with_ansi(false).init();
+                fmt()
+                    .with_env_filter(filter)
+                    .with_writer(file)
+                    .with_ansi(false)
+                    .init();
             } else {
                 fmt().with_env_filter(filter).with_ansi(false).init();
             }
@@ -249,7 +279,7 @@ fn main() -> anyhow::Result<()> {
     let mut tray_icon = Some(
         TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
-            .with_tooltip("Cross-SystemConnect")
+            .with_tooltip(app_title())
             .with_icon(tray_icon_img)
             .build()
             .context("create tray icon")?,
@@ -327,7 +357,7 @@ fn main() -> anyhow::Result<()> {
                 if !warmed && !open_settings {
                     warmed = true;
                     let mut wb = WindowBuilder::new()
-                        .with_title("Cross-SystemConnect")
+                        .with_title(app_title())
                         .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 720.0))
                         .with_visible(false);
                     if let Some(ic) = icon::app_window_icon() {
@@ -347,7 +377,7 @@ fn main() -> anyhow::Result<()> {
             Event::UserEvent(UserEvent::ShowSettings) => {
                 if window.is_none() {
                     let mut wb = WindowBuilder::new()
-                        .with_title("Cross-SystemConnect")
+                        .with_title(app_title())
                         .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 720.0));
                     if let Some(ic) = icon::app_window_icon() {
                         wb = wb.with_window_icon(Some(ic));
@@ -392,4 +422,14 @@ fn main() -> anyhow::Result<()> {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn index_html_embeds_package_version() {
+        let html = String::from_utf8(super::index_html()).expect("utf-8");
+        assert!(html.contains(&format!("v{}", super::APP_VERSION)));
+        assert!(!html.contains("__CSC_VERSION__"));
+    }
 }

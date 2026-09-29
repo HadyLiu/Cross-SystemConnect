@@ -119,3 +119,20 @@ pub fn try_decode_ipc_message(buf: &[u8]) -> Result<Option<(usize, Value)>, serd
     let value: Value = serde_json::from_slice(&buf[4..4 + len])?;
     Ok(Some((4 + len, value)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_roundtrip_and_short_buffer() {
+        let raw = encode_ipc_message(&serde_json::json!({"method": "get_status"})).unwrap();
+        assert!(try_decode_ipc_message(&raw[..3]).unwrap().is_none());
+        assert!(try_decode_ipc_message(&raw[..raw.len() - 1])
+            .unwrap()
+            .is_none());
+        let (n, value) = try_decode_ipc_message(&raw).unwrap().unwrap();
+        assert_eq!(n, raw.len());
+        assert_eq!(value["method"], "get_status");
+    }
+}

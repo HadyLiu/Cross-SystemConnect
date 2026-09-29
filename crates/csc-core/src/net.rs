@@ -13,8 +13,8 @@ use bytes::BytesMut;
 use csc_config::{Config, Role};
 use csc_proto::{
     decode_hello_bin, encode_frame, encode_hello_bin, encode_json_frame, encode_mouse_move_bin,
-    try_decode_frame, AppStatus, DiscoveredPeer, HelloPayload, MouseMovePayload,
-    MsgType, SwitchPayload,
+    try_decode_frame, AppStatus, DiscoveredPeer, HelloPayload, MouseMovePayload, MsgType,
+    SwitchPayload,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -182,8 +182,8 @@ pub async fn spawn_network(
                     &peers2,
                     inbound.clone(),
                 ) => {
-                    if let Err(e) = result {
-                        warn!("network session ended: {e:#}");
+            if let Err(e) = result {
+                warn!("network session ended: {e:#}");
                     }
                     false
                 }
@@ -238,17 +238,7 @@ async fn run_role(
             )
             .await
         }
-        Role::Client => {
-            run_client(
-                snapshot,
-                local_host,
-                local_ips,
-                status,
-                peers,
-                inbound,
-            )
-            .await
-        }
+        Role::Client => run_client(snapshot, local_host, local_ips, status, peers, inbound).await,
     }
 }
 
@@ -402,7 +392,10 @@ fn spawn_server_link(
             Choice::Once => true,
             Choice::Reject => {
                 info!("client {key} rejected");
-                rejected.lock().await.insert(key.clone(), reject_mark(Instant::now()));
+                rejected
+                    .lock()
+                    .await
+                    .insert(key.clone(), reject_mark(Instant::now()));
                 false
             }
         };

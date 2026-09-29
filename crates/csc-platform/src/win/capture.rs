@@ -3,6 +3,7 @@ use tracing::info;
 
 /// Windows LL hook capture — hooks are installed when start() is called.
 /// Full Raw Input path can be extended; v1 polls cursor position from core loop.
+#[derive(Default)]
 pub struct WinInputCapture {
     grab: bool,
 }

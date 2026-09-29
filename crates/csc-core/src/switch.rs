@@ -294,9 +294,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw
-            .on_local_cursor(99, 50, Instant::now())
-            .expect("enter");
+        let d = sw.on_local_cursor(99, 50, Instant::now()).expect("enter");
         assert_eq!(d.neighbor, "REMOTE");
         assert_eq!(d.edge, Edge::Right);
     }

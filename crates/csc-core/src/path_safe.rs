@@ -1,7 +1,6 @@
 //! Path safety for file transfer receive paths.
 #![allow(dead_code)] // exercised by file_transfer + unit tests
 
-
 use std::path::{Component, Path, PathBuf};
 
 /// Reject absolute paths and `..` components. Returns a sanitized relative path.
@@ -37,6 +36,17 @@ mod tests {
         assert_eq!(
             sanitize_relative_path("a/b.txt").unwrap(),
             PathBuf::from("a/b.txt")
+        );
+    }
+
+    #[test]
+    fn rejects_nested_escape_and_empty() {
+        assert!(sanitize_relative_path("a/../../etc/passwd").is_none());
+        assert!(sanitize_relative_path("").is_none());
+        assert!(sanitize_relative_path(".").is_none());
+        assert_eq!(
+            sanitize_relative_path("foo/./bar").unwrap(),
+            PathBuf::from("foo").join("bar")
         );
     }
 }

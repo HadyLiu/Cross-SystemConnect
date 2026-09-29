@@ -2,9 +2,7 @@
 
 use crate::prompt::{Choice, PeerPrompt};
 use csc_config::Config;
-use csc_proto::{
-    encode_ipc_message, try_decode_ipc_message, AppStatus, IpcRequest, IpcResponse,
-};
+use csc_proto::{encode_ipc_message, try_decode_ipc_message, AppStatus, IpcRequest, IpcResponse};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +45,9 @@ async fn run_ipc_windows(state: Arc<AppState>) -> anyhow::Result<()> {
     loop {
         let server = if first {
             first = false;
-            ServerOptions::new().first_pipe_instance(true).create(PIPE)?
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(PIPE)?
         } else {
             ServerOptions::new().create(PIPE)?
         };
