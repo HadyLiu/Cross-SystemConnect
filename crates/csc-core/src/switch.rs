@@ -1,3 +1,5 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use crate::layout::ScreenLayout;
 use csc_config::SwitchConfig;
 use csc_platform::ScreenSize;

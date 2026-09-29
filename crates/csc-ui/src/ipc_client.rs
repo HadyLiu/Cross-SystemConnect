@@ -8,6 +8,7 @@ use std::time::Duration;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(windows)]
 pub const CORE_PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
 pub const CORE_BIN: &str = "Cross-SystemConnect-core";
 

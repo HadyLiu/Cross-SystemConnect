@@ -82,9 +82,6 @@ fn single_instance_lock() -> anyhow::Result<std::fs::File> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        // re-open with flock via nix would be better; write pid for now
-        let _ = OpenOptionsExt::mode;
         std::fs::write(&lock_path, format!("{}", std::process::id()))?;
     }
     Ok(file)
