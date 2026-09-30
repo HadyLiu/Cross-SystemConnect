@@ -10,9 +10,8 @@
   "control_port": 24900,
   "data_port": 24901,
   "hotkeys": {
-    "lock_screen": "ScrollLock",
-    "return_to_server": "Ctrl+Alt+Home",
-    "toggle_enable": "Ctrl+Alt+Pause"
+    "lock_screen": "Win+L",
+    "return_to_server": "Ctrl+Alt+/"
   },
   "layout": {},
   "log_level": "info",

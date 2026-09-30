@@ -151,30 +151,28 @@ impl Default for FileTransferConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeyConfig {
+    /// Locks this computer and every connected one.
     #[serde(default = "default_lock")]
     pub lock_screen: String,
     #[serde(default = "default_return")]
     pub return_to_server: String,
-    #[serde(default = "default_toggle")]
-    pub toggle_enable: String,
 }
 
 fn default_lock() -> String {
-    "ScrollLock".into()
+    "Win+L".into()
 }
 fn default_return() -> String {
-    "Ctrl+Alt+Home".into()
+    "Ctrl+Alt+/".into()
 }
-fn default_toggle() -> String {
-    "Ctrl+Alt+Pause".into()
-}
+/// Keys of earlier versions, replaced wherever they are still found.
+const RETIRED_RETURN_KEY: &str = "Ctrl+Alt+Home";
+const RETIRED_LOCK_KEY: &str = "ScrollLock";
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             lock_screen: default_lock(),
             return_to_server: default_return(),
-            toggle_enable: default_toggle(),
         }
     }
 }
@@ -268,7 +266,7 @@ pub struct ScreenPlace {
 }
 
 /// Version written by this build. Files without the field are version 1.
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 fn default_config_version() -> u32 {
     1
@@ -556,8 +554,18 @@ impl Config {
         if cfg.log.level.is_empty() {
             cfg.log.level = cfg.log_level.clone();
         }
-        if cfg.upgrade() {
+        let upgraded = cfg.upgrade();
+        if upgraded {
             info!("Upgraded config to version {CONFIG_VERSION}");
+        }
+        let retired = cfg.retire_old_hotkeys();
+        if retired {
+            info!(
+                "Hotkeys set to return {} and lock {}",
+                cfg.hotkeys.return_to_server, cfg.hotkeys.lock_screen
+            );
+        }
+        if upgraded || retired {
             if let Err(e) = cfg.save(path) {
                 warn!("Failed to persist upgraded config: {e}");
             }
@@ -579,9 +587,26 @@ impl Config {
         true
     }
 
+    /// The old keys are gone for good, not just as defaults, and an empty key
+    /// would leave the action without one. True when a key was replaced.
+    fn retire_old_hotkeys(&mut self) -> bool {
+        let retire = |key: &mut String, old: &str, new: fn() -> String| {
+            let k = key.replace(' ', "");
+            let stale = k.is_empty() || k.eq_ignore_ascii_case(old);
+            if stale {
+                *key = new();
+            }
+            stale
+        };
+        let back = retire(&mut self.hotkeys.return_to_server, RETIRED_RETURN_KEY, default_return);
+        let lock = retire(&mut self.hotkeys.lock_screen, RETIRED_LOCK_KEY, default_lock);
+        back || lock
+    }
+
     fn clamp_limits(&mut self) {
         self.clipboard.max_inline_mb = self.clipboard.max_inline_mb.clamp(1, MAX_INLINE_MB);
         self.switch_cfg.edge_push_px = self.switch_cfg.edge_push_px.clamp(0, 200);
+        self.retire_old_hotkeys();
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -756,6 +781,47 @@ mod tests {
         cfg.save(&path).unwrap();
         let again = Config::load_or_create(&path).unwrap();
         assert_eq!(again.clipboard.max_inline_mb, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_hotkeys_are_replaced() {
+        let dir = std::env::temp_dir().join(format!("csc-cfg-hk-{}", std::process::id()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"config_version":2,"name":"Desk","hotkeys":{"lock_screen":"ScrollLock","return_to_server":"Ctrl+Alt+Home","toggle_enable":"Ctrl+Alt+Pause"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_or_create(&path).unwrap();
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("toggle_enable"));
+
+        // A user's own lock key stays; the old return key never survives, even in a current file.
+        std::fs::write(
+            &path,
+            r#"{"config_version":3,"name":"Desk","hotkeys":{"lock_screen":"Ctrl+Alt+L","return_to_server":"ctrl+alt+home"}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::load_or_create(&path).unwrap();
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+L");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Ctrl+Alt+/"));
+
+        cfg.merge_from_value(serde_json::json!({
+            "hotkeys": {"lock_screen": "scroll lock", "return_to_server": "Ctrl+Alt+Home"}
+        }))
+        .unwrap();
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
+        cfg.merge_from_value(serde_json::json!({
+            "hotkeys": {"lock_screen": "", "return_to_server": ""}
+        }))
+        .unwrap();
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

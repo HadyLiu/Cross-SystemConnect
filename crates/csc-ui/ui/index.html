@@ -141,6 +141,9 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover{background:var(--accent2)}
 .btn.on{box-shadow:inset 0 0 0 1px #fff}
+input.hotkey{cursor:pointer;caret-color:transparent}
+input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
+.row > .btn.hk-reset{flex:0 0 auto;min-width:0;padding:6px 12px}
 .help h2{margin-bottom:8px}
 .help p,.help li{color:var(--text)}
 .help ul{margin:0;padding-left:18px}
@@ -234,8 +237,6 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <h2>文件传输</h2>
           <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
           <label class="check"><input id="clip_files" type="checkbox"/><span>复制文件后，在另一台电脑按 Ctrl+V 传输</span></label>
-          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text" placeholder="默认：桌面"/></div>
-          <div class="row"><label class="f"></label><button class="btn" id="ft_pick_dir" type="button">浏览…</button><button class="btn" id="ft_open_dir" type="button">打开</button></div>
           <div class="row"><label class="f">单文件上限 MB</label><input id="ft_max_size_mb" type="number"/></div>
           <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限制传输速度（不勾选则不限速，跑满带宽）</span></label>
           <div class="row"><label class="f">限速 MiB/s</label><input id="ft_max_speed_mibs" type="number" min="1"/></div>
@@ -243,9 +244,9 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         </div>
         <div class="card">
           <h2>快捷键</h2>
-          <div class="row"><label class="f">锁定屏幕</label><input id="lock_screen" type="text"/></div>
-          <div class="row" title="键鼠在另一台电脑上时按下，立即回到本机"><label class="f">回到本机</label><input id="return_to_server" type="text" placeholder="Ctrl+Alt+Home"/></div>
-          <div class="row"><label class="f">切换共享</label><input id="toggle_enable" type="text"/></div>
+          <div class="row" title="在任意一台电脑上按下，所有已连接的电脑一起锁屏"><label class="f">锁定屏幕</label><input id="lock_screen" class="hotkey" type="text" readonly data-default="Win+L" placeholder="Win+L"/><button type="button" class="btn hk-reset" data-for="lock_screen">默认</button></div>
+          <div class="row" title="键鼠在另一台电脑上时按下，立即回到本机"><label class="f">回到本机</label><input id="return_to_server" class="hotkey" type="text" readonly data-default="Ctrl+Alt+/" placeholder="Ctrl+Alt+/"/><button type="button" class="btn hk-reset" data-for="return_to_server">默认</button></div>
+          <p class="hint">点一下输入框，再按下新的组合键即可修改；Esc 取消。锁定屏幕：在任意一台电脑上按下，所有已连接的电脑一起锁屏。Win+L 会被系统直接锁屏、无法录入，用「默认」恢复。</p>
         </div>
         <div class="card">
           <h2>窗口 / 托盘</h2>
@@ -301,9 +302,8 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <div class="card">
           <h2>快捷键</h2>
           <ul>
-            <li>锁定屏幕：ScrollLock</li>
-            <li>切回键鼠主机：Ctrl+Alt+Home</li>
-            <li>暂停或恢复共享：Ctrl+Alt+Pause</li>
+            <li>锁定屏幕：Win+L，所有已连接的电脑一起锁屏</li>
+            <li>切回键鼠主机：Ctrl+Alt+/</li>
           </ul>
           <p class="hint">可以在「设置」里改。边缘切换的延迟和死区也在设置里。</p>
         </div>
@@ -646,6 +646,58 @@ document.querySelector('.content').addEventListener('input', e=>{
 });
 document.querySelector('.content').addEventListener('change', scheduleSave);
 
+// Hotkey fields record the combination pressed, in the names the core parses (Ctrl+Alt+/).
+const HK_KEYS={Slash:'/',Minus:'-',Equal:'=',BracketLeft:'[',BracketRight:']',Backslash:'\\',
+  Semicolon:';',Quote:"'",Backquote:'`',Comma:',',Period:'.',Space:'Space',Tab:'Tab',Enter:'Enter',
+  Backspace:'Backspace',Insert:'Insert',Delete:'Delete',Home:'Home',End:'End',PageUp:'PageUp',
+  PageDown:'PageDown',ArrowUp:'Up',ArrowDown:'Down',ArrowLeft:'Left',ArrowRight:'Right',
+  Pause:'Pause',ScrollLock:'ScrollLock',PrintScreen:'PrintScreen',CapsLock:'CapsLock'};
+function hkKeyName(code){
+  if(/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if(/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if(/^F([1-9]|1[0-2])$/.test(code)) return code;
+  return HK_KEYS[code]||'';
+}
+function hkMods(e){
+  return [e.ctrlKey&&'Ctrl',e.altKey&&'Alt',e.shiftKey&&'Shift',e.metaKey&&'Win'].filter(Boolean);
+}
+// Old keys the core also replaces: Ctrl+Alt+Home (return) and ScrollLock (lock).
+const HK_RETIRED={return_to_server:/^ctrl\+alt\+home$/i,lock_screen:/^scrolllock$/i};
+function hkClean(id,v){
+  const k=(v||'').replace(/\s/g,'');
+  if(!k||(HK_RETIRED[id]&&HK_RETIRED[id].test(k))) return $(id).dataset.default;
+  return v;
+}
+function hkPartial(el,e){
+  const m=hkMods(e);
+  el.value=m.length?m.join('+')+'+…':'';
+}
+document.querySelectorAll('input.hotkey').forEach(el=>{
+  el.addEventListener('focus',()=>{
+    el.dataset.prev=el.value; el.value=''; el.placeholder='请按下组合键…'; el.classList.add('recording');
+  });
+  el.addEventListener('blur',()=>{
+    if(!el.value||el.value.endsWith('…')) el.value=el.dataset.prev||'';
+    el.placeholder=el.dataset.default; el.classList.remove('recording');
+  });
+  el.addEventListener('keydown',e=>{
+    const mods=hkMods(e);
+    if(e.code==='Tab'&&!mods.length) return;
+    e.preventDefault(); e.stopPropagation();
+    if(e.code==='Escape'&&!mods.length){ el.value=''; el.blur(); return; }
+    const key=hkKeyName(e.code);
+    if(!key){ hkPartial(el,e); return; }
+    el.value=hkClean(el.id,[...mods,key].join('+'));
+    el.dataset.prev=el.value;
+    el.blur();
+    scheduleSave();
+  });
+  el.addEventListener('keyup',e=>{ if(el.value===''||el.value.endsWith('…')) hkPartial(el,e); });
+});
+document.querySelectorAll('.hk-reset').forEach(b=>b.onclick=()=>{
+  const el=$(b.dataset.for); el.value=el.dataset.default; el.dataset.prev=el.value; scheduleSave();
+});
+
 async function getConfig(){
   const r=await fetch('/config');
   let j=null;
@@ -689,11 +741,10 @@ function saveBody(){
     clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
                files:$('clip_files').checked,
                max_inline_mb:Math.max(1,Math.min(15,Number($('max_inline_mb').value)||15))},
-    file_transfer:{enabled:$('ft_enabled').checked,receive_dir:$('ft_receive_dir').value,
+    file_transfer:{enabled:$('ft_enabled').checked,
                    max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
                    max_speed_mibs:Number($('ft_max_speed_mibs').value)},
-    hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value,
-             toggle_enable:$('toggle_enable').value},
+    hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value},
     gui:{theme:'dark',launch_at_login:$('launch_at_login').checked,
          prevent_sleep:$('prevent_sleep').checked,auto_hide:$('auto_hide').checked,
          close_to_tray:$('close_to_tray').checked},
@@ -754,13 +805,12 @@ async function load(){
     $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
     $('clip_files').checked=!!clip.files;
     $('max_inline_mb').value=clip.max_inline_mb||15;
-    $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
+    $('ft_enabled').checked=ft.enabled!==false;
     $('ft_max_size_mb').value=ft.max_size_mb||10240;
     $('ft_limit_speed').checked=ft.limit_speed===true; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
     const hk=cfg.hotkeys||{};
-    $('lock_screen').value=hk.lock_screen||'ScrollLock';
-    $('return_to_server').value=hk.return_to_server||'Ctrl+Alt+Home';
-    $('toggle_enable').value=hk.toggle_enable||'Ctrl+Alt+Pause';
+    $('lock_screen').value=hkClean('lock_screen',hk.lock_screen);
+    $('return_to_server').value=hkClean('return_to_server',hk.return_to_server);
     $('log_level').value=(l.level||cfg.log_level||'info');
     $('log_to_file').checked=!!l.to_file; $('log_file').value=l.file||'';
     $('enable_enter_command').checked=!!cfg.enable_enter_command;
@@ -770,7 +820,8 @@ async function load(){
     const savedIp=cfg.search_address||'';
     await refreshStatus();
     ready=true;
-    if((selectedIp&&selectedIp!==savedIp)||placesDirty) scheduleSave();
+    const oldKey=$('return_to_server').value!==hk.return_to_server||$('lock_screen').value!==hk.lock_screen;
+    if((selectedIp&&selectedIp!==savedIp)||placesDirty||oldKey) scheduleSave();
     msg.className='ok'; msg.textContent='已加载';
   }catch(e){
     msg.className='err'; msg.textContent='加载失败: '+(e&&e.message?e.message:e);
@@ -884,20 +935,6 @@ $('rescanBtn').onclick=async()=>{
   }finally{
     setTimeout(()=>{ btn.disabled=false; }, 1500);
   }
-};
-$('ft_pick_dir').onclick=()=>{
-  fetch('/pick-folder',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({current:$('ft_receive_dir').value})}).catch(()=>{});
-};
-$('ft_open_dir').onclick=()=>{
-  fetch('/open-folder',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({path:$('ft_receive_dir').value})}).catch(()=>{});
-};
-// Called by the app after the folder picker closes with a choice.
-window.onFolderPicked=(path)=>{
-  if(!path) return;
-  $('ft_receive_dir').value=path;
-  scheduleSave();
 };
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);

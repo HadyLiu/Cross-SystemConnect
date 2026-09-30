@@ -3,10 +3,12 @@
 pub mod clip;
 mod host;
 pub mod keymap;
+mod lock;
 mod notify;
 mod traits;
 pub mod vdrag;
 
+pub use lock::{lock_hits, lock_screen, lock_watch};
 pub use notify::notify;
 
 #[cfg(all(unix, not(target_os = "macos")))]

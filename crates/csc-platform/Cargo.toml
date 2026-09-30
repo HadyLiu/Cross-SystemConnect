@@ -31,6 +31,7 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemServices",
     "Win32_Storage_FileSystem",
     "Win32_System_Variant",
+    "Win32_System_Shutdown",
     "implement",
 ] }
 windows-core = "0.58"

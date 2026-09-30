@@ -2,9 +2,12 @@
 //! A dedicated thread with its own display connection grabs the pointer and
 //! keyboard, turns events into `Captured`, and holds the cursor at a park point.
 //! The same thread measures raw mouse motion (XInput2), for pushing through a
-//! screen edge, and catches Ctrl+V while files copied elsewhere wait to be pasted.
+//! screen edge, notices the lock key from raw key events, and catches Ctrl+V
+//! while files copied elsewhere wait to be pasted.
 
 use super::xdo::{dlopen, dlopen_quiet, sym};
+use crate::keymap::modifier_bit;
+use crate::lock::lock_key_down;
 use crate::traits::Captured;
 use libc::{c_int, c_long, c_uint, c_ulong, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -63,6 +66,8 @@ struct XiRawEvent {
 }
 
 const GENERIC_EVENT: c_int = 35;
+const XI_RAW_KEY_PRESS: c_int = 13;
+const XI_RAW_KEY_RELEASE: c_int = 14;
 const XI_RAW_MOTION: c_int = 17;
 const XI_ALL_MASTER_DEVICES: c_int = 1;
 const XK_V: c_ulong = 0x76;
@@ -345,12 +350,16 @@ unsafe fn open_xi(x11: *mut c_void, dpy: *mut c_void, root: c_ulong) -> Option<X
     let xi = dlopen_quiet(b"libXi.so.6\0")?;
     let query_version: XiQueryVersion = sym(xi, "XIQueryVersion")?;
     let select: XiSelectEvents = sym(xi, "XISelectEvents")?;
-    let (mut major, mut minor) = (2, 0);
+    // From 2.1 on, raw events keep arriving while another client holds a grab,
+    // such as the desktop's own grab of the Win key.
+    let (mut major, mut minor) = (2, 2);
     if query_version(dpy, &mut major, &mut minor) != 0 || major < 2 {
         return None;
     }
     let mut bits = [0u8; 3];
-    bits[(XI_RAW_MOTION >> 3) as usize] |= 1 << (XI_RAW_MOTION & 7);
+    for ev in [XI_RAW_KEY_PRESS, XI_RAW_KEY_RELEASE, XI_RAW_MOTION] {
+        bits[(ev >> 3) as usize] |= 1 << (ev & 7);
+    }
     let mut mask = XiEventMask {
         deviceid: XI_ALL_MASTER_DEVICES,
         mask_len: bits.len() as c_int,
@@ -419,10 +428,34 @@ struct GrabState {
     warned: bool,
 }
 
+/// The eight modifier keys (HID 0xE0..=0xE7) currently held.
+#[derive(Default)]
+struct HeldMods(u8);
+
+impl HeldMods {
+    fn set(&mut self, hid: u32, down: bool) {
+        if let Some(i) = hid.checked_sub(0xE0).filter(|i| *i < 8) {
+            if down {
+                self.0 |= 1 << i;
+            } else {
+                self.0 &= !(1 << i);
+            }
+        }
+    }
+
+    /// As `keymap::modifier_bit` flags, either hand.
+    fn bits(&self) -> u32 {
+        (0..8)
+            .filter(|i| self.0 & (1 << i) != 0)
+            .fold(0, |bits, i| bits | modifier_bit(0xE0 + i))
+    }
+}
+
 fn run(mut api: Api) {
     let mut grabbed: Option<GrabState> = None;
     let mut buf = [0 as c_long; 24];
     let mut frac = (0.0f64, 0.0f64);
+    let mut held_mods = HeldMods::default();
     loop {
         let want = SHARED.lock().map(|s| s.want).unwrap_or(None);
         unsafe {
@@ -461,14 +494,28 @@ fn run(mut api: Api) {
                         if (*cookie).extension == xi.opcode
                             && (xi.get_data)(api.dpy, cookie as *mut c_void) != 0
                         {
-                            if (*cookie).evtype == XI_RAW_MOTION && !(*cookie).data.is_null() {
-                                let (dx, dy) = raw_delta(&*((*cookie).data as *const XiRawEvent));
+                            let evtype = (*cookie).evtype;
+                            let data = (*cookie).data as *const XiRawEvent;
+                            if evtype == XI_RAW_MOTION && !data.is_null() {
+                                let (dx, dy) = raw_delta(&*data);
                                 frac.0 += dx;
                                 frac.1 += dy;
                                 let (ix, iy) = (frac.0.trunc(), frac.1.trunc());
                                 frac = (frac.0 - ix, frac.1 - iy);
                                 RAW_DX.fetch_add(ix as i32, Ordering::AcqRel);
                                 RAW_DY.fetch_add(iy as i32, Ordering::AcqRel);
+                            } else if (evtype == XI_RAW_KEY_PRESS || evtype == XI_RAW_KEY_RELEASE)
+                                && !data.is_null()
+                            {
+                                let evdev = ((*data).detail as u32).saturating_sub(8) as u16;
+                                if let Some(hid) = crate::keymap::hid_from_evdev(evdev) {
+                                    let down = evtype == XI_RAW_KEY_PRESS;
+                                    held_mods.set(hid, down);
+                                    // While grabbed the core sees the keys itself.
+                                    if down && grabbed.is_none() {
+                                        lock_key_down(hid, held_mods.bits());
+                                    }
+                                }
                             }
                             (xi.free_data)(api.dpy, cookie as *mut c_void);
                         }

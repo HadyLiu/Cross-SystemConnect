@@ -1549,7 +1549,11 @@ async fn dispatch_frame(
                 .frame(peer.to_string(), frame.msg_type, frame.payload)
                 .await;
         }
-        MsgType::ClipOffer | MsgType::EdgeHit | MsgType::PasteRequest | MsgType::DragBegin => {
+        MsgType::ClipOffer
+        | MsgType::EdgeHit
+        | MsgType::PasteRequest
+        | MsgType::DragBegin
+        | MsgType::LockScreen => {
             let _ = inbound
                 .send(InboundEvent::From {
                     peer: peer.to_string(),

@@ -259,6 +259,7 @@ fn plan(paths: &[PathBuf]) -> Result<Plan, String> {
     };
     let mut problems = Vec::new();
     for root in paths {
+        let root = &csc_platform::clip::tidy_path(root.clone());
         let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
             problems.push(format!("{}：名称编码无法识别", root.display()));
             continue;
@@ -298,7 +299,9 @@ fn walk(path: &Path, rel: String, plan: &mut Plan, problems: &mut Vec<String>) -
     }
     let leaf = rel.rsplit('/').next().unwrap_or(&rel);
     if let Some(why) = name_problem(leaf) {
-        problems.push(format!("{rel}：{why}"));
+        // Control characters are invisible in a notification; show them escaped.
+        let shown = if rel.chars().any(char::is_control) { rel.escape_debug().to_string() } else { rel.clone() };
+        problems.push(format!("{shown}：{why}"));
         return Ok(());
     }
     if check_relative_path(&rel).is_err() {

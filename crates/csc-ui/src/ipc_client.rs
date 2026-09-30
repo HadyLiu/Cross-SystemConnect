@@ -237,12 +237,6 @@ pub fn resolve_conflict(id: u64, decisions: Value) -> anyhow::Result<Value> {
     call("resolve_conflict", json!({"transferId": id, "decisions": decisions}))
 }
 
-/// Folder incoming files go to when no drop target named one.
-pub fn receive_dir() -> anyhow::Result<String> {
-    let v = call("receive_dir", json!({}))?;
-    Ok(v.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string())
-}
-
 pub fn rescan() -> anyhow::Result<Value> {
     call("rescan", json!({}))
 }

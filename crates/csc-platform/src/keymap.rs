@@ -117,7 +117,18 @@ pub fn fold_modifier(hid: u32) -> u32 {
     }
 }
 
-/// HID usage for a key name as written in a hotkey such as `Ctrl+Alt+Home`.
+/// One bit per modifier, either hand: Ctrl 1, Shift 2, Alt 4, Win 8. 0 for other keys.
+pub fn modifier_bit(hid: u32) -> u32 {
+    match fold_modifier(hid) {
+        HID_LEFT_CTRL => 1,
+        HID_LEFT_SHIFT => 2,
+        HID_LEFT_ALT => 4,
+        HID_LEFT_GUI => 8,
+        _ => 0,
+    }
+}
+
+/// HID usage for a key name as written in a hotkey such as `Ctrl+Alt+/`.
 /// Modifiers map to their left-hand usage. Case does not matter.
 pub fn hid_from_name(name: &str) -> Option<u32> {
     let n = name.trim().to_ascii_lowercase();
@@ -127,6 +138,17 @@ pub fn hid_from_name(name: &str) -> Option<u32> {
             c @ b'a'..=b'z' => Some(0x04 + (c - b'a') as u32),
             b'0' => Some(0x27),
             c @ b'1'..=b'9' => Some(0x1E + (c - b'1') as u32),
+            b'-' => Some(0x2D),
+            b'=' => Some(0x2E),
+            b'[' => Some(0x2F),
+            b']' => Some(0x30),
+            b'\\' => Some(0x31),
+            b';' => Some(0x33),
+            b'\'' => Some(0x34),
+            b'`' => Some(0x35),
+            b',' => Some(0x36),
+            b'.' => Some(0x37),
+            b'/' => Some(0x38),
             _ => None,
         };
     }
@@ -171,6 +193,10 @@ mod tests {
         assert_eq!(hid_from_name("ctrl"), Some(HID_LEFT_CTRL));
         assert_eq!(hid_from_name("F12"), Some(0x45));
         assert_eq!(hid_from_name("q"), Some(0x14));
+        assert_eq!(hid_from_name("/"), Some(0x38));
+        assert_eq!(hid_from_name("Win"), Some(HID_LEFT_GUI));
+        assert_eq!(modifier_bit(0xE7), 8);
+        assert_eq!(modifier_bit(0x0F), 0);
         assert_eq!(hid_from_evdev(102), Some(0x4A));
         assert_eq!(fold_modifier(0xE6), HID_LEFT_ALT);
     }

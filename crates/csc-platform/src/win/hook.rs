@@ -6,10 +6,11 @@
 //! Windows drops a hook whose callback is slow, so callbacks only queue.
 //!
 //! The same thread reads raw mouse input (movement before the cursor is held
-//! at the screen edge) and, when asked, swallows Ctrl+V so a paste of files
-//! copied on another computer can start a transfer instead.
+//! at the screen edge), notices the lock key, and, when asked, swallows Ctrl+V
+//! so a paste of files copied on another computer can start a transfer instead.
 
 use crate::keymap::hid_from_scan;
+use crate::lock::lock_key_down;
 use crate::traits::Captured;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -117,6 +118,19 @@ unsafe extern "system" fn raw_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 fn key_held(vk: u16) -> bool {
     unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
+
+/// Modifiers held now, as `keymap::modifier_bit` flags.
+fn held_modifiers() -> u32 {
+    [
+        (key_held(VK_CONTROL.0), 1),
+        (key_held(VK_SHIFT.0), 2),
+        (key_held(VK_MENU.0), 4),
+        (key_held(VK_LWIN.0) || key_held(VK_RWIN.0), 8),
+    ]
+    .iter()
+    .filter(|(held, _)| *held)
+    .fold(0, |bits, (_, bit)| bits | bit)
 }
 
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -299,6 +313,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 });
             }
             return LRESULT(1);
+        }
+    }
+    if code >= 0 && !GRAB.load(Ordering::Relaxed) {
+        let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if down && info.flags.0 & LLKHF_INJECTED == 0 {
+            if let Some(hid) = hid_from_scan(info.scanCode as u16, info.flags.0 & LLKHF_EXTENDED != 0) {
+                lock_key_down(hid, held_modifiers());
+            }
         }
     }
     if code >= 0 && PASTE_WANT.load(Ordering::Relaxed) && !GRAB.load(Ordering::Relaxed) {

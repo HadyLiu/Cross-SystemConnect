@@ -49,6 +49,8 @@ const HID_LCTRL: u32 = 0xE0;
 const HID_RCTRL: u32 = 0xE4;
 /// Text above this goes on the bulk queue so it never holds up the pointer.
 const BULK_TEXT: usize = 64 * 1024;
+/// A held lock key repeats, and every computer passes the lock on once.
+const LOCK_REPEAT: Duration = Duration::from_secs(3);
 
 fn peer_size(
     sizes: &HashMap<String, csc_platform::ScreenSize>,
@@ -190,7 +192,7 @@ fn drop_zone_rect(
     }
 }
 
-/// A key combination such as `Ctrl+Alt+Home`, as HID usages.
+/// A key combination such as `Ctrl+Alt+/`, as HID usages.
 /// Modifiers are stored left-handed; either hand matches.
 #[derive(Debug, Clone, PartialEq)]
 struct Hotkey {
@@ -391,6 +393,8 @@ struct Core {
     /// Keys and buttons this computer injected for a remote host, released if that host goes away.
     injected: HeldInput,
     return_hotkey: Option<Hotkey>,
+    lock_hotkey: Option<Hotkey>,
+    last_lock: Instant,
     last_miss: Instant,
     next_nic: Instant,
     supervisor: Supervisor,
@@ -411,13 +415,29 @@ struct Core {
     last_edge_sent: Instant,
 }
 
-fn hotkey_of(cfg: &Config) -> Option<Hotkey> {
-    let text = cfg.hotkeys.return_to_server.clone();
-    let parsed = Hotkey::parse(&text);
+fn hotkey_of(text: &str, what: &str) -> Option<Hotkey> {
+    let parsed = Hotkey::parse(text);
     if parsed.is_none() && !text.trim().is_empty() {
-        warn!("return hotkey {text:?} not understood");
+        warn!("{what} hotkey {text:?} not understood");
     }
     parsed
+}
+
+/// Return and lock hotkeys from the config. The lock key is also watched
+/// while input belongs to this computer.
+fn hotkeys_of(cfg: &Config) -> (Option<Hotkey>, Option<Hotkey>) {
+    let back = hotkey_of(&cfg.hotkeys.return_to_server, "return");
+    let lock = hotkey_of(&cfg.hotkeys.lock_screen, "lock");
+    match &lock {
+        Some(k) if !csc_platform::lock_watch(&k.mods, k.key) => {
+            warn!("lock hotkey {:?} is only noticed while controlling another computer", cfg.hotkeys.lock_screen);
+        }
+        Some(_) => {}
+        None => {
+            csc_platform::lock_watch(&[], 0);
+        }
+    }
+    (back, lock)
 }
 
 impl Core {
@@ -468,7 +488,10 @@ impl Core {
                 ScreenLayout::load(&cfg.layout),
             );
             self.switch.set_screen(self.screen, self.monitors.clone());
-            self.return_hotkey = hotkey_of(&cfg);
+            (self.return_hotkey, self.lock_hotkey) = hotkeys_of(&cfg);
+        }
+        if csc_platform::lock_hits() > 0 && !self.grab {
+            self.lock_all(None).await;
         }
         if self.grab && !self.net.has_peer(self.switch.active_remote()).await {
             warn!(
@@ -621,23 +644,14 @@ impl Core {
     /// One captured event while grabbed. True once input is back on this computer.
     async fn grab_input(&mut self, step: Captured) -> bool {
         if let Captured::Key { hid, down: true } = step {
-            if self
-                .return_hotkey
-                .as_ref()
-                .is_some_and(|k| k.completes(hid, &self.held.keys))
-            {
-                let current = self.switch.active_remote().to_string();
-                self.held.release_all(&self.net).await;
-                let leave_msg = SwitchPayload {
-                    edge: csc_proto::Edge::Left,
-                    position_pct: 0.5,
-                };
-                self.net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
-                self.switch.unlock_to_local();
-                release_pointer(&mut self.grab, Some(self.home_point));
-                self.grab_armed = false;
-                self.set_active_screen(None).await;
-                info!("return hotkey: input back from {current}");
+            let hit = |k: &Option<Hotkey>| k.as_ref().is_some_and(|k| k.completes(hid, &self.held.keys));
+            let (lock, back) = (hit(&self.lock_hotkey), hit(&self.return_hotkey));
+            if lock {
+                self.lock_all(None).await;
+                return true;
+            }
+            if back {
+                self.return_home("return hotkey").await;
                 return true;
             }
             if hid == HID_V && self.held.ctrl() {
@@ -674,6 +688,47 @@ impl Core {
             return false;
         };
         self.leave_remote(leave, None).await
+    }
+
+    /// Bring input back to this computer from the active remote, crossing no edge.
+    async fn return_home(&mut self, why: &str) {
+        let current = self.switch.active_remote().to_string();
+        self.held.release_all(&self.net).await;
+        let leave_msg = SwitchPayload {
+            edge: csc_proto::Edge::Left,
+            position_pct: 0.5,
+        };
+        self.net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+        self.switch.unlock_to_local();
+        release_pointer(&mut self.grab, Some(self.home_point));
+        self.grab_armed = false;
+        self.set_active_screen(None).await;
+        info!("{why}: input back from {current}");
+    }
+
+    /// Lock this computer and the connected ones. `from` is the computer that
+    /// asked, None when the lock key was pressed here. The keyboard host passes
+    /// the lock on to its other computers; a controlled computer only tells its host.
+    async fn lock_all(&mut self, from: Option<&str>) {
+        if self.last_lock.elapsed() < LOCK_REPEAT {
+            return;
+        }
+        self.last_lock = Instant::now();
+        if self.grab {
+            self.return_home("lock screen").await;
+        } else {
+            self.injected.release_injected(self.injector.as_mut());
+        }
+        if from.is_none() || self.is_host().await {
+            for peer in self.net.peer_names().await {
+                if from.is_some_and(|f| f.eq_ignore_ascii_case(&peer)) {
+                    continue;
+                }
+                self.net.send_control(&peer, csc_proto::encode_lock_screen_bin()).await;
+            }
+        }
+        info!("locking the screen (asked by {})", from.unwrap_or("this computer"));
+        csc_platform::lock_screen();
     }
 
     /// The pointer leaves the active remote through `leave.edge`: hop to the
@@ -1259,6 +1314,7 @@ impl Core {
                     self.on_drag_begin(peer, begin).await;
                 }
             }
+            MsgType::LockScreen => self.lock_all(Some(&peer)).await,
             _ => {}
         }
     }
@@ -1478,7 +1534,7 @@ async fn main() -> anyhow::Result<()> {
         transfers: Vec::new(),
     };
 
-    let return_hotkey = hotkey_of(&cfg);
+    let (return_hotkey, lock_hotkey) = hotkeys_of(&cfg);
     let config = Arc::new(RwLock::new(cfg));
     let status = Arc::new(RwLock::new(status));
     let (quit_tx, mut quit_rx) = watch::channel(false);
@@ -1605,6 +1661,8 @@ async fn main() -> anyhow::Result<()> {
         held: HeldInput::default(),
         injected: HeldInput::default(),
         return_hotkey,
+        lock_hotkey,
+        last_lock: Instant::now() - LOCK_REPEAT,
         last_miss: Instant::now() - Duration::from_secs(5),
         next_nic: Instant::now(),
         supervisor,
@@ -1657,14 +1715,25 @@ mod tests {
 
     #[test]
     fn return_hotkey_matches_either_hand() {
-        let hk = Hotkey::parse("Ctrl+Alt+Home").expect("parse");
-        let home = 0x4A;
+        let hk = Hotkey::parse("Ctrl+Alt+End").expect("parse");
+        let end = 0x4D;
         let held: HashSet<u32> = [0xE4, 0xE2].into_iter().collect();
-        assert!(hk.completes(home, &held));
+        assert!(hk.completes(end, &held));
         let only_ctrl: HashSet<u32> = [0xE0].into_iter().collect();
-        assert!(!hk.completes(home, &only_ctrl));
-        assert!(!hk.completes(0x4D, &held));
+        assert!(!hk.completes(end, &only_ctrl));
+        assert!(!hk.completes(0x4A, &held));
         assert!(Hotkey::parse("Ctrl+Nope").is_none());
+    }
+
+    #[test]
+    fn default_hotkeys_parse() {
+        let back = Hotkey::parse("Ctrl+Alt+/").expect("parse");
+        let ctrl_alt: HashSet<u32> = [0xE0, 0xE6].into_iter().collect();
+        assert!(back.completes(0x38, &ctrl_alt));
+        let lock = Hotkey::parse("Win+L").expect("parse");
+        let right_win: HashSet<u32> = [0xE7].into_iter().collect();
+        assert!(lock.completes(0x0F, &right_win));
+        assert!(!lock.completes(0x0F, &ctrl_alt));
     }
 
     #[test]

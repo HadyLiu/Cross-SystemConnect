@@ -34,6 +34,8 @@ pub enum MsgType {
     FileBegin = 0x56,
     FileDone = 0x57,
     FileAck = 0x58,
+    /// Lock the screen. The keyboard host passes it on to its other computers.
+    LockScreen = 0x60,
 }
 
 /// Peer supports dragging a virtual file onto its desktop (`DragBegin`).
@@ -72,6 +74,7 @@ impl MsgType {
             0x56 => Self::FileBegin,
             0x57 => Self::FileDone,
             0x58 => Self::FileAck,
+            0x60 => Self::LockScreen,
             _ => return None,
         })
     }

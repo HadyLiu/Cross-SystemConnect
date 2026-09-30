@@ -336,6 +336,10 @@ pub fn encode_switch_leave_bin(s: &SwitchPayload) -> Vec<u8> {
     encode_switch_msg(MsgType::SwitchLeave, s)
 }
 
+pub fn encode_lock_screen_bin() -> Vec<u8> {
+    encode_frame(MsgType::LockScreen, &[], 0)
+}
+
 fn encode_switch_msg(msg_type: MsgType, s: &SwitchPayload) -> Vec<u8> {
     let edge = match s.edge {
         Edge::Left => 0u8,
