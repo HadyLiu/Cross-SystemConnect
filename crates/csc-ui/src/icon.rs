@@ -6,11 +6,10 @@ pub fn app_png_bytes() -> &'static [u8] {
     ICON_PNG
 }
 
-/// Preferred tray size on Windows (sharp at 100%/125% DPI).
-const TRAY_SIZE: u32 = 32;
-
 #[cfg(not(target_os = "linux"))]
 pub fn app_tray_icon() -> tray_icon::Icon {
+    /// Preferred tray size on Windows (sharp at 100%/125% DPI).
+    const TRAY_SIZE: u32 = 32;
     match load_rgba(TRAY_SIZE) {
         Ok((rgba, w, h)) => {
             tray_icon::Icon::from_rgba(rgba, w, h).unwrap_or_else(|_| fallback_icon())

@@ -227,7 +227,7 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
         }
         "save_config" | "saveConfig" => {
             let mut cfg = state.config.write().await;
-            let before_role = cfg.role.clone();
+            let before_role = cfg.role;
             let before_port = cfg.control_port;
             let before_bind = cfg.bind_address.clone();
             let before_name = cfg.name.clone();

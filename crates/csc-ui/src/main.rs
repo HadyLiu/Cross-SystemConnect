@@ -29,7 +29,6 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) enum UserEvent {
     ShowSettings,
     Quit,
-    ToggleShare,
 }
 
 pub(crate) fn app_title() -> String {
@@ -275,11 +274,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let mut tray_icon = {
         let tray_menu = Menu::new();
-        let item_settings = MenuItem::new("打开设置", true, None);
-        let item_share = MenuItem::new("暂停/启用共享", true, None);
+        let item_settings = MenuItem::new("设置", true, None);
         let item_quit = MenuItem::new("退出", true, None);
         tray_menu.append(&item_settings)?;
-        tray_menu.append(&item_share)?;
         tray_menu.append(&item_quit)?;
 
         let tray_icon_img = icon::app_tray_icon();
@@ -291,7 +288,6 @@ fn main() -> anyhow::Result<()> {
             .context("create tray icon")?;
 
         let settings_id = item_settings.id().clone();
-        let share_id = item_share.id().clone();
         let quit_id = item_quit.id().clone();
 
         MenuEvent::set_event_handler(Some({
@@ -299,8 +295,6 @@ fn main() -> anyhow::Result<()> {
             move |event: MenuEvent| {
                 if event.id == settings_id {
                     let _ = proxy.send_event(UserEvent::ShowSettings);
-                } else if event.id == share_id {
-                    let _ = proxy.send_event(UserEvent::ToggleShare);
                 } else if event.id == quit_id {
                     let _ = proxy.send_event(UserEvent::Quit);
                 }
@@ -356,7 +350,6 @@ fn main() -> anyhow::Result<()> {
 
     let mut window = None::<tao::window::Window>;
     let mut webview = None::<wry::WebView>;
-    let mut sharing = true;
     let mut warmed = false;
 
     if open_settings {
@@ -411,10 +404,6 @@ fn main() -> anyhow::Result<()> {
                     w.set_visible(true);
                     w.set_focus();
                 }
-            }
-            Event::UserEvent(UserEvent::ToggleShare) => {
-                sharing = !sharing;
-                let _ = ipc_client::set_sharing_enabled(sharing);
             }
             Event::UserEvent(UserEvent::Quit) => {
                 let _ = ipc_client::quit_core();

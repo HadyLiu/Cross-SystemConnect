@@ -1,7 +1,8 @@
-//! Cross-machine TCP control channel (HELLO + heartbeat + switch/input frames).
+//! Cross-machine control channel (HELLO + heartbeat + switch/input frames).
 //!
 //! The keyboard host (server) searches a UDP port and then connects to the client.
 //! The client sends an announce to that same port and accepts the TCP connection.
+//! UDP only carries the computer name and port. The TCP session is always TLS 1.3.
 
 use crate::discover::{
     broadcast_targets, decode_datagram, encode_announce, encode_search, is_own_announce,
@@ -18,12 +19,13 @@ use csc_proto::{
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -214,10 +216,11 @@ pub async fn spawn_network(
     Ok(NetHub { status, peers })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_role(
     snapshot: &Config,
     cfg: &Arc<RwLock<Config>>,
-    config_path: &PathBuf,
+    config_path: &Path,
     app_status: &Arc<RwLock<AppStatus>>,
     prompt: &Arc<PeerPrompt>,
     local_host: &str,
@@ -226,12 +229,17 @@ async fn run_role(
     peers: &PeerTable,
     inbound: mpsc::Sender<InboundEvent>,
 ) -> anyhow::Result<()> {
+    let identity = Arc::new(crate::tls::Identity::load(
+        config_path.parent().unwrap_or_else(|| Path::new(".")),
+    )?);
+    info!("control channel TLS fingerprint {}", identity.fingerprint);
     match snapshot.role {
         Role::Server => {
             run_server(
                 snapshot,
                 cfg,
                 config_path,
+                &identity,
                 app_status,
                 prompt,
                 local_host,
@@ -247,6 +255,7 @@ async fn run_role(
                 snapshot,
                 cfg,
                 config_path,
+                &identity,
                 app_status,
                 prompt,
                 local_host,
@@ -273,10 +282,12 @@ pub enum InboundEvent {
     Disconnected { peer: String },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     cfg: &Config,
-    _live: &Arc<RwLock<Config>>,
-    _config_path: &PathBuf,
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    identity: &Arc<crate::tls::Identity>,
     app_status: &Arc<RwLock<AppStatus>>,
     _prompt: &Arc<PeerPrompt>,
     local_host: &str,
@@ -340,6 +351,9 @@ async fn run_server(
                 inflight.lock().await.insert(key.clone());
                 spawn_server_link(
                     cfg.clone(),
+                    live.clone(),
+                    config_path.to_path_buf(),
+                    identity.clone(),
                     peers.clone(),
                     inbound.clone(),
                     status.clone(),
@@ -353,8 +367,12 @@ async fn run_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_server_link(
     cfg: Config,
+    live: Arc<RwLock<Config>>,
+    config_path: PathBuf,
+    identity: Arc<crate::tls::Identity>,
     peers: PeerTable,
     inbound: mpsc::Sender<InboundEvent>,
     status: Arc<RwLock<NetStatus>>,
@@ -364,14 +382,26 @@ fn spawn_server_link(
     peer_addr: SocketAddr,
 ) {
     tokio::spawn(async move {
-        match connect_peer(peer_addr).await {
-            Ok(stream) => {
+        match connect_tls(&identity, peer_addr).await {
+            Ok((stream, peer_cert)) => {
                 info!("connected to client {key} at {peer_addr}");
                 let (tx, rx) = mpsc::channel(64);
                 peers.insert(&key, tx).await;
                 refresh_link_status(&status, &peers).await;
                 tokio::select! {
-                    result = session(&cfg, stream, &status, key.clone(), rx, inbound, None, None) => {
+                    result = session(
+                        &cfg,
+                        &live,
+                        &config_path,
+                        stream,
+                        peer_cert,
+                        &status,
+                        key.clone(),
+                        rx,
+                        inbound,
+                        None,
+                        None,
+                    ) => {
                         if let Err(e) = result {
                             warn!("session {key} ended: {e:#}");
                         }
@@ -387,10 +417,12 @@ fn spawn_server_link(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client(
     cfg: &Config,
     live: &Arc<RwLock<Config>>,
-    config_path: &PathBuf,
+    config_path: &Path,
+    identity: &Arc<crate::tls::Identity>,
     app_status: &Arc<RwLock<AppStatus>>,
     prompt: &Arc<PeerPrompt>,
     local_host: &str,
@@ -447,12 +479,15 @@ async fn run_client(
                 }
             }
             acc = listener.accept() => {
-                let (stream, peer) = acc?;
-                let _ = stream.set_nodelay(true);
+                let (tcp, peer) = acc?;
+                let _ = tcp.set_nodelay(true);
                 info!("keyboard host connected from {peer}");
                 let key = peer.ip().to_string();
                 let (tx, rx) = mpsc::channel(64);
                 let cfg = cfg.clone();
+                let live = live.clone();
+                let config_path = config_path.to_path_buf();
+                let identity = identity.clone();
                 let status = status.clone();
                 let peers = peers.clone();
                 let inbound = inbound.clone();
@@ -472,8 +507,28 @@ async fn run_client(
                     address: peer.to_string(),
                 };
                 tokio::spawn(async move {
+                    let accepted = match accept_tls(&identity, tcp).await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("tls from {peer}: {e:#}");
+                            return;
+                        }
+                    };
+                    let (stream, peer_cert) = accepted;
                     tokio::select! {
-                        result = session(&cfg, stream, &status, key.clone(), rx, inbound, Some(link), Some(admit)) => {
+                        result = session(
+                            &cfg,
+                            &live,
+                            &config_path,
+                            stream,
+                            peer_cert,
+                            &status,
+                            key.clone(),
+                            rx,
+                            inbound,
+                            Some(link),
+                            Some(admit),
+                        ) => {
                             if let Err(e) = result {
                                 warn!("client session {key} ended: {e:#}");
                             }
@@ -591,6 +646,39 @@ async fn connect_peer(addr: SocketAddr) -> anyhow::Result<TcpStream> {
     Ok(stream)
 }
 
+async fn connect_tls(
+    identity: &crate::tls::Identity,
+    addr: SocketAddr,
+) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Vec<u8>)> {
+    let tcp = connect_peer(addr).await?;
+    let peer = crate::tls::PeerCert::new();
+    let config = identity.client_config(peer.clone())?;
+    let name = rustls::pki_types::ServerName::try_from("csc.local")
+        .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .map_err(|_| anyhow::anyhow!("tls handshake with {addr} timed out"))??;
+    let der = peer.take()?;
+    Ok((stream, der))
+}
+
+async fn accept_tls(
+    identity: &crate::tls::Identity,
+    tcp: TcpStream,
+) -> anyhow::Result<(tokio_rustls::server::TlsStream<TcpStream>, Vec<u8>)> {
+    let peer = crate::tls::PeerCert::new();
+    let config = identity.server_config(peer.clone())?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TlsAcceptor::from(Arc::new(config)).accept(tcp),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tls handshake timed out"))??;
+    let der = peer.take()?;
+    Ok((stream, der))
+}
+
 struct ClientLink {
     peers: PeerTable,
     status: Arc<RwLock<NetStatus>>,
@@ -607,17 +695,25 @@ struct Admit {
     address: String,
 }
 
-async fn session(
+#[allow(clippy::too_many_arguments)]
+async fn session<S>(
     cfg: &Config,
-    stream: TcpStream,
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    stream: S,
+    peer_cert: Vec<u8>,
     status: &Arc<RwLock<NetStatus>>,
     peer: String,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     mut inbound: mpsc::Sender<InboundEvent>,
     link: Option<ClientLink>,
     admit: Option<Admit>,
-) -> anyhow::Result<()> {
-    let (mut reader, writer) = stream.into_split();
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer_fp = crate::tls::fingerprint(&peer_cert);
+    let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
 
     let size = csc_platform::create_screen_info().virtual_size();
@@ -628,7 +724,9 @@ async fn session(
         screen_height: size.height,
         capabilities: 0,
     };
-    {
+    // The keyboard host speaks first. The controlled computer answers only after trust,
+    // so a cancelled prompt never pins a certificate on the host.
+    if admit.is_none() {
         let mut w = writer.lock().await;
         w.write_all(&encode_hello_bin(&hello)).await?;
     }
@@ -653,7 +751,7 @@ async fn session(
         };
         // Keep reading while the user decides, so the host's send buffer cannot fill.
         let announced = remote.clone();
-        let mut decision = std::pin::pin!(allow_control(&admit, &remote));
+        let mut decision = std::pin::pin!(allow_control(&admit, &remote, &peer_fp));
         let mut discard = [0u8; 4096];
         loop {
             while try_decode_frame(&mut buf)?.is_some() {}
@@ -674,7 +772,47 @@ async fn session(
                 }
             }
         }
+        {
+            let mut w = writer.lock().await;
+            w.write_all(&encode_hello_bin(&hello)).await?;
+        }
         let _ = inbound.send(InboundEvent::Hello(announced)).await;
+    } else {
+        let (remote, early) = match tokio::time::timeout(
+            Duration::from_secs(120),
+            read_until_hello(&mut reader, &mut buf),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
+                info!("client {peer} closed before accepting control: {e:#}");
+                return Ok(());
+            }
+            Err(_) => {
+                info!("client {peer} did not accept control");
+                return Ok(());
+            }
+        };
+        let name = if remote.host_name.is_empty() {
+            peer.clone()
+        } else {
+            remote.host_name.clone()
+        };
+        {
+            let mut saved = live.write().await;
+            if let Err(msg) = saved.pin_peer(&name, &peer_fp) {
+                warn!("{msg}");
+                return Ok(());
+            }
+            if let Err(e) = saved.save(config_path) {
+                warn!("save peer certificate: {e:#}");
+            }
+        }
+        for frame in early {
+            dispatch_frame(frame, status, &mut inbound).await?;
+        }
+        let _ = inbound.send(InboundEvent::Hello(remote)).await;
     }
 
     if let Some(link) = link {
@@ -738,10 +876,13 @@ async fn session(
     Ok(())
 }
 
-async fn read_until_hello(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+async fn read_until_hello<R>(
+    reader: &mut R,
     buf: &mut BytesMut,
-) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)> {
+) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)>
+where
+    R: AsyncRead + Unpin,
+{
     let mut early = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -764,7 +905,7 @@ async fn read_until_hello(
     }
 }
 
-async fn allow_control(admit: &Admit, hello: &HelloPayload) -> bool {
+async fn allow_control(admit: &Admit, hello: &HelloPayload, fingerprint: &str) -> bool {
     let name = if hello.host_name.is_empty() {
         admit.address.clone()
     } else {
@@ -782,11 +923,15 @@ async fn allow_control(admit: &Admit, hello: &HelloPayload) -> bool {
     }
     let trusted = {
         let cfg = admit.live.read().await;
-        cfg.is_trusted_peer(&name) || cfg.is_trusted_peer(&hello.host_name)
+        cfg.certificate_trusted(&name, fingerprint)
+            || cfg.certificate_trusted(&hello.host_name, fingerprint)
     };
     if trusted {
         info!("trusted keyboard host {name}");
         return true;
+    }
+    if admit.live.read().await.is_trusted_peer(&name) {
+        info!("keyboard host {name} presented a new certificate; asking again");
     }
     info!("keyboard host {name} requested control");
     let choice = admit
@@ -796,10 +941,9 @@ async fn allow_control(admit: &Admit, hello: &HelloPayload) -> bool {
     match choice {
         Choice::Trust => {
             let mut cfg = admit.live.write().await;
-            if cfg.trust_peer(&name) {
-                if let Err(e) = cfg.save(&admit.config_path) {
-                    warn!("save trusted peer: {e:#}");
-                }
+            cfg.remember_peer(&name, fingerprint);
+            if let Err(e) = cfg.save(&admit.config_path) {
+                warn!("save trusted peer: {e:#}");
             }
             true
         }

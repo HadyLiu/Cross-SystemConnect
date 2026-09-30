@@ -4,13 +4,11 @@ use tracing::info;
 /// Windows LL hook capture — hooks are installed when start() is called.
 /// Full Raw Input path can be extended; v1 polls cursor position from core loop.
 #[derive(Default)]
-pub struct WinInputCapture {
-    grab: bool,
-}
+pub struct WinInputCapture;
 
 impl WinInputCapture {
     pub fn new() -> Self {
-        Self { grab: false }
+        Self
     }
 }
 
@@ -27,9 +25,7 @@ impl InputCapture for WinInputCapture {
 
     fn stop(&mut self) {}
 
-    fn set_grab(&mut self, grab: bool) {
-        self.grab = grab;
-    }
+    fn set_grab(&mut self, _grab: bool) {}
 
     fn warp_cursor(&mut self, x: i32, y: i32) {
         unsafe {

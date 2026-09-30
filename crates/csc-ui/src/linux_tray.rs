@@ -37,8 +37,7 @@ impl ksni::Tray for LinuxTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
-            item("打开设置", UserEvent::ShowSettings),
-            item("暂停/启用共享", UserEvent::ToggleShare),
+            item("设置", UserEvent::ShowSettings),
             item("退出", UserEvent::Quit),
         ]
     }

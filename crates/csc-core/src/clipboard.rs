@@ -4,20 +4,11 @@ use csc_platform::{Clipboard, FileEntry};
 use csc_proto::{ClipOfferPayload, MsgType};
 use tracing::debug;
 
+#[derive(Default)]
 pub struct ClipboardSync {
     seq: u64,
     last_remote_seq: u64,
     ignore_next: bool,
-}
-
-impl Default for ClipboardSync {
-    fn default() -> Self {
-        Self {
-            seq: 0,
-            last_remote_seq: 0,
-            ignore_next: false,
-        }
-    }
 }
 
 impl ClipboardSync {

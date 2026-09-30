@@ -228,11 +228,6 @@ pub fn resolve_peer(host_name: &str, decision: &str) -> anyhow::Result<Value> {
     )
 }
 
-pub fn set_sharing_enabled(enabled: bool) -> anyhow::Result<()> {
-    call("set_sharing_enabled", json!({"enabled": enabled}))?;
-    Ok(())
-}
-
 fn core_lock_path() -> std::path::PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -267,6 +262,19 @@ fn kill_core_by_lock() {
             .status();
     }
     let _ = std::fs::remove_file(path);
+}
+
+/// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.
+pub fn quit_core() -> anyhow::Result<()> {
+    let _ = call_raw("quit", &json!({})).and_then(decode_response);
+    for _ in 0..15 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !try_connect() {
+            return Ok(());
+        }
+    }
+    kill_core_by_lock();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,17 +321,4 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.result.unwrap()["text"], "line");
     }
-}
-
-/// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.
-pub fn quit_core() -> anyhow::Result<()> {
-    let _ = call_raw("quit", &json!({})).and_then(decode_response);
-    for _ in 0..15 {
-        std::thread::sleep(Duration::from_millis(100));
-        if !try_connect() {
-            return Ok(());
-        }
-    }
-    kill_core_by_lock();
-    Ok(())
 }

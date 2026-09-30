@@ -9,6 +9,7 @@ mod net;
 mod path_safe;
 mod prompt;
 mod switch;
+mod tls;
 
 use crate::clipboard::ClipboardSync;
 use crate::file_transfer::FileTransfer;
@@ -77,7 +78,31 @@ fn release_pointer(
         let (ox, oy) = csc_platform::virtual_origin();
         csc_platform::warp_cursor(ox + x, oy + y);
     }
-    csc_platform::set_cursor_visible(true);
+}
+
+/// Keep the pointer just inside the edge it crossed, so the physical mouse
+/// stays where the hand is and a small move back returns to this computer.
+fn park_inside(
+    edge: csc_proto::Edge,
+    x: i32,
+    y: i32,
+    screen: csc_platform::ScreenSize,
+) -> (i32, i32) {
+    let w = screen.width.max(2);
+    let h = screen.height.max(2);
+    let inset = 24;
+    let cx = x.clamp(inset, w - 1 - inset);
+    let cy = y.clamp(inset, h - 1 - inset);
+    match edge {
+        csc_proto::Edge::Left => (inset, cy),
+        csc_proto::Edge::Right => (w - 1 - inset, cy),
+        csc_proto::Edge::Top => (cx, inset),
+        csc_proto::Edge::Bottom => (cx, h - 1 - inset),
+        csc_proto::Edge::TopLeft => (inset, inset),
+        csc_proto::Edge::TopRight => (w - 1 - inset, inset),
+        csc_proto::Edge::BottomLeft => (inset, h - 1 - inset),
+        csc_proto::Edge::BottomRight => (w - 1 - inset, h - 1 - inset),
+    }
 }
 
 fn log_path_of(cfg: &Config) -> PathBuf {
@@ -386,11 +411,11 @@ async fn main() -> anyhow::Result<()> {
                             let x = ax - ox;
                             let y = ay - oy;
                             if !grab_armed {
-                                if (x - park_x).abs() <= 40 && (y - park_y).abs() <= 40 {
-                                    grab_armed = true;
-                                } else {
-                                    csc_platform::warp_cursor(ox + park_x, oy + park_y);
-                                }
+                                // Use the cursor's real position. Forcing it back to a
+                                // mismatched point makes the physical mouse feel stuck.
+                                park_x = x;
+                                park_y = y;
+                                grab_armed = true;
                             } else {
                                 let dx = (x - park_x).clamp(-300, 300);
                                 let dy = (y - park_y).clamp(-300, 300);
@@ -421,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
                                                 edge: leave.edge.opposite(),
                                                 position_pct: leave.position_pct,
                                             };
-                                            net.send_to(&next, csc_proto::encode_switch_bin(&enter)).await;
+                                            net.send_to(next, csc_proto::encode_switch_bin(&enter)).await;
                                             let remote = peer_size(&peer_screens, next, screen);
                                             switch.confirm_entered(
                                                 enter.edge,
@@ -465,25 +490,32 @@ async fn main() -> anyhow::Result<()> {
                             let x = ax - ox;
                             let y = ay - oy;
                             if let Some(dec) = switch.on_local_cursor(x, y, Instant::now()) {
-                                if net.has_peer(&dec.neighbor).await {
+                                let known_screen = peer_screens.iter().any(|(k, size)| {
+                                    k.eq_ignore_ascii_case(&dec.neighbor)
+                                        && size.width > 1
+                                        && size.height > 1
+                                });
+                                let has_peer = net.has_peer(&dec.neighbor).await;
+                                if has_peer && known_screen {
+                                    let entry = dec.edge.opposite();
                                     let payload = SwitchPayload {
-                                        edge: dec.edge,
+                                        edge: entry,
                                         position_pct: dec.position_pct,
                                     };
                                     net.send_to(&dec.neighbor, csc_proto::encode_switch_bin(&payload)).await;
                                     let remote = peer_size(&peer_screens, &dec.neighbor, screen);
                                     switch.confirm_entered(
-                                        dec.edge,
+                                        entry,
                                         dec.position_pct,
                                         remote,
                                         &mut remote_x,
                                         &mut remote_y,
                                         &dec.neighbor,
                                     );
-                                    park_x = screen.width / 2;
-                                    park_y = screen.height / 2;
+                                    let parked = park_inside(dec.edge, x, y, screen);
+                                    park_x = parked.0;
+                                    park_y = parked.1;
                                     csc_platform::warp_cursor(ox + park_x, oy + park_y);
-                                    csc_platform::set_cursor_visible(false);
                                     grab = true;
                                     grab_armed = false;
                                     let mut s = status.write().await;
@@ -491,10 +523,17 @@ async fn main() -> anyhow::Result<()> {
                                     info!("switch enter -> {}", s.active_screen);
                                 } else if last_miss.elapsed() > Duration::from_secs(2) {
                                     last_miss = Instant::now();
-                                    warn!(
-                                        "pointer hit {:?} but {} has no session; place that computer on an edge in the layout",
-                                        dec.edge, dec.neighbor
-                                    );
+                                    if !has_peer {
+                                        warn!(
+                                            "pointer hit {:?} but {} has no session; place that computer on an edge in the layout",
+                                            dec.edge, dec.neighbor
+                                        );
+                                    } else {
+                                        warn!(
+                                            "pointer hit {:?} but {} has not reported its screen size; leaving the local pointer alone",
+                                            dec.edge, dec.neighbor
+                                        );
+                                    }
                                 }
                             }
                         }

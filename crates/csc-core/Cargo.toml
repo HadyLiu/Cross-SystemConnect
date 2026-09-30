@@ -10,6 +10,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+tokio-rustls.workspace = true
 csc-config.workspace = true
 csc-platform.workspace = true
 csc-proto.workspace = true

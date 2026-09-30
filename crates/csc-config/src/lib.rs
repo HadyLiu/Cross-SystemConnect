@@ -261,6 +261,7 @@ pub struct Config {
     pub control_port: u16,
     #[serde(default = "default_data_port")]
     pub data_port: u16,
+    /// Kept so older config files still load. The control channel is always TLS.
     #[serde(default)]
     pub tls: bool,
     #[serde(default)]
@@ -295,6 +296,9 @@ pub struct Config {
     /// Computer names that may connect again without a prompt.
     #[serde(default)]
     pub trusted_peers: Vec<String>,
+    /// SHA-256 of a peer certificate, keyed by that computer's name.
+    #[serde(default)]
+    pub peer_fingerprints: BTreeMap<String, String>,
 }
 
 fn default_bind() -> String {
@@ -333,6 +337,7 @@ impl Default for Config {
             exit_command: String::new(),
             log_level: default_log_level(),
             trusted_peers: Vec::new(),
+            peer_fingerprints: BTreeMap::new(),
         }
     }
 }
@@ -536,7 +541,7 @@ impl Config {
         let mut current = serde_json::to_value(&*self)?;
         if let (Some(base), Some(patch)) = (current.as_object_mut(), v.as_object()) {
             for (k, val) in patch {
-                if k == "trusted_peers" {
+                if k == "trusted_peers" || k == "peer_fingerprints" {
                     continue;
                 }
                 base.insert(k.clone(), val.clone());
@@ -573,6 +578,59 @@ impl Config {
                 .iter()
                 .any(|h| h.eq_ignore_ascii_case(host))
     }
+
+    pub fn peer_fingerprint<'a>(&'a self, host_name: &str) -> Option<&'a str> {
+        let host = host_name.trim();
+        self.peer_fingerprints
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(host))
+            .map(|(_, fp)| fp.as_str())
+    }
+
+    /// Name is trusted and the certificate fingerprint is the one we stored.
+    pub fn certificate_trusted(&self, host_name: &str, fingerprint: &str) -> bool {
+        self.is_trusted_peer(host_name)
+            && self
+                .peer_fingerprint(host_name)
+                .is_some_and(|fp| fp.eq_ignore_ascii_case(fingerprint.trim()))
+    }
+
+    /// Remember a keyboard host after the user chooses trust.
+    pub fn remember_peer(&mut self, host_name: &str, fingerprint: &str) {
+        let host = host_name.trim();
+        let fp = fingerprint.trim().to_ascii_lowercase();
+        if host.is_empty() || fp.is_empty() {
+            return;
+        }
+        self.trust_peer(host);
+        let key = self
+            .trusted_peers
+            .iter()
+            .find(|h| h.eq_ignore_ascii_case(host))
+            .cloned()
+            .unwrap_or_else(|| host.to_string());
+        self.peer_fingerprints.insert(key, fp);
+    }
+
+    /// Keyboard host: keep the first certificate for a controlled computer.
+    /// A later different certificate is refused.
+    pub fn pin_peer(&mut self, host_name: &str, fingerprint: &str) -> Result<(), String> {
+        let host = host_name.trim();
+        let fp = fingerprint.trim().to_ascii_lowercase();
+        if host.is_empty() || fp.is_empty() {
+            return Err("peer has no certificate".into());
+        }
+        if let Some(existing) = self.peer_fingerprint(host) {
+            if existing.eq_ignore_ascii_case(&fp) {
+                return Ok(());
+            }
+            return Err(format!(
+                "certificate for {host} changed; refusing the connection"
+            ));
+        }
+        self.peer_fingerprints.insert(host.to_string(), fp);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +664,19 @@ mod tests {
         assert!(cfg.is_trusted_peer("DESK"));
         assert!(!cfg.is_trusted_peer("  "));
         assert!(!cfg.trust_peer(""));
+    }
+
+    #[test]
+    fn certificate_trust_requires_matching_fingerprint() {
+        let mut cfg = Config::default();
+        cfg.trust_peer("Desk");
+        assert!(!cfg.certificate_trusted("Desk", "aa"));
+        cfg.remember_peer("desk", "AA");
+        assert!(cfg.certificate_trusted("DESK", "aa"));
+        assert!(!cfg.certificate_trusted("DESK", "bb"));
+        assert!(cfg.pin_peer("Other", "cc").is_ok());
+        assert!(cfg.pin_peer("other", "cc").is_ok());
+        assert!(cfg.pin_peer("Other", "dd").is_err());
     }
 
     #[test]
