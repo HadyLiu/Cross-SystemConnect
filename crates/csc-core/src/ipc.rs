@@ -280,6 +280,12 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 Err(e) => IpcResponse::err(req.id, e),
             }
         }
+        "rescan" => {
+            state.status.write().await.discovered.clear();
+            state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            info!("rescan requested from UI");
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
         "set_sharing_enabled" => {
             let enabled = req
                 .params

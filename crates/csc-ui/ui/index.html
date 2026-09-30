@@ -6,6 +6,7 @@
 <title>Cross-SystemConnect</title>
 <style>
 :root{
+  color-scheme:dark;
   --bg:#14161e;--side:#1a1c24;--card:#22252f;--card2:#2a2e3a;
   --text:#e8eaed;--muted:#8b93a7;--line:#2f3442;
   --accent:#3b82f6;--accent2:#2563eb;--ok:#22c55e;--off:#6b7280;--danger:#ef4444;
@@ -98,6 +99,15 @@ input[type=text],input[type=number],select,textarea{
   background:var(--card2);color:var(--text);font:inherit;outline:none;
 }
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+select{
+  appearance:none;-webkit-appearance:none;padding-right:30px;cursor:pointer;
+  background-color:var(--card2);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b93a7'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;
+}
+select option{background:var(--card2);color:var(--text)}
+#rescanBtn{min-width:0;padding:6px 12px}
+#rescanBtn:disabled{opacity:.6;cursor:default}
 textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,monospace;font-size:12px}
 .seg{display:flex;gap:8px}
 .seg button{
@@ -153,6 +163,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
     <div class="top-side">
       <span id="msg"></span>
       <div class="pill"><span class="dot" id="dot"></span><span id="pillText">加载中…</span></div>
+      <button type="button" class="btn" id="rescanBtn" title="清空已发现的设备并重新搜索">⟳ 刷新</button>
     </div>
   </div>
   <div class="content">
@@ -818,6 +829,23 @@ async function decidePeer(decision){
 }
 $('peerTrust').onclick=()=>decidePeer('trust');
 $('peerReject').onclick=()=>decidePeer('reject');
+$('rescanBtn').onclick=async()=>{
+  const btn=$('rescanBtn'), msg=$('msg');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/rescan',{method:'POST'});
+    let j=null;
+    try{ j=await r.json(); }catch(_){}
+    if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
+    liveSig='';
+    msg.className='ok'; msg.textContent='已重新开始搜索';
+    await refreshStatus();
+  }catch(e){
+    msg.className='err'; msg.textContent='刷新失败: '+(e&&e.message?e.message:e);
+  }finally{
+    setTimeout(()=>{ btn.disabled=false; }, 1500);
+  }
+};
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);
 </script>

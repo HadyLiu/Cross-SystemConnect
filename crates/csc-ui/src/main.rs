@@ -98,6 +98,21 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
             .body(Cow::Owned(body))?);
     }
 
+    if path == "/rescan" && method == Method::POST {
+        let (status, v) = match ipc_client::rescan() {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+        let body = serde_json::to_vec(&v)?;
+        return Ok(cors_headers(Response::builder())
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(body))?);
+    }
+
     if path == "/logs" && method == Method::GET {
         match ipc_client::get_logs() {
             Ok(v) => {
@@ -235,6 +250,13 @@ fn build_webview(window: &tao::window::Window) -> wry::Result<wry::WebView> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // WebKitGTK draws <select> popups with the GTK theme, which CSS cannot reach.
+    // Must be set before GTK starts. A theme the user chose still wins.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GTK_THEME").is_none() {
+        std::env::set_var("GTK_THEME", "Adwaita:dark");
+    }
+
     // Log to file so GUI subsystem still has diagnostics
     {
         use tracing_subscriber::fmt;

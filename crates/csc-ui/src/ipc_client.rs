@@ -217,6 +217,10 @@ pub fn save_config(body: Value) -> anyhow::Result<Value> {
     call("save_config", body)
 }
 
+pub fn rescan() -> anyhow::Result<Value> {
+    call("rescan", json!({}))
+}
+
 pub fn get_logs() -> anyhow::Result<Value> {
     call("get_logs", json!({}))
 }

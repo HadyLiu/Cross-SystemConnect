@@ -2,7 +2,10 @@
 //!
 //! The keyboard host (server) searches a UDP port and then connects to the client.
 //! The client sends an announce to that same port and accepts the TCP connection.
-//! UDP only carries the computer name and port. The TCP session is always TLS 1.3.
+//! The client also dials the host back when it hears a search, because a firewall
+//! often drops inbound TCP on one side only. Each side keeps one link per peer.
+//! UDP only carries the computer name and port. The TCP session is always TLS 1.3,
+//! with the client as the TLS server whichever side opened the TCP connection.
 
 use crate::discover::{
     broadcast_targets, decode_datagram, encode_announce, encode_search, is_own_announce,
@@ -26,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Default)]
 pub struct NetStatus {
@@ -53,6 +56,35 @@ impl PeerTable {
         let mut active = self.active.lock().await;
         if active.is_empty() {
             *active = name.to_string();
+        }
+    }
+
+    /// Insert only when no link to `name` exists yet.
+    async fn insert_new(&self, name: &str, tx: mpsc::Sender<Vec<u8>>) -> bool {
+        {
+            let mut txs = self.txs.lock().await;
+            if txs.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            txs.insert(name.to_string(), tx);
+        }
+        let mut active = self.active.lock().await;
+        if active.is_empty() {
+            *active = name.to_string();
+        }
+        true
+    }
+
+    /// Remove `name` only if it still points at this link, not a newer one.
+    async fn remove_owned(&self, name: &str, tx: &mpsc::Sender<Vec<u8>>) {
+        let owned = self
+            .txs
+            .lock()
+            .await
+            .get(name)
+            .is_some_and(|cur| cur.same_channel(tx));
+        if owned {
+            self.remove(name).await;
         }
     }
 
@@ -299,6 +331,13 @@ async fn run_server(
     let port = cfg.control_port;
     let bind = effective_bind(cfg);
     let udp = bind_udp(parse_bind(&bind, port)).await?;
+    let listener = match TcpListener::bind(parse_bind(&bind, port)).await {
+        Ok(l) => Some(l),
+        Err(e) => {
+            warn!("listen TCP {port} failed ({e:#}); clients cannot dial back");
+            None
+        }
+    };
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "全部本机网段".into());
     info!("searching UDP port {port} on {subnet}");
     let search = encode_search();
@@ -360,11 +399,59 @@ async fn run_server(
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
-                    peer_addr,
+                    ServerLink::Dial(peer_addr),
+                );
+            }
+            acc = accept_opt(listener.as_ref()) => {
+                let (tcp, addr) = match acc {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!("accept client: {e}");
+                        continue;
+                    }
+                };
+                let _ = tcp.set_nodelay(true);
+                let ip = addr.ip().to_string();
+                // Only computers that announced on the selected LAN may dial in.
+                let Some(key) = seen
+                    .iter()
+                    .find(|(_, (p, _))| p.address == ip)
+                    .map(|(k, _)| k.clone())
+                else {
+                    debug!("ignoring TCP from {addr}: no announce seen");
+                    continue;
+                };
+                if peers.contains(&key).await {
+                    continue;
+                }
+                spawn_server_link(
+                    cfg.clone(),
+                    live.clone(),
+                    config_path.to_path_buf(),
+                    identity.clone(),
+                    peers.clone(),
+                    inbound.clone(),
+                    status.clone(),
+                    inflight.clone(),
+                    stop_rx.clone(),
+                    key,
+                    ServerLink::Accepted(tcp, addr),
                 );
             }
         }
     }
+}
+
+async fn accept_opt(listener: Option<&TcpListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum ServerLink {
+    Dial(SocketAddr),
+    Accepted(TcpStream, SocketAddr),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,14 +466,26 @@ fn spawn_server_link(
     inflight: Arc<Mutex<HashSet<String>>>,
     mut stop: watch::Receiver<bool>,
     key: String,
-    peer_addr: SocketAddr,
+    link: ServerLink,
 ) {
     tokio::spawn(async move {
-        match connect_tls(&identity, peer_addr).await {
+        let dialed = matches!(link, ServerLink::Dial(_));
+        let (tls, peer_addr) = match link {
+            ServerLink::Dial(addr) => (connect_tls(&identity, addr).await, addr),
+            ServerLink::Accepted(tcp, addr) => (tls_client(&identity, tcp, addr).await, addr),
+        };
+        match tls {
             Ok((stream, peer_cert)) => {
-                info!("connected to client {key} at {peer_addr}");
                 let (tx, rx) = mpsc::channel(64);
-                peers.insert(&key, tx).await;
+                if !peers.insert_new(&key, tx.clone()).await {
+                    debug!("already linked to {key}; dropping extra connection {peer_addr}");
+                    if dialed {
+                        inflight.lock().await.remove(&key);
+                    }
+                    return;
+                }
+                let how = if dialed { "dialed" } else { "dialed back by client" };
+                info!("connected to client {key} at {peer_addr} ({how})");
                 refresh_link_status(&status, &peers).await;
                 tokio::select! {
                     result = session(
@@ -408,12 +507,17 @@ fn spawn_server_link(
                     }
                     _ = stop.changed() => {}
                 }
-                peers.remove(&key).await;
+                peers.remove_owned(&key, &tx).await;
                 refresh_link_status(&status, &peers).await;
             }
-            Err(e) => warn!("connect {peer_addr}: {e:#}"),
+            Err(e) if dialed => warn!(
+                "connect {peer_addr}: {e:#} (the client's firewall may block inbound TCP; waiting for it to dial back)"
+            ),
+            Err(e) => warn!("client {key} dialed back from {peer_addr}: {e:#}"),
         }
-        inflight.lock().await.remove(&key);
+        if dialed {
+            inflight.lock().await.remove(&key);
+        }
     });
 }
 
@@ -457,6 +561,20 @@ async fn run_client(
     let targets = scan_targets(cfg, port, local_ips);
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "本机网段".into());
     info!("announcing on UDP port {port} toward {subnet}");
+    let ctx = ClientCtx {
+        cfg: cfg.clone(),
+        live: live.clone(),
+        config_path: config_path.to_path_buf(),
+        identity: identity.clone(),
+        app_status: app_status.clone(),
+        prompt: prompt.clone(),
+        status: status.clone(),
+        peers: peers.clone(),
+        inbound: inbound.clone(),
+        rejected: rejected.clone(),
+        stop: stop_rx.clone(),
+    };
+    let dialing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut buf = [0u8; 2048];
     loop {
@@ -476,71 +594,97 @@ async fn run_client(
                 }
                 if decode_datagram(&buf[..n]) == Some(Datagram::Search) {
                     let _ = udp.send_to(&announce, src).await;
+                    let key = src.ip().to_string();
+                    if !peers.contains(&key).await && dialing.lock().await.insert(key.clone()) {
+                        let ctx = ctx.clone();
+                        let dialing = dialing.clone();
+                        let addr = SocketAddr::new(src.ip(), port);
+                        tokio::spawn(async move {
+                            match connect_peer(addr).await {
+                                Ok(tcp) => {
+                                    info!("dialed keyboard host at {addr}");
+                                    client_link(ctx, tcp, addr).await;
+                                }
+                                Err(e) => debug!("dial keyboard host {addr}: {e:#}"),
+                            }
+                            dialing.lock().await.remove(&key);
+                        });
+                    }
                 }
             }
             acc = listener.accept() => {
                 let (tcp, peer) = acc?;
                 let _ = tcp.set_nodelay(true);
                 info!("keyboard host connected from {peer}");
-                let key = peer.ip().to_string();
-                let (tx, rx) = mpsc::channel(64);
-                let cfg = cfg.clone();
-                let live = live.clone();
-                let config_path = config_path.to_path_buf();
-                let identity = identity.clone();
-                let status = status.clone();
-                let peers = peers.clone();
-                let inbound = inbound.clone();
-                let mut stop = stop_rx.clone();
-                let link = ClientLink {
-                    peers: peers.clone(),
-                    status: status.clone(),
-                    key: key.clone(),
-                    tx,
-                };
-                let admit = Admit {
-                    app_status: app_status.clone(),
-                    prompt: prompt.clone(),
-                    live: live.clone(),
-                    config_path: config_path.clone(),
-                    rejected: rejected.clone(),
-                    address: peer.to_string(),
-                };
-                tokio::spawn(async move {
-                    let accepted = match accept_tls(&identity, tcp).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            warn!("tls from {peer}: {e:#}");
-                            return;
-                        }
-                    };
-                    let (stream, peer_cert) = accepted;
-                    tokio::select! {
-                        result = session(
-                            &cfg,
-                            &live,
-                            &config_path,
-                            stream,
-                            peer_cert,
-                            &status,
-                            key.clone(),
-                            rx,
-                            inbound,
-                            Some(link),
-                            Some(admit),
-                        ) => {
-                            if let Err(e) = result {
-                                warn!("client session {key} ended: {e:#}");
-                            }
-                        }
-                        _ = stop.changed() => {}
-                    }
-                    peers.remove(&key).await;
-                    refresh_link_status(&status, &peers).await;
-                });
+                tokio::spawn(client_link(ctx.clone(), tcp, peer));
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct ClientCtx {
+    cfg: Config,
+    live: Arc<RwLock<Config>>,
+    config_path: PathBuf,
+    identity: Arc<crate::tls::Identity>,
+    app_status: Arc<RwLock<AppStatus>>,
+    prompt: Arc<PeerPrompt>,
+    status: Arc<RwLock<NetStatus>>,
+    peers: PeerTable,
+    inbound: mpsc::Sender<InboundEvent>,
+    rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
+    stop: watch::Receiver<bool>,
+}
+
+/// Run one control session with the keyboard host, whichever side opened the TCP.
+async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
+    let key = peer.ip().to_string();
+    let (tx, rx) = mpsc::channel(64);
+    let link = ClientLink {
+        peers: ctx.peers.clone(),
+        status: ctx.status.clone(),
+        key: key.clone(),
+        tx: tx.clone(),
+    };
+    let admit = Admit {
+        app_status: ctx.app_status.clone(),
+        prompt: ctx.prompt.clone(),
+        live: ctx.live.clone(),
+        config_path: ctx.config_path.clone(),
+        rejected: ctx.rejected.clone(),
+        address: peer.to_string(),
+    };
+    let (stream, peer_cert) = match accept_tls(&ctx.identity, tcp).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("tls from {peer}: {e:#}");
+            return;
+        }
+    };
+    let mut stop = ctx.stop.clone();
+    tokio::select! {
+        result = session(
+            &ctx.cfg,
+            &ctx.live,
+            &ctx.config_path,
+            stream,
+            peer_cert,
+            &ctx.status,
+            key.clone(),
+            rx,
+            ctx.inbound.clone(),
+            Some(link),
+            Some(admit),
+        ) => {
+            if let Err(e) = result {
+                warn!("client session {key} ended: {e:#}");
+            }
+        }
+        _ = stop.changed() => {}
+    }
+    ctx.peers.remove_owned(&key, &tx).await;
+    refresh_link_status(&ctx.status, &ctx.peers).await;
 }
 
 struct StopOnDrop(watch::Sender<bool>);
@@ -651,6 +795,14 @@ async fn connect_tls(
     addr: SocketAddr,
 ) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Vec<u8>)> {
     let tcp = connect_peer(addr).await?;
+    tls_client(identity, tcp, addr).await
+}
+
+async fn tls_client(
+    identity: &crate::tls::Identity,
+    tcp: TcpStream,
+    addr: SocketAddr,
+) -> anyhow::Result<(tokio_rustls::client::TlsStream<TcpStream>, Vec<u8>)> {
     let peer = crate::tls::PeerCert::new();
     let config = identity.client_config(peer.clone())?;
     let name = rustls::pki_types::ServerName::try_from("csc.local")
