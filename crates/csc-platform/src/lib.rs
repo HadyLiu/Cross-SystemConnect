@@ -64,3 +64,11 @@ pub fn create_screen_info() -> Box<dyn ScreenInfo> {
 pub fn create_auto_start() -> Box<dyn AutoStart> {
     Box::new(stub::StubAutoStart::default())
 }
+
+/// Windows UDP sockets report ICMP unreachable as a connection reset and then
+/// drop the socket's next read. Discovery scans a whole subnet, so that reset
+/// has to be turned off. Other systems ignore the call.
+#[cfg(windows)]
+pub fn tune_udp_socket(raw: std::os::windows::io::RawSocket) {
+    win::disable_udp_connreset(raw);
+}

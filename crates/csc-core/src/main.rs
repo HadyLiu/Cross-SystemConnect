@@ -192,13 +192,20 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
-    // The socket must exist before this function returns to the rest of startup.
-    // A later failure must not leave the UI connecting to a path that was never created.
-    run_ipc(state.clone())
+    // run_ipc accepts forever. Awaiting it here never reaches NIC discovery or search.
+    let ipc_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_ipc(ipc_state).await {
+            warn!("IPC server stopped: {e:#}");
+        }
+    });
+    // GetAdaptersAddresses must not run on a Tokio worker after the pipe is on IOCP.
+    let host = tokio::task::spawn_blocking(query_host_net_info)
         .await
-        .context("start IPC")?;
-
-    let host = query_host_net_info();
+        .unwrap_or_else(|e| {
+            warn!("host net info: {e}");
+            csc_platform::HostNetInfo::default()
+        });
     {
         let mut cfg = config.write().await;
         if cfg.search_address.is_empty() {
@@ -284,7 +291,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if Instant::now() >= next_nic {
                     next_nic = Instant::now() + Duration::from_secs(3);
-                    let host = query_host_net_info();
+                    let Ok(host) = tokio::task::spawn_blocking(query_host_net_info).await else {
+                        continue;
+                    };
                     let mut s = status.write().await;
                     s.host_name = host.host_name;
                     s.local_ipv4 = host.ipv4_addresses;

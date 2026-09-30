@@ -291,7 +291,9 @@ async fn run_server(
                 publish_discovered(app_status, &seen).await;
             }
             res = udp.recv_from(&mut buf) => {
-                let (n, src) = res?;
+                let Some((n, src)) = udp_datagram(res)? else {
+                    continue;
+                };
                 let Some(Datagram::Announce(ann)) = decode_datagram(&buf[..n]) else {
                     continue;
                 };
@@ -465,7 +467,9 @@ async fn run_client(
                 send_to_targets(&udp, &announce, &targets).await;
             }
             res = udp.recv_from(&mut buf) => {
-                let (n, src) = res?;
+                let Some((n, src)) = udp_datagram(res)? else {
+                    continue;
+                };
                 if !cfg.search_address.is_empty() {
                     let src_ip = src.ip().to_string();
                     if !same_subnet24(&src_ip, &cfg.search_address) && src_ip != "255.255.255.255" {
@@ -517,7 +521,7 @@ impl Drop for StopOnDrop {
 fn effective_bind(cfg: &Config) -> String {
     if crate::discover::ipv4_octets(&cfg.search_address).is_some() {
         cfg.search_address.clone()
-    } else if cfg.bind_address.is_empty() {
+    } else if cfg.bind_address.is_empty() || cfg.bind_address.starts_with("127.") {
         "0.0.0.0".into()
     } else {
         cfg.bind_address.clone()
@@ -568,7 +572,29 @@ fn parse_bind(bind: &str, port: u16) -> SocketAddr {
 async fn bind_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr).await?;
     sock.set_broadcast(true)?;
+    // Windows turns ICMP port-unreachable into WSAECONNRESET on the next recv.
+    // Scanning a /24 then kills discovery. Ignore that error on the socket.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        csc_platform::tune_udp_socket(sock.as_raw_socket());
+    }
     Ok(sock)
+}
+
+fn udp_datagram(
+    res: std::io::Result<(usize, SocketAddr)>,
+) -> std::io::Result<Option<(usize, SocketAddr)>> {
+    match res {
+        Ok(packet) => Ok(Some(packet)),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::ConnectionReset
+                || err.raw_os_error() == Some(10054) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn send_to_targets(sock: &UdpSocket, packet: &[u8], targets: &[SocketAddr]) {
