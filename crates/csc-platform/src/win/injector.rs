@@ -1,9 +1,10 @@
 use crate::traits::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 
 #[derive(Default)]
@@ -43,13 +44,19 @@ impl InputInjector for WinInputInjector {
     }
 
     fn mouse_button(&mut self, button: u32, down: bool) {
-        let flags = match (button, down) {
-            (0, true) => MOUSEEVENTF_LEFTDOWN,
-            (0, false) => MOUSEEVENTF_LEFTUP,
-            (1, true) => MOUSEEVENTF_RIGHTDOWN,
-            (1, false) => MOUSEEVENTF_RIGHTUP,
-            (2, true) => MOUSEEVENTF_MIDDLEDOWN,
-            (2, false) => MOUSEEVENTF_MIDDLEUP,
+        const XBUTTON1: u32 = 1;
+        const XBUTTON2: u32 = 2;
+        let (flags, data) = match (button, down) {
+            (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+            (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+            (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+            (1, false) => (MOUSEEVENTF_RIGHTUP, 0),
+            (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+            (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            (3, true) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+            (3, false) => (MOUSEEVENTF_XUP, XBUTTON1),
+            (4, true) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+            (4, false) => (MOUSEEVENTF_XUP, XBUTTON2),
             _ => return,
         };
         unsafe {
@@ -59,7 +66,7 @@ impl InputInjector for WinInputInjector {
                     mi: MOUSEINPUT {
                         dx: 0,
                         dy: 0,
-                        mouseData: 0,
+                        mouseData: data,
                         dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,
@@ -108,12 +115,13 @@ impl InputInjector for WinInputInjector {
     }
 
     fn key(&mut self, hid_usage: u32, down: bool) {
-        // Map a subset of HID usages to Windows scan codes (simplified).
-        let scan = hid_to_scan(hid_usage);
-        if scan == 0 {
+        let Some((scan, extended)) = crate::keymap::scan_from_hid(hid_usage) else {
             return;
-        }
+        };
         let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
         if !down {
             flags |= KEYEVENTF_KEYUP;
         }
@@ -132,18 +140,5 @@ impl InputInjector for WinInputInjector {
             };
             let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
         }
-    }
-}
-
-fn hid_to_scan(hid: u32) -> u16 {
-    // USB HID keyboard page 0x07 — common keys
-    match hid {
-        0x04..=0x1d => (hid - 0x04 + 0x1e) as u16, // a-z rough
-        0x2c => 0x39,                              // space
-        0x28 => 0x1c,                              // enter
-        0x29 => 0x01,                              // escape
-        0x2a => 0x0e,                              // backspace
-        0x2b => 0x0f,                              // tab
-        _ => 0,
     }
 }

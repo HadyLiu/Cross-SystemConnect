@@ -163,6 +163,32 @@ impl NetHub {
         self.send_raw(encode_mouse_move_bin(&MouseMovePayload { dx, dy }))
             .await;
     }
+
+    /// Forward one captured input event to the computer that has the pointer.
+    pub async fn send_captured(&self, ev: csc_platform::Captured) {
+        use csc_platform::Captured;
+        let frame = match ev {
+            Captured::Move { dx, dy } => encode_mouse_move_bin(&MouseMovePayload { dx, dy }),
+            Captured::Button { button, down } => {
+                csc_proto::encode_mouse_button_bin(&csc_proto::MouseButtonPayload {
+                    button,
+                    down: down as u8,
+                })
+            }
+            Captured::Wheel { v, h } => {
+                csc_proto::encode_mouse_wheel_bin(&csc_proto::MouseWheelPayload {
+                    wheel_v: v,
+                    wheel_h: h,
+                })
+            }
+            Captured::Key { hid, down } => csc_proto::encode_key_bin(&csc_proto::KeyPayload {
+                hid_usage: hid,
+                down: down as u8,
+                modifiers: 0,
+            }),
+        };
+        self.send_raw(frame).await;
+    }
 }
 
 pub async fn spawn_network(
@@ -308,6 +334,8 @@ pub enum InboundEvent {
     SwitchEnter(SwitchPayload),
     SwitchLeave(SwitchPayload),
     MouseMove { dx: i32, dy: i32 },
+    MouseButton { button: u32, down: bool },
+    MouseWheel { v: i32, h: i32 },
     Key { hid: u32, down: bool },
     ClipOffer(serde_json::Value),
     Raw(MsgType, Vec<u8>),
@@ -1159,6 +1187,26 @@ async fn dispatch_frame(
                 let dx = i32::from_le_bytes(frame.payload[0..4].try_into()?);
                 let dy = i32::from_le_bytes(frame.payload[4..8].try_into()?);
                 let _ = inbound.send(InboundEvent::MouseMove { dx, dy }).await;
+            }
+        }
+        MsgType::MouseButton => {
+            if let Some(b) = csc_proto::decode_mouse_button_bin(&frame.payload) {
+                let _ = inbound
+                    .send(InboundEvent::MouseButton {
+                        button: b.button,
+                        down: b.down != 0,
+                    })
+                    .await;
+            }
+        }
+        MsgType::MouseWheel => {
+            if let Some(w) = csc_proto::decode_mouse_wheel_bin(&frame.payload) {
+                let _ = inbound
+                    .send(InboundEvent::MouseWheel {
+                        v: w.wheel_v,
+                        h: w.wheel_h,
+                    })
+                    .await;
             }
         }
         MsgType::Key => {

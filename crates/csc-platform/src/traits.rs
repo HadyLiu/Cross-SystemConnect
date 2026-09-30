@@ -65,8 +65,60 @@ pub trait DragDrop: Send {
     fn cancel_drag(&mut self);
 }
 
+/// Monitor area in virtual-desktop pixels, relative to the desktop origin.
+/// `right` and `bottom` are exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Rect {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    pub fn width(&self) -> i32 {
+        self.right - self.left
+    }
+
+    pub fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+
+    pub fn center(&self) -> (i32, i32) {
+        (
+            self.left + self.width() / 2,
+            self.top + self.height() / 2,
+        )
+    }
+}
+
+/// Input read from the local devices while the pointer is on a remote screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Captured {
+    Move { dx: i32, dy: i32 },
+    /// 0 left, 1 right, 2 middle, 3 back, 4 forward.
+    Button { button: u32, down: bool },
+    /// Whole notches. Positive `v` scrolls up, positive `h` scrolls right.
+    Wheel { v: i32, h: i32 },
+    Key { hid: u32, down: bool },
+}
+
 pub trait ScreenInfo: Send {
     fn virtual_size(&self) -> ScreenSize;
+    /// Each physical monitor. The default is one monitor covering the desktop.
+    fn monitors(&self) -> Vec<Rect> {
+        let s = self.virtual_size();
+        vec![Rect {
+            left: 0,
+            top: 0,
+            right: s.width,
+            bottom: s.height,
+        }]
+    }
 }
 
 pub trait AutoStart: Send {

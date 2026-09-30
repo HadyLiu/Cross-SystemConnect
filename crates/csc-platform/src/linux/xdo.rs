@@ -36,6 +36,7 @@ type WarpPointer = unsafe extern "C" fn(
 ) -> c_int;
 type FakeMotion = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_ulong) -> c_int;
 type FakeButton = unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int;
+type FakeKey = unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int;
 
 struct Conn {
     dpy: *mut c_void,
@@ -49,6 +50,7 @@ struct Conn {
     fake_motion: FakeMotion,
     fake_rel: FakeMotion,
     fake_button: FakeButton,
+    fake_key: FakeKey,
 }
 
 unsafe impl Send for Conn {}
@@ -125,9 +127,19 @@ pub fn button(button: u32, down: bool) {
         0 => 1,
         1 => 3,
         2 => 2,
+        3 => 8,
+        4 => 9,
         _ => return,
     };
     x_button(xbtn, down);
+}
+
+/// Press or release an X11 keycode (evdev code + 8).
+pub fn key(keycode: u32, down: bool) {
+    let _ = with(|c| unsafe {
+        (c.fake_key)(c.dpy, keycode, if down { 1 } else { 0 }, 0);
+        (c.flush)(c.dpy);
+    });
 }
 
 pub fn x_button(xbtn: u32, down: bool) {
@@ -153,6 +165,7 @@ fn open() -> Option<Conn> {
         let fake_motion: FakeMotion = sym(xtst, "XTestFakeMotionEvent")?;
         let fake_rel: FakeMotion = sym(xtst, "XTestFakeRelativeMotionEvent")?;
         let fake_button: FakeButton = sym(xtst, "XTestFakeButtonEvent")?;
+        let fake_key: FakeKey = sym(xtst, "XTestFakeKeyEvent")?;
         init();
         let dpy = open_display(std::ptr::null());
         if dpy.is_null() {
@@ -179,6 +192,7 @@ fn open() -> Option<Conn> {
             fake_motion,
             fake_rel,
             fake_button,
+            fake_key,
         })
     }
 }

@@ -47,36 +47,79 @@ fn peer_size(
 }
 
 /// Where the local pointer reappears after it leaves a remote screen.
-/// `leave` is the edge of the remote screen that was crossed.
-fn reentry_point(leave: csc_proto::Edge, screen: csc_platform::ScreenSize) -> (i32, i32) {
-    let w = screen.width.max(2);
-    let h = screen.height.max(2);
+/// `leave` is the edge of the remote screen that was crossed, `pct` the
+/// position along it, and `m` the local monitor the pointer returns to.
+fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i32, i32) {
     let inset = 12;
+    let pct = pct.clamp(0.0, 1.0);
+    let lo_x = m.left + inset;
+    let hi_x = (m.right - 1 - inset).max(lo_x);
+    let lo_y = m.top + inset;
+    let hi_y = (m.bottom - 1 - inset).max(lo_y);
+    let along_x = (m.left + (m.width() as f32 * pct) as i32).clamp(lo_x, hi_x);
+    let along_y = (m.top + (m.height() as f32 * pct) as i32).clamp(lo_y, hi_y);
     match leave.opposite() {
-        csc_proto::Edge::Left => (inset, h / 2),
-        csc_proto::Edge::Right => (w - 1 - inset, h / 2),
-        csc_proto::Edge::Top => (w / 2, inset),
-        csc_proto::Edge::Bottom => (w / 2, h - 1 - inset),
-        csc_proto::Edge::TopLeft => (inset, inset),
-        csc_proto::Edge::TopRight => (w - 1 - inset, inset),
-        csc_proto::Edge::BottomLeft => (inset, h - 1 - inset),
-        csc_proto::Edge::BottomRight => (w - 1 - inset, h - 1 - inset),
+        csc_proto::Edge::Left => (lo_x, along_y),
+        csc_proto::Edge::Right => (hi_x, along_y),
+        csc_proto::Edge::Top => (along_x, lo_y),
+        csc_proto::Edge::Bottom => (along_x, hi_y),
+        csc_proto::Edge::TopLeft => (lo_x, lo_y),
+        csc_proto::Edge::TopRight => (hi_x, lo_y),
+        csc_proto::Edge::BottomLeft => (lo_x, hi_y),
+        csc_proto::Edge::BottomRight => (hi_x, hi_y),
     }
 }
 
-fn release_pointer(
-    grab: &mut bool,
-    leave: Option<csc_proto::Edge>,
-    screen: csc_platform::ScreenSize,
-) {
+/// Give input back to this computer. `target` is where the cursor reappears,
+/// in desktop coordinates relative to the virtual origin.
+fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
     if !*grab {
         return;
     }
     *grab = false;
-    if let Some(edge) = leave {
-        let (x, y) = reentry_point(edge, screen);
+    csc_platform::capture_set_grab(false, None);
+    if let Some((x, y)) = target {
         let (ox, oy) = csc_platform::virtual_origin();
         csc_platform::warp_cursor(ox + x, oy + y);
+    }
+}
+
+/// Keys and buttons the remote computer currently sees as held down.
+#[derive(Default)]
+struct HeldInput {
+    keys: std::collections::HashSet<u32>,
+    buttons: std::collections::HashSet<u32>,
+}
+
+impl HeldInput {
+    fn track(&mut self, ev: csc_platform::Captured) {
+        use csc_platform::Captured;
+        match ev {
+            Captured::Key { hid, down: true } => {
+                self.keys.insert(hid);
+            }
+            Captured::Key { hid, down: false } => {
+                self.keys.remove(&hid);
+            }
+            Captured::Button { button, down: true } => {
+                self.buttons.insert(button);
+            }
+            Captured::Button { button, down: false } => {
+                self.buttons.remove(&button);
+            }
+            _ => {}
+        }
+    }
+
+    /// Release everything on the remote, so no key stays stuck after the pointer leaves.
+    async fn release_all(&mut self, net: &crate::net::NetHub) {
+        use csc_platform::Captured;
+        for hid in self.keys.drain() {
+            net.send_captured(Captured::Key { hid, down: false }).await;
+        }
+        for button in self.buttons.drain() {
+            net.send_captured(Captured::Button { button, down: false }).await;
+        }
     }
 }
 
@@ -214,7 +257,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Cross-SystemConnect-core starting name={}", cfg.name);
 
-    let screen = create_screen_info().virtual_size();
+    csc_platform::init_process();
+    let screen_info = create_screen_info();
+    let mut screen = screen_info.virtual_size();
+    let mut monitors = screen_info.monitors();
+    info!(
+        "screen {}x{}, monitors {:?}",
+        screen.width, screen.height, monitors
+    );
     let mut switch = SwitchController::default();
     switch.configure(
         cfg.name.clone(),
@@ -222,6 +272,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.switch_cfg.clone(),
         ScreenLayout::load(&cfg.layout),
     );
+    switch.set_screen(screen, monitors.clone());
+    let hooked = csc_platform::capture_start();
 
     let status = AppStatus {
         connected: false,
@@ -354,6 +406,8 @@ async fn main() -> anyhow::Result<()> {
     let mut grab_armed = false;
     let mut park_x = 0i32;
     let mut park_y = 0i32;
+    let mut enter_point = (0i32, 0i32);
+    let mut held = HeldInput::default();
     let mut last_miss = Instant::now() - Duration::from_secs(5);
     let mut tick = tokio::time::interval(Duration::from_millis(8));
     let mut next_nic = Instant::now();
@@ -363,7 +417,8 @@ async fn main() -> anyhow::Result<()> {
             _ = quit_rx.changed() => {
                 if *quit_rx.borrow_and_update() {
                     info!("quit requested");
-                    release_pointer(&mut grab, None, screen);
+                    held.release_all(&net).await;
+                    release_pointer(&mut grab, None);
                     break;
                 }
             }
@@ -377,9 +432,26 @@ async fn main() -> anyhow::Result<()> {
                         cfg.switch_cfg.clone(),
                         ScreenLayout::load(&cfg.layout),
                     );
+                    switch.set_screen(screen, monitors.clone());
                 }
                 if Instant::now() >= next_nic {
                     next_nic = Instant::now() + Duration::from_secs(3);
+                    if !grab {
+                        let now_screen = screen_info.virtual_size();
+                        let now_monitors = screen_info.monitors();
+                        if now_monitors != monitors
+                            || now_screen.width != screen.width
+                            || now_screen.height != screen.height
+                        {
+                            info!(
+                                "screen changed to {}x{}, monitors {:?}",
+                                now_screen.width, now_screen.height, now_monitors
+                            );
+                            screen = now_screen;
+                            monitors = now_monitors;
+                            switch.set_screen(screen, monitors.clone());
+                        }
+                    }
                     let Ok(host) = tokio::task::spawn_blocking(query_host_net_info).await else {
                         continue;
                     };
@@ -406,83 +478,100 @@ async fn main() -> anyhow::Result<()> {
 
                 if screen.width > 1 && screen.height > 1 {
                     if grab && switch.state() == crate::switch::SwitchState::Remote {
-                        if let Some((ax, ay)) = csc_platform::cursor_pos() {
-                            let (ox, oy) = csc_platform::virtual_origin();
-                            let x = ax - ox;
-                            let y = ay - oy;
-                            if !grab_armed {
-                                // Use the cursor's real position. Forcing it back to a
-                                // mismatched point makes the physical mouse feel stuck.
-                                park_x = x;
-                                park_y = y;
-                                grab_armed = true;
-                            } else {
-                                let dx = (x - park_x).clamp(-300, 300);
-                                let dy = (y - park_y).clamp(-300, 300);
-                                if dx != 0 || dy != 0 {
+                        // With hooks, local input arrives already swallowed. Without them,
+                        // poll the cursor and pull it back to the park point each tick.
+                        let steps: Vec<csc_platform::Captured> = if hooked {
+                            csc_platform::capture_drain()
+                        } else {
+                            let mut polled = Vec::new();
+                            if let Some((ax, ay)) = csc_platform::cursor_pos() {
+                                let (ox, oy) = csc_platform::virtual_origin();
+                                let x = ax - ox;
+                                let y = ay - oy;
+                                if !grab_armed {
+                                    // Use the cursor's real position. Forcing it back to a
+                                    // mismatched point makes the physical mouse feel stuck.
+                                    park_x = x;
+                                    park_y = y;
+                                    grab_armed = true;
+                                } else if x != park_x || y != park_y {
                                     csc_platform::warp_cursor(ox + park_x, oy + park_y);
-                                    let current = switch.active_remote().to_string();
-                                    let remote = peer_size(&peer_screens, &current, screen);
-                                    if let Some(leave) = switch.on_remote_relative(
-                                        dx,
-                                        dy,
-                                        &mut remote_x,
-                                        &mut remote_y,
-                                        remote,
-                                    ) {
-                                        let local_name = status.read().await.local_name.clone();
-                                        let next = switch.neighbor_from_active(leave.edge);
-                                        let hop = next.as_ref().filter(|name| {
-                                            !name.eq_ignore_ascii_case(&local_name)
-                                                && !name.eq_ignore_ascii_case(&current)
-                                        });
-                                        if let Some(next) = hop {
-                                            let leave_msg = SwitchPayload {
-                                                edge: leave.edge,
-                                                position_pct: leave.position_pct,
-                                            };
-                                            net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
-                                            let enter = SwitchPayload {
-                                                edge: leave.edge.opposite(),
-                                                position_pct: leave.position_pct,
-                                            };
-                                            net.send_to(next, csc_proto::encode_switch_bin(&enter)).await;
-                                            let remote = peer_size(&peer_screens, next, screen);
-                                            switch.confirm_entered(
-                                                enter.edge,
-                                                enter.position_pct,
-                                                remote,
-                                                &mut remote_x,
-                                                &mut remote_y,
-                                                next,
-                                            );
-                                            status.write().await.active_screen = next.clone();
-                                            info!("switch hop -> {next}");
-                                        } else {
-                                            let leave_msg = SwitchPayload {
-                                                edge: leave.edge,
-                                                position_pct: leave.position_pct,
-                                            };
-                                            if current.is_empty() {
-                                                net.send_raw(encode_switch_leave_bin(&leave_msg)).await;
-                                            } else {
-                                                net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
-                                            }
-                                            switch.confirm_returned();
-                                            release_pointer(&mut grab, Some(leave.edge), screen);
-                                            grab_armed = false;
-                                            let mut s = status.write().await;
-                                            s.active_screen = s.local_name.clone();
-                                            info!("switch return");
-                                        }
-                                    } else {
-                                        net.send_mouse_move(dx, dy).await;
-                                    }
+                                    polled.push(csc_platform::Captured::Move {
+                                        dx: x - park_x,
+                                        dy: y - park_y,
+                                    });
                                 }
+                            }
+                            polled
+                        };
+                        for step in steps {
+                            let csc_platform::Captured::Move { dx, dy } = step else {
+                                held.track(step);
+                                net.send_captured(step).await;
+                                continue;
+                            };
+                            let dx = dx.clamp(-300, 300);
+                            let dy = dy.clamp(-300, 300);
+                            let current = switch.active_remote().to_string();
+                            let remote = peer_size(&peer_screens, &current, screen);
+                            let Some(leave) = switch.on_remote_relative(
+                                dx,
+                                dy,
+                                &mut remote_x,
+                                &mut remote_y,
+                                remote,
+                            ) else {
+                                net.send_mouse_move(dx, dy).await;
+                                continue;
+                            };
+                            held.release_all(&net).await;
+                            let local_name = status.read().await.local_name.clone();
+                            let next = switch.neighbor_from_active(leave.edge);
+                            let hop = next.as_ref().filter(|name| {
+                                !name.eq_ignore_ascii_case(&local_name)
+                                    && !name.eq_ignore_ascii_case(&current)
+                            });
+                            let leave_msg = SwitchPayload {
+                                edge: leave.edge,
+                                position_pct: leave.position_pct,
+                            };
+                            if let Some(next) = hop {
+                                net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                                let enter = SwitchPayload {
+                                    edge: leave.edge.opposite(),
+                                    position_pct: leave.position_pct,
+                                };
+                                net.send_to(next, csc_proto::encode_switch_bin(&enter)).await;
+                                let remote = peer_size(&peer_screens, next, screen);
+                                switch.confirm_entered(
+                                    enter.edge,
+                                    enter.position_pct,
+                                    remote,
+                                    &mut remote_x,
+                                    &mut remote_y,
+                                    next,
+                                );
+                                status.write().await.active_screen = next.clone();
+                                info!("switch hop -> {next}");
+                            } else {
+                                if current.is_empty() {
+                                    net.send_raw(encode_switch_leave_bin(&leave_msg)).await;
+                                } else {
+                                    net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                                }
+                                switch.confirm_returned();
+                                let m = switch.monitor_at(enter_point.0, enter_point.1);
+                                let back = reentry_point(leave.edge, leave.position_pct, m);
+                                release_pointer(&mut grab, Some(back));
+                                grab_armed = false;
+                                let mut s = status.write().await;
+                                s.active_screen = s.local_name.clone();
+                                info!("switch return");
+                                break;
                             }
                         }
                     } else if grab {
-                        release_pointer(&mut grab, None, screen);
+                        release_pointer(&mut grab, None);
                         grab_armed = false;
                     } else if switch.enabled() && switch.state() == crate::switch::SwitchState::Local {
                         if let Some((ax, ay)) = csc_platform::cursor_pos() {
@@ -512,10 +601,20 @@ async fn main() -> anyhow::Result<()> {
                                         &mut remote_y,
                                         &dec.neighbor,
                                     );
-                                    let parked = park_inside(dec.edge, x, y, screen);
-                                    park_x = parked.0;
-                                    park_y = parked.1;
-                                    csc_platform::warp_cursor(ox + park_x, oy + park_y);
+                                    enter_point = (x, y);
+                                    held = HeldInput::default();
+                                    if hooked {
+                                        // Moves are measured from the park point, and Windows
+                                        // clips the cursor at the desktop edge. Park in the
+                                        // middle of this monitor so no motion is lost.
+                                        let (cx, cy) = switch.monitor_at(x, y).center();
+                                        csc_platform::capture_set_grab(true, Some((ox + cx, oy + cy)));
+                                    } else {
+                                        let parked = park_inside(dec.edge, x, y, screen);
+                                        park_x = parked.0;
+                                        park_y = parked.1;
+                                        csc_platform::warp_cursor(ox + park_x, oy + park_y);
+                                    }
                                     grab = true;
                                     grab_armed = false;
                                     let mut s = status.write().await;
@@ -547,7 +646,8 @@ async fn main() -> anyhow::Result<()> {
                         let mut s = status.write().await;
                         if s.active_screen.eq_ignore_ascii_case(&peer) || s.peer_name.eq_ignore_ascii_case(&peer) {
                             switch.unlock_to_local();
-                            release_pointer(&mut grab, None, screen);
+                            held = HeldInput::default();
+                            release_pointer(&mut grab, None);
                             grab_armed = false;
                             s.active_screen = s.local_name.clone();
                         }
@@ -601,7 +701,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         switch.confirm_returned();
-                        release_pointer(&mut grab, Some(p.edge), screen);
+                        if grab {
+                            held.release_all(&net).await;
+                            let m = switch.monitor_at(enter_point.0, enter_point.1);
+                            release_pointer(&mut grab, Some(reentry_point(p.edge, p.position_pct, m)));
+                        }
                         grab_armed = false;
                         let mut s = status.write().await;
                         s.active_screen = s.local_name.clone();
@@ -615,8 +719,20 @@ async fn main() -> anyhow::Result<()> {
                             injector.mouse_move_abs(remote_x, remote_y);
                         }
                     }
+                    Some(InboundEvent::MouseButton { button, down }) => {
+                        if !grab {
+                            injector.mouse_button(button, down);
+                        }
+                    }
+                    Some(InboundEvent::MouseWheel { v, h }) => {
+                        if !grab {
+                            injector.mouse_wheel(v, h);
+                        }
+                    }
                     Some(InboundEvent::Key { hid, down }) => {
-                        injector.key(hid, down);
+                        if !grab {
+                            injector.key(hid, down);
+                        }
                     }
                     Some(InboundEvent::ClipOffer(v)) => {
                         match serde_json::from_value::<ClipOfferPayload>(v) {

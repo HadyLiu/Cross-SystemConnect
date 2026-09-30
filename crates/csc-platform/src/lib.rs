@@ -1,6 +1,7 @@
 //! Platform abstractions for input, clipboard, screen, and host info.
 
 mod host;
+pub mod keymap;
 mod traits;
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -111,6 +112,47 @@ pub fn set_cursor_visible(visible: bool) {
 
 #[cfg(not(windows))]
 pub fn set_cursor_visible(_visible: bool) {}
+
+/// Process-wide setup that must run before any screen or cursor call.
+pub fn init_process() {
+    #[cfg(windows)]
+    win::init_dpi_awareness();
+}
+
+/// Start capturing local input for forwarding. Returns false where the
+/// platform has no capture; the core then falls back to polling the cursor
+/// and cannot forward buttons or keys.
+pub fn capture_start() -> bool {
+    #[cfg(windows)]
+    {
+        win::hook::start()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Swallow local input and hold the cursor at `park` (absolute screen pixels),
+/// or give input back to this computer.
+pub fn capture_set_grab(grab: bool, park: Option<(i32, i32)>) {
+    #[cfg(windows)]
+    win::hook::set_grab(grab, park);
+    #[cfg(not(windows))]
+    let _ = (grab, park);
+}
+
+/// Input captured since the last call.
+pub fn capture_drain() -> Vec<Captured> {
+    #[cfg(windows)]
+    {
+        win::hook::drain()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
 
 pub fn create_auto_start() -> Box<dyn AutoStart> {
     Box::new(stub::StubAutoStart::default())

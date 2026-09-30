@@ -54,18 +54,22 @@ impl InputInjector for LinuxInputInjector {
     fn mouse_button(&mut self, button: u32, down: bool) {
         xdo::button(button, down);
     }
-    fn mouse_wheel(&mut self, v: i32, _h: i32) {
-        let xbtn = if v > 0 {
-            4
-        } else if v < 0 {
-            5
-        } else {
-            return;
-        };
-        xdo::x_button(xbtn, true);
-        xdo::x_button(xbtn, false);
+    fn mouse_wheel(&mut self, v: i32, h: i32) {
+        // X11 scrolls with button clicks: 4 up, 5 down, 6 left, 7 right.
+        let clicks = [(v, 4, 5), (h, 7, 6)];
+        for (amount, positive, negative) in clicks {
+            let xbtn = if amount > 0 { positive } else { negative };
+            for _ in 0..amount.unsigned_abs().min(20) {
+                xdo::x_button(xbtn, true);
+                xdo::x_button(xbtn, false);
+            }
+        }
     }
-    fn key(&mut self, _hid_usage: u32, _down: bool) {}
+    fn key(&mut self, hid_usage: u32, down: bool) {
+        if let Some(code) = crate::keymap::evdev_from_hid(hid_usage) {
+            xdo::key(code as u32 + 8, down);
+        }
+    }
 }
 
 pub struct LinuxScreenInfo;

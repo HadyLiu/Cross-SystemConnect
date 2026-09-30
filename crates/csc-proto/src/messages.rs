@@ -209,6 +209,40 @@ pub fn encode_mouse_move_bin(m: &MouseMovePayload) -> Vec<u8> {
     encode_frame(MsgType::MouseMove, &body, 0)
 }
 
+pub fn encode_mouse_button_bin(m: &MouseButtonPayload) -> Vec<u8> {
+    let mut body = Vec::with_capacity(5);
+    body.extend_from_slice(&m.button.to_le_bytes());
+    body.push(m.down);
+    encode_frame(MsgType::MouseButton, &body, 0)
+}
+
+pub fn decode_mouse_button_bin(payload: &[u8]) -> Option<MouseButtonPayload> {
+    if payload.len() < 5 {
+        return None;
+    }
+    Some(MouseButtonPayload {
+        button: u32::from_le_bytes(payload[0..4].try_into().ok()?),
+        down: payload[4],
+    })
+}
+
+pub fn encode_mouse_wheel_bin(m: &MouseWheelPayload) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&m.wheel_v.to_le_bytes());
+    body.extend_from_slice(&m.wheel_h.to_le_bytes());
+    encode_frame(MsgType::MouseWheel, &body, 0)
+}
+
+pub fn decode_mouse_wheel_bin(payload: &[u8]) -> Option<MouseWheelPayload> {
+    if payload.len() < 8 {
+        return None;
+    }
+    Some(MouseWheelPayload {
+        wheel_v: i32::from_le_bytes(payload[0..4].try_into().ok()?),
+        wheel_h: i32::from_le_bytes(payload[4..8].try_into().ok()?),
+    })
+}
+
 pub fn encode_key_bin(k: &KeyPayload) -> Vec<u8> {
     let mut body = Vec::with_capacity(9);
     body.extend_from_slice(&k.hid_usage.to_le_bytes());

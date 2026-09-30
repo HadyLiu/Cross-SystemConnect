@@ -2,7 +2,7 @@
 
 use crate::layout::ScreenLayout;
 use csc_config::SwitchConfig;
-use csc_platform::ScreenSize;
+use csc_platform::{Rect, ScreenSize};
 use csc_proto::Edge;
 use std::time::Instant;
 
@@ -24,6 +24,8 @@ pub struct EnterDecision {
 pub struct SwitchController {
     local_name: String,
     screen: ScreenSize,
+    /// Local monitors. Empty means one monitor covering `screen`.
+    monitors: Vec<Rect>,
     cfg: SwitchConfig,
     layout: ScreenLayout,
     state: SwitchState,
@@ -40,6 +42,7 @@ impl Default for SwitchController {
         Self {
             local_name: String::new(),
             screen: ScreenSize::default(),
+            monitors: Vec::new(),
             cfg: SwitchConfig::default(),
             layout: ScreenLayout::default(),
             state: SwitchState::Local,
@@ -64,6 +67,55 @@ impl SwitchController {
         self.screen = screen;
         self.cfg = cfg;
         self.layout = layout;
+    }
+
+    pub fn set_screen(&mut self, screen: ScreenSize, monitors: Vec<Rect>) {
+        self.screen = screen;
+        self.monitors = monitors;
+    }
+
+    fn monitor_list(&self) -> Vec<Rect> {
+        if self.monitors.is_empty() {
+            vec![Rect {
+                left: 0,
+                top: 0,
+                right: self.screen.width,
+                bottom: self.screen.height,
+            }]
+        } else {
+            self.monitors.clone()
+        }
+    }
+
+    /// Monitor holding the point, or the nearest one when the point is in a gap.
+    pub fn monitor_at(&self, x: i32, y: i32) -> Rect {
+        let list = self.monitor_list();
+        if let Some(m) = list.iter().find(|m| m.contains(x, y)) {
+            return *m;
+        }
+        let dist = |m: &Rect| {
+            let dx = (m.left - x).max(0).max(x - (m.right - 1));
+            let dy = (m.top - y).max(0).max(y - (m.bottom - 1));
+            dx as i64 * dx as i64 + dy as i64 * dy as i64
+        };
+        list.into_iter().min_by_key(dist).unwrap_or_default()
+    }
+
+    /// Sides of monitor `m` that lie on the outer boundary of the whole desktop.
+    /// A border between two monitors, or the side of a monitor that is set back
+    /// from its neighbors, never switches computers.
+    fn outer_sides(&self, m: &Rect) -> (bool, bool, bool, bool) {
+        let list = self.monitor_list();
+        let min_left = list.iter().map(|r| r.left).min().unwrap_or(m.left);
+        let max_right = list.iter().map(|r| r.right).max().unwrap_or(m.right);
+        let min_top = list.iter().map(|r| r.top).min().unwrap_or(m.top);
+        let max_bottom = list.iter().map(|r| r.bottom).max().unwrap_or(m.bottom);
+        (
+            m.left <= min_left,
+            m.right >= max_right,
+            m.top <= min_top,
+            m.bottom >= max_bottom,
+        )
     }
 
     pub fn state(&self) -> SwitchState {
@@ -155,15 +207,15 @@ impl SwitchController {
     }
 
     fn hit_outer_edge(&self, x: i32, y: i32) -> Option<Edge> {
-        let w = self.screen.width;
-        let h = self.screen.height;
-        if x <= 0 {
+        let m = self.monitor_at(x, y);
+        let (ol, or, ot, ob) = self.outer_sides(&m);
+        if ol && x <= m.left {
             Some(Edge::Left)
-        } else if x >= w - 1 {
+        } else if or && x >= m.right - 1 {
             Some(Edge::Right)
-        } else if y <= 0 {
+        } else if ot && y <= m.top {
             Some(Edge::Top)
-        } else if y >= h - 1 {
+        } else if ob && y >= m.bottom - 1 {
             Some(Edge::Bottom)
         } else {
             None
@@ -173,12 +225,12 @@ impl SwitchController {
     /// Corner that the pointer is in, using the configured dead-zone size.
     fn diagonal_at(&self, x: i32, y: i32) -> Option<Edge> {
         let d = self.cfg.corner_dead_zone_px.max(0);
-        let w = self.screen.width;
-        let h = self.screen.height;
-        let left = x <= d;
-        let right = x >= w.saturating_sub(1).saturating_sub(d);
-        let top = y <= d;
-        let bottom = y >= h.saturating_sub(1).saturating_sub(d);
+        let m = self.monitor_at(x, y);
+        let (ol, or, ot, ob) = self.outer_sides(&m);
+        let left = ol && x <= m.left + d;
+        let right = or && x >= m.right - 1 - d;
+        let top = ot && y <= m.top + d;
+        let bottom = ob && y >= m.bottom - 1 - d;
         if left && top {
             Some(Edge::TopLeft)
         } else if right && top {
@@ -255,17 +307,18 @@ impl SwitchController {
     }
 
     fn make_decision(&self, neighbor: String, edge: Edge, x: i32, y: i32) -> EnterDecision {
+        let m = self.monitor_at(x, y);
         let pct = match edge {
             Edge::Left | Edge::Right => {
-                if self.screen.height > 0 {
-                    y as f32 / self.screen.height as f32
+                if m.height() > 0 {
+                    (y - m.top) as f32 / m.height() as f32
                 } else {
                     0.5
                 }
             }
             Edge::Top | Edge::Bottom => {
-                if self.screen.width > 0 {
-                    x as f32 / self.screen.width as f32
+                if m.width() > 0 {
+                    (x - m.left) as f32 / m.width() as f32
                 } else {
                     0.5
                 }
@@ -303,35 +356,51 @@ impl SwitchController {
             (_, true, _, true) => Some(Edge::BottomRight),
             _ => None,
         };
-        let leave_edge = if let Some(diag) = diagonal {
-            if self.layout.neighbor(&self.active_remote, diag).is_some() {
-                Some(diag)
-            } else if past_left {
-                Some(Edge::Left)
-            } else if past_right {
-                Some(Edge::Right)
-            } else if past_top {
-                Some(Edge::Top)
-            } else if past_bottom {
-                Some(Edge::Bottom)
-            } else {
-                None
-            }
-        } else if past_left {
+        let horizontal = if past_left {
             Some(Edge::Left)
         } else if past_right {
             Some(Edge::Right)
-        } else if past_top {
+        } else {
+            None
+        };
+        let vertical = if past_top {
             Some(Edge::Top)
         } else if past_bottom {
             Some(Edge::Bottom)
         } else {
             None
         };
-        leave_edge.map(|edge| EnterDecision {
+        // Leave only through a side that leads somewhere. Other sides hold the
+        // pointer, as a physical screen edge would.
+        let crossed = [diagonal, horizontal, vertical].into_iter().flatten();
+        let way_back = self
+            .layout
+            .edge_toward(&self.active_remote, &self.local_name)
+            .is_some();
+        let leave_edge = if way_back {
+            crossed
+                .into_iter()
+                .find(|e| self.layout.neighbor(&self.active_remote, *e).is_some())
+        } else {
+            // No link back to this computer: any side returns, so the pointer cannot get stuck.
+            [horizontal, vertical].into_iter().flatten().next()
+        };
+        let w = remote.width.max(1);
+        let h = remote.height.max(1);
+        let Some(edge) = leave_edge else {
+            *cursor_x = (*cursor_x).clamp(0, w - 1);
+            *cursor_y = (*cursor_y).clamp(0, h - 1);
+            return None;
+        };
+        let pct = match edge {
+            Edge::Left | Edge::Right => (*cursor_y).clamp(0, h - 1) as f32 / h as f32,
+            Edge::Top | Edge::Bottom => (*cursor_x).clamp(0, w - 1) as f32 / w as f32,
+            _ => 0.5,
+        };
+        Some(EnterDecision {
             neighbor: self.local_name.clone(),
             edge,
-            position_pct: 0.5,
+            position_pct: pct,
         })
     }
 }
@@ -382,6 +451,65 @@ mod tests {
         let d = sw.on_local_cursor(99, 0, Instant::now()).expect("diagonal");
         assert_eq!(d.neighbor, "CORNER");
         assert_eq!(d.edge, Edge::TopRight);
+    }
+
+    fn two_way_layout() -> ScreenLayout {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut host = BTreeMap::new();
+        host.insert("right".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), host);
+        let mut remote = BTreeMap::new();
+        remote.insert("left".into(), "LOCAL".into());
+        layout_map.insert("REMOTE".into(), remote);
+        ScreenLayout::load(&layout_map)
+    }
+
+    #[test]
+    fn edge_between_monitors_is_not_an_exit() {
+        // 1920x1080 left monitor, shorter 1440x900 right monitor.
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 3360, height: 1080 },
+            SwitchConfig::default(),
+            two_way_layout(),
+        );
+        sw.set_screen(
+            ScreenSize { width: 3360, height: 1080 },
+            vec![
+                Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
+                Rect { left: 1920, top: 0, right: 3360, bottom: 900 },
+            ],
+        );
+        // Inner border between the monitors does not switch, even below the short monitor.
+        assert!(sw.on_local_cursor(1919, 500, Instant::now()).is_none());
+        assert!(sw.on_local_cursor(1919, 1000, Instant::now()).is_none());
+        // Right side of the right monitor switches, with the position on that monitor.
+        let d = sw.on_local_cursor(3359, 450, Instant::now()).expect("right edge");
+        assert_eq!(d.edge, Edge::Right);
+        assert!((d.position_pct - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn remote_side_without_neighbor_holds_the_pointer() {
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 100, height: 100 },
+            SwitchConfig::default(),
+            two_way_layout(),
+        );
+        let remote = ScreenSize { width: 200, height: 100 };
+        let (mut x, mut y) = (0, 0);
+        sw.confirm_entered(Edge::Left, 0.5, remote, &mut x, &mut y, "REMOTE");
+        // Far right side has nothing: stay on the remote, clamped.
+        assert!(sw.on_remote_relative(500, 0, &mut x, &mut y, remote).is_none());
+        assert_eq!(x, 199);
+        // Left side leads back to LOCAL.
+        let back = sw
+            .on_remote_relative(-400, 0, &mut x, &mut y, remote)
+            .expect("return");
+        assert_eq!(back.edge, Edge::Left);
     }
 
     #[test]

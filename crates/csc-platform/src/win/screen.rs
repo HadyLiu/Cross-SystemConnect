@@ -1,4 +1,6 @@
-use crate::traits::{ScreenInfo, ScreenSize};
+use crate::traits::{Rect, ScreenInfo, ScreenSize};
+use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, ShowCursor, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
@@ -14,6 +16,69 @@ impl ScreenInfo for WinScreenInfo {
                 height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
             }
         }
+    }
+
+    fn monitors(&self) -> Vec<Rect> {
+        let (ox, oy) = virtual_origin();
+        let mut out: Vec<Rect> = Vec::new();
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                HDC::default(),
+                None,
+                Some(collect_monitor),
+                LPARAM(&mut out as *mut Vec<Rect> as isize),
+            );
+        }
+        for r in &mut out {
+            r.left -= ox;
+            r.right -= ox;
+            r.top -= oy;
+            r.bottom -= oy;
+        }
+        if out.is_empty() {
+            let s = self.virtual_size();
+            out.push(Rect {
+                left: 0,
+                top: 0,
+                right: s.width,
+                bottom: s.height,
+            });
+        }
+        out
+    }
+}
+
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _hdc: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let out = &mut *(data.0 as *mut Vec<Rect>);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        let r = info.rcMonitor;
+        out.push(Rect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        });
+    }
+    BOOL(1)
+}
+
+/// Use physical pixels everywhere. Without this, a scaled monitor reports
+/// logical coordinates and cursor, monitor, and injected positions disagree.
+pub fn init_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 }
 

@@ -26,11 +26,10 @@ impl ScreenLayout {
     }
 
     /// Reverse lookup: which edge of `from` points to `to`.
-    #[allow(dead_code)]
     pub fn edge_toward(&self, from: &str, to: &str) -> Option<Edge> {
         let edges = self.graph.get(from)?;
         for (e, n) in edges {
-            if n == to {
+            if n.eq_ignore_ascii_case(to) {
                 return Some(*e);
             }
         }
