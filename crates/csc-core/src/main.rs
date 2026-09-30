@@ -192,15 +192,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
-    let ipc_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_ipc(ipc_state).await {
-            warn!("IPC server stopped: {e:#}");
-        }
-    });
-    // Bind the socket before NIC discovery. A failure there must not leave the UI
-    // with "no such file" on every config and log request.
-    tokio::task::yield_now().await;
+    // The socket must exist before this function returns to the rest of startup.
+    // A later failure must not leave the UI connecting to a path that was never created.
+    run_ipc(state.clone())
+        .await
+        .context("start IPC")?;
 
     let host = query_host_net_info();
     {

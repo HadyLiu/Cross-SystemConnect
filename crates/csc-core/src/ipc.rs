@@ -25,6 +25,10 @@ pub struct AppState {
     pub log_path: PathBuf,
 }
 
+/// Bind the local IPC endpoint, then serve it in the background.
+///
+/// Returns once the endpoint exists. Callers can talk to the core immediately;
+/// the accept loop keeps running on a spawned task.
 pub async fn run_ipc(state: Arc<AppState>) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -32,7 +36,13 @@ pub async fn run_ipc(state: Arc<AppState>) -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     {
-        run_ipc_unix(state).await
+        let listener = bind_unix_listener()?;
+        tokio::spawn(async move {
+            if let Err(e) = serve_unix(listener, state).await {
+                warn!("IPC server stopped: {e:#}");
+            }
+        });
+        Ok(())
     }
 }
 
@@ -87,7 +97,7 @@ async fn handle_conn_windows(
 }
 
 #[cfg(unix)]
-async fn run_ipc_unix(state: Arc<AppState>) -> anyhow::Result<()> {
+fn bind_unix_listener() -> anyhow::Result<tokio::net::UnixListener> {
     use std::fs;
     use std::os::unix::net::UnixStream;
     use tokio::net::UnixListener;
@@ -109,6 +119,14 @@ async fn run_ipc_unix(state: Arc<AppState>) -> anyhow::Result<()> {
     let listener = UnixListener::bind(&path)
         .map_err(|e| anyhow::anyhow!("bind IPC {}: {e}", path.display()))?;
     info!("IPC listening on {}", path.display());
+    Ok(listener)
+}
+
+#[cfg(unix)]
+async fn serve_unix(
+    listener: tokio::net::UnixListener,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let st = state.clone();

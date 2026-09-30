@@ -4,7 +4,8 @@ use csc_proto::{encode_ipc_message, try_decode_ipc_message, IpcRequest, IpcRespo
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -39,12 +40,21 @@ fn open_pipe() -> anyhow::Result<std::os::unix::net::UnixStream> {
         .map_err(|e| anyhow::anyhow!("连接内核 {} 失败: {e}", path.display()))
 }
 
-fn call_raw(method: &str, params: Value) -> anyhow::Result<IpcResponse> {
+fn core_is_down(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("连接内核")
+        || text.contains("os error 2")
+        || text.contains("os error 111")
+        || text.contains("Connection refused")
+        || text.contains("没有那个文件或目录")
+}
+
+fn call_raw(method: &str, params: &Value) -> anyhow::Result<IpcResponse> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let req = IpcRequest {
         id,
         method: method.to_string(),
-        params,
+        params: params.clone(),
     };
     let bytes = encode_ipc_message(&req)?;
 
@@ -83,8 +93,7 @@ fn read_ipc_response(conn: &mut impl Read) -> anyhow::Result<IpcResponse> {
     anyhow::bail!("ipc closed without response")
 }
 
-pub fn call(method: &str, params: Value) -> anyhow::Result<Value> {
-    let resp = call_raw(method, params)?;
+fn decode_response(resp: IpcResponse) -> anyhow::Result<Value> {
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
@@ -92,14 +101,67 @@ pub fn call(method: &str, params: Value) -> anyhow::Result<Value> {
     }
 }
 
+pub fn call(method: &str, params: Value) -> anyhow::Result<Value> {
+    match call_raw(method, &params) {
+        Ok(resp) => decode_response(resp),
+        Err(err) if core_is_down(&err) => {
+            ensure_core_running().map_err(|start| {
+                anyhow::anyhow!("{start}（套接字 {}）", ipc_endpoint())
+            })?;
+            decode_response(call_raw(method, &params)?)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub fn try_connect() -> bool {
-    call("get_status", json!({})).is_ok()
+    call_raw("get_status", &json!({}))
+        .and_then(decode_response)
+        .is_ok()
+}
+
+struct StartFailure {
+    at: Instant,
+    message: String,
+}
+
+fn start_failure() -> &'static Mutex<Option<StartFailure>> {
+    static SLOT: Mutex<Option<StartFailure>> = Mutex::new(None);
+    &SLOT
 }
 
 pub fn ensure_core_running() -> anyhow::Result<()> {
     if try_connect() {
         return Ok(());
     }
+    let mut slot = start_failure()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if try_connect() {
+        *slot = None;
+        return Ok(());
+    }
+    if let Some(prev) = slot.as_ref() {
+        if prev.at.elapsed() < Duration::from_secs(3) {
+            anyhow::bail!("{}", prev.message);
+        }
+    }
+    match spawn_core() {
+        Ok(()) => {
+            *slot = None;
+            Ok(())
+        }
+        Err(err) => {
+            *slot = Some(StartFailure {
+                at: Instant::now(),
+                message: err.to_string(),
+            });
+            Err(err)
+        }
+    }
+}
+
+fn spawn_core() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let core = exe
         .parent()
@@ -109,7 +171,10 @@ pub fn ensure_core_running() -> anyhow::Result<()> {
     let core = core.with_extension("exe");
 
     if !core.exists() {
-        anyhow::bail!("kernel not found next to UI: {}", core.display());
+        anyhow::bail!(
+            "找不到内核程序 {}。套接字不会被创建。请先执行 cargo build -p csc-core -p csc-ui，再重新打开界面。",
+            core.display()
+        );
     }
 
     let mut cmd = std::process::Command::new(&core);
@@ -224,6 +289,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_socket_counts_as_core_down() {
+        let err = anyhow::anyhow!(
+            "连接内核 /run/user/1000/cross-systemconnect-core.sock 失败: No such file or directory (os error 2)"
+        );
+        assert!(super::core_is_down(&err));
+        let other = anyhow::anyhow!("ipc timed out waiting for the core");
+        assert!(!super::core_is_down(&other));
+    }
+
+    #[test]
     fn ipc_read_retries_interrupted_then_decodes() {
         let raw =
             encode_ipc_message(&IpcResponse::ok(7, serde_json::json!({"text": "line"}))).unwrap();
@@ -240,7 +315,7 @@ mod tests {
 
 /// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.
 pub fn quit_core() -> anyhow::Result<()> {
-    let _ = call("quit", json!({}));
+    let _ = call_raw("quit", &json!({})).and_then(decode_response);
     for _ in 0..15 {
         std::thread::sleep(Duration::from_millis(100));
         if !try_connect() {
