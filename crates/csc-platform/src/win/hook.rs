@@ -103,11 +103,8 @@ unsafe extern "system" fn raw_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             &mut size,
             std::mem::size_of::<RAWINPUTHEADER>() as u32,
         );
-        // Injected input has no device; only a hand on the mouse counts.
-        if got != u32::MAX
-            && raw.header.dwType == RIM_TYPEMOUSE.0
-            && !raw.header.hDevice.is_invalid()
-        {
+        // Precision touchpads report without a device handle, so it cannot tell injected input apart.
+        if got != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 {
             let mouse = raw.data.mouse;
             if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE == 0 {
                 RAW_DX.fetch_add(mouse.lLastX, Ordering::AcqRel);

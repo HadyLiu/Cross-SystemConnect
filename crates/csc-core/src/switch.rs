@@ -95,9 +95,16 @@ pub struct SwitchController {
     pending_second_tap: bool,
     push: EdgePush,
     last_local: Option<(i32, i32)>,
+    /// Consecutive steps where the cursor moved but raw motion stayed silent.
+    raw_misses: u8,
     /// The active remote reports its own edge contact (EdgeHit).
     remote_reports: bool,
 }
+
+/// Raw motion that missed this many cursor movements in a row is not used:
+/// touchpads, tablets and remote sessions may deliver none, and the edge
+/// must then switch on contact instead of waiting for a push it cannot see.
+const RAW_MISS_LIMIT: u8 = 3;
 
 impl Default for SwitchController {
     fn default() -> Self {
@@ -115,6 +122,7 @@ impl Default for SwitchController {
             pending_second_tap: false,
             push: EdgePush::default(),
             last_local: None,
+            raw_misses: RAW_MISS_LIMIT,
             remote_reports: false,
         }
     }
@@ -393,6 +401,23 @@ impl SwitchController {
 
     /// Local pointer at (x, y). `raw` is the hand movement since the last call
     /// when the platform can measure it; without it the edge switches on contact.
+    fn usable_raw(&mut self, raw: Option<(i32, i32)>, moved: (i32, i32)) -> Option<(i32, i32)> {
+        let r = raw?;
+        if moved != (0, 0) {
+            let trusted = self.raw_misses < RAW_MISS_LIMIT;
+            self.raw_misses = if r == (0, 0) { self.raw_misses.saturating_add(1) } else { 0 };
+            let now_trusted = self.raw_misses < RAW_MISS_LIMIT;
+            if trusted != now_trusted {
+                if now_trusted {
+                    tracing::info!("raw mouse motion available; edges need a push of {} px", self.cfg.edge_push_px);
+                } else {
+                    tracing::info!("raw mouse motion silent while the cursor moves; edges switch on contact");
+                }
+            }
+        }
+        (self.raw_misses < RAW_MISS_LIMIT).then_some(r)
+    }
+
     pub fn on_local_cursor(&mut self, x: i32, y: i32, raw: Option<(i32, i32)>, now: Instant) -> Option<EnterDecision> {
         if !self.enabled || self.state != SwitchState::Local {
             return None;
@@ -402,6 +427,7 @@ impl SwitchController {
             .map(|(lx, ly)| (x - lx, y - ly))
             .unwrap_or((0, 0));
         self.last_local = Some((x, y));
+        let raw = self.usable_raw(raw, moved);
         let diagonal = self
             .diagonal_at(x, y)
             .filter(|d| self.layout.neighbor(&self.local_name, *d).is_some());
@@ -623,6 +649,35 @@ mod tests {
         assert!(sw.on_local_cursor(99, 60, Some((5, 0)), t).is_none());
         let d = sw.on_local_cursor(99, 60, Some((3, 0)), t).expect("pushed 8 px");
         assert_eq!(d.edge, Edge::Right);
+    }
+
+    #[test]
+    fn silent_raw_motion_switches_on_contact() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("right".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 100, height: 100 },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        let t = Instant::now();
+        // A touchpad whose raw input never arrives: the cursor moves, raw stays zero.
+        for x in [80, 85, 90, 95] {
+            assert!(sw.on_local_cursor(x, 50, Some((0, 0)), t).is_none());
+        }
+        let d = sw.on_local_cursor(99, 50, Some((0, 0)), t).expect("contact is enough");
+        assert_eq!(d.edge, Edge::Right);
+
+        // Once raw motion follows the hand again, the push is required.
+        sw.unlock_to_local();
+        assert!(sw.on_local_cursor(90, 50, Some((0, 0)), t).is_none());
+        assert!(sw.on_local_cursor(95, 50, Some((5, 0)), t).is_none());
+        assert!(sw.on_local_cursor(99, 50, Some((4, 0)), t).is_none());
+        assert!(sw.on_local_cursor(99, 50, Some((8, 0)), t).is_some());
     }
 
     #[test]

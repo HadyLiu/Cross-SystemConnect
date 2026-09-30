@@ -507,16 +507,19 @@ impl Core {
         if self.screen.width <= 1 || self.screen.height <= 1 {
             return;
         }
+        let local = !self.grab && self.switch.enabled() && self.switch.state() == SwitchState::Local;
+        if !local {
+            // Raw motion only measures pushes at local edges; what piles up while
+            // the pointer is elsewhere would count as a push right after returning.
+            let _ = csc_platform::take_raw_motion();
+        }
         if self.grab && self.switch.state() == SwitchState::Remote {
             self.grab_step().await;
         } else if self.grab {
             release_pointer(&mut self.grab, None);
             self.grab_armed = false;
-        } else if self.switch.enabled() && self.switch.state() == SwitchState::Local {
+        } else if local {
             self.local_step().await;
-        } else {
-            // Keep raw motion from piling up while this computer is controlled.
-            let _ = csc_platform::take_raw_motion();
         }
     }
 
