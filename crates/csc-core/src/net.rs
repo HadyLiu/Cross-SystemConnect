@@ -410,7 +410,13 @@ async fn run_server(
                 }, Instant::now()));
                 publish_discovered(app_status, &seen).await;
 
-                if peers.contains(&key).await || inflight.lock().await.contains(&key) {
+                if peers.contains(&key).await {
+                    continue;
+                }
+                // A direct reply passes firewalls that drop unsolicited datagrams,
+                // so the client dials back now instead of after its own refresh.
+                let _ = udp.send_to(&search, src).await;
+                if inflight.lock().await.contains(&key) {
                     continue;
                 }
                 let tcp_port = if ann.tcp_port == 0 { port } else { ann.tcp_port };
@@ -446,7 +452,7 @@ async fn run_server(
                     .find(|(_, (p, _))| p.address == ip)
                     .map(|(k, _)| k.clone())
                 else {
-                    debug!("ignoring TCP from {addr}: no announce seen");
+                    info!("ignoring TCP from {addr}: no announce seen yet");
                     continue;
                 };
                 if peers.contains(&key).await {
@@ -628,6 +634,9 @@ async fn run_client(
                         let dialing = dialing.clone();
                         let addr = SocketAddr::new(src.ip(), port);
                         tokio::spawn(async move {
+                            // The host accepts only computers whose announce it has seen;
+                            // let the announce above arrive first.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
                             match connect_peer(addr).await {
                                 Ok(tcp) => {
                                     info!("dialed keyboard host at {addr}");

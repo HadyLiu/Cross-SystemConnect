@@ -219,7 +219,10 @@ fn init_logging(cfg: &Config) -> anyhow::Result<PathBuf> {
     } else {
         cfg.log_level.as_str()
     };
-    let filter = EnvFilter::try_new(format!("info,csc_core={level}")).unwrap_or_default();
+    let filter = EnvFilter::try_new(format!(
+        "info,Cross_SystemConnect_core={level},csc_platform={level}"
+    ))
+    .unwrap_or_default();
     let preferred = log_path_of(cfg);
     let fallback = default_log_path();
     let (path, file) = match open_log_file(&preferred) {
@@ -541,6 +544,13 @@ async fn main() -> anyhow::Result<()> {
                     s.connected = ns.connected;
                     s.peer_name = ns.peer_name.clone();
                     switch.set_enabled(s.sharing_enabled);
+                    // Being controlled earlier (as a client) leaves the switch in Remote.
+                    // A keyboard host is only Remote while it holds the grab.
+                    if !grab && s.role == "server" && switch.state() == crate::switch::SwitchState::Remote {
+                        info!("clearing stale remote state; pointer belongs to this computer");
+                        switch.unlock_to_local();
+                        s.active_screen = s.local_name.clone();
+                    }
                 }
 
                 if screen.width > 1 && screen.height > 1 {
@@ -755,7 +765,12 @@ async fn main() -> anyhow::Result<()> {
                             s.active_screen = s.local_name.clone();
                         }
                         if !grab {
+                            // The host that was driving this computer is gone.
                             injected.release_injected(injector.as_mut());
+                            if switch.state() == crate::switch::SwitchState::Remote {
+                                switch.unlock_to_local();
+                                s.active_screen = s.local_name.clone();
+                            }
                         }
                         let left: Vec<&str> = s.peer_name.split(',').map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&peer)).collect();
                         s.peer_name = left.join(", ");
