@@ -2,7 +2,6 @@
 
 mod clipboard;
 mod discover;
-mod file_transfer;
 mod ipc;
 mod layout;
 mod net;
@@ -10,9 +9,9 @@ mod path_safe;
 mod prompt;
 mod switch;
 mod tls;
+mod transfer;
 
-use crate::clipboard::ClipboardSync;
-use crate::file_transfer::FileTransfer;
+use crate::clipboard::ClipEvent;
 use crate::ipc::{claim_ipc, serve_ipc, AppState, IpcBusy};
 use crate::layout::ScreenLayout;
 use crate::net::{spawn_network, InboundEvent};
@@ -20,9 +19,7 @@ use crate::prompt::PeerPrompt;
 use crate::switch::SwitchController;
 use anyhow::Context;
 use csc_config::{default_config_path, default_log_path, Config};
-use csc_platform::{
-    create_clipboard, create_input_injector, create_screen_info, query_host_net_info,
-};
+use csc_platform::{create_input_injector, create_screen_info, query_host_net_info};
 use csc_proto::{encode_switch_leave_bin, AppStatus, ClipOfferPayload, LocalNic, SwitchPayload};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -130,6 +127,37 @@ impl HeldInput {
         for button in self.buttons.drain() {
             injector.mouse_button(button, false);
         }
+    }
+}
+
+/// Area against `edge` of monitor `m`, around the pointer, where dropped files
+/// are sent across. Desktop coordinates relative to the virtual origin.
+fn drop_zone_rect(edge: csc_proto::Edge, x: i32, y: i32, m: csc_platform::Rect) -> csc_platform::Rect {
+    use csc_proto::Edge;
+    const DEPTH: i32 = 160;
+    const LENGTH: i32 = 260;
+    let (w, h) = match edge {
+        Edge::Left | Edge::Right => (DEPTH, LENGTH),
+        Edge::Top | Edge::Bottom => (LENGTH, DEPTH),
+        _ => (DEPTH, DEPTH),
+    };
+    let w = w.min(m.width());
+    let h = h.min(m.height());
+    let left = match edge {
+        Edge::Left | Edge::TopLeft | Edge::BottomLeft => m.left,
+        Edge::Right | Edge::TopRight | Edge::BottomRight => m.right - w,
+        Edge::Top | Edge::Bottom => (x - w / 2).clamp(m.left, m.right - w),
+    };
+    let top = match edge {
+        Edge::Top | Edge::TopLeft | Edge::TopRight => m.top,
+        Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => m.bottom - h,
+        Edge::Left | Edge::Right => (y - h / 2).clamp(m.top, m.bottom - h),
+    };
+    csc_platform::Rect {
+        left,
+        top,
+        right: left + w,
+        bottom: top + h,
     }
 }
 
@@ -341,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
         pending_peer: None,
         discovered: Vec::new(),
         search_subnet: crate::discover::subnet_label(&cfg.search_address).unwrap_or_default(),
+        drop_zone: None,
     };
 
     let config = Arc::new(RwLock::new(cfg));
@@ -349,8 +378,10 @@ async fn main() -> anyhow::Result<()> {
     let (net_reload, net_reload_rx) = tokio::sync::watch::channel(0u64);
     let (layout_reload, mut layout_rx) = tokio::sync::watch::channel(0u64);
     let prompt = Arc::new(PeerPrompt::default());
+    let (transfer, transfer_rx) = crate::transfer::channel();
 
     let state = Arc::new(AppState {
+        transfer: transfer.clone(),
         config: config.clone(),
         config_path: config_path.clone(),
         status: status.clone(),
@@ -429,20 +460,16 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let mut injector = create_input_injector();
-    let mut clipboard = create_clipboard();
-    let mut clip_sync = ClipboardSync::default();
-    let receive_root = {
-        let cfg = config.read().await;
-        if cfg.file_transfer.receive_dir.is_empty() {
-            default_config_path()
-                .parent()
-                .map(|p| p.join("received"))
-                .unwrap_or_else(|| PathBuf::from("received"))
-        } else {
-            PathBuf::from(&cfg.file_transfer.receive_dir)
-        }
-    };
-    let _file_xfer = FileTransfer::new(receive_root);
+    let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
+    let clip = crate::clipboard::spawn(clip_tx);
+    crate::transfer::spawn(transfer_rx, net.clone(), config.clone(), clip.clone());
+    // Sequence numbers start from the clock so a restarted core is never mistaken for a repeat.
+    let mut clip_seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+    let mut last_remote_clip = 0u64;
+    let mut drop_zone: Option<csc_proto::DropZone> = None;
     let mut remote_x = 0i32;
     let mut remote_y = 0i32;
     let mut peer_screens: HashMap<String, csc_platform::ScreenSize> = HashMap::new();
@@ -682,6 +709,17 @@ async fn main() -> anyhow::Result<()> {
                             let (ox, oy) = csc_platform::virtual_origin();
                             let x = ax - ox;
                             let y = ay - oy;
+                            let dragging = csc_platform::primary_button_down();
+                            if let Some(zone) = drop_zone.as_ref() {
+                                let near = x >= zone.x - ox - 48
+                                    && x < zone.x - ox + zone.width + 48
+                                    && y >= zone.y - oy - 48
+                                    && y < zone.y - oy + zone.height + 48;
+                                if !dragging || !near {
+                                    drop_zone = None;
+                                    status.write().await.drop_zone = None;
+                                }
+                            }
                             if let Some(dec) = switch.on_local_cursor(x, y, Instant::now()) {
                                 let known_screen = peer_screens.iter().any(|(k, size)| {
                                     k.eq_ignore_ascii_case(&dec.neighbor)
@@ -689,7 +727,25 @@ async fn main() -> anyhow::Result<()> {
                                         && size.height > 1
                                 });
                                 let has_peer = net.has_peer(&dec.neighbor).await;
-                                if has_peer && known_screen {
+                                let drops = has_peer && config.read().await.file_transfer.enabled;
+                                if dragging && drops {
+                                    // A held button at the edge may be a file drag: offer a
+                                    // drop area instead of switching, and switch after release.
+                                    let r = drop_zone_rect(dec.edge, x, y, switch.monitor_at(x, y));
+                                    let zone = csc_proto::DropZone {
+                                        peer: dec.neighbor.clone(),
+                                        x: r.left + ox,
+                                        y: r.top + oy,
+                                        width: r.width(),
+                                        height: r.height(),
+                                    };
+                                    // Keep the first area so the window does not jump under the drag.
+                                    if drop_zone.is_none() {
+                                        debug!("drop zone for {} at {:?}", zone.peer, r);
+                                        status.write().await.drop_zone = Some(zone.clone());
+                                        drop_zone = Some(zone);
+                                    }
+                                } else if has_peer && known_screen {
                                     let entry = dec.edge.opposite();
                                     let payload = SwitchPayload {
                                         edge: entry,
@@ -748,6 +804,43 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Some(ev) = clip_rx.recv() => {
+                let peers = net.peer_names().await;
+                let c = config.read().await.clipboard.clone();
+                if peers.is_empty() || !c.enabled {
+                    continue;
+                }
+                match ev {
+                    ClipEvent::Text(text) => {
+                        let max = c.max_inline_mb.max(0) as usize * 1024 * 1024;
+                        if !c.text || text.len() > max {
+                            continue;
+                        }
+                        clip_seq += 1;
+                        let offer = ClipOfferPayload {
+                            seq: clip_seq,
+                            formats: vec!["text".into()],
+                            text: Some(text),
+                            files: Vec::new(),
+                        };
+                        if let Ok(frame) = csc_proto::encode_json_frame(csc_proto::MsgType::ClipOffer, &offer) {
+                            for p in &peers {
+                                net.send_control(p, frame.clone()).await;
+                            }
+                        }
+                    }
+                    ClipEvent::Files(paths) => {
+                        if !c.files {
+                            continue;
+                        }
+                        for p in peers {
+                            transfer
+                                .send_files(p, paths.clone(), csc_proto::TransferPurpose::Clipboard)
+                                .await;
+                        }
+                    }
+                }
+            }
             ev = inbound_rx.recv() => {
                 match ev {
                     None => break,
@@ -775,6 +868,8 @@ async fn main() -> anyhow::Result<()> {
                         let left: Vec<&str> = s.peer_name.split(',').map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&peer)).collect();
                         s.peer_name = left.join(", ");
                         s.connected = !s.peer_name.is_empty();
+                        drop(s);
+                        transfer.peer_gone(peer).await;
                     }
                     Some(InboundEvent::Hello(h)) => {
                         info!("HELLO from {} ({}x{})", h.host_name, h.screen_width, h.screen_height);
@@ -857,11 +952,21 @@ async fn main() -> anyhow::Result<()> {
                     Some(InboundEvent::ClipOffer(v)) => {
                         match serde_json::from_value::<ClipOfferPayload>(v) {
                             Ok(offer) => {
-                                let _ = ClipboardSync::offer_msg_type();
-                                clip_sync.apply_remote_offer(clipboard.as_mut(), &offer);
+                                let c = config.read().await;
+                                let wanted = c.clipboard.enabled && c.clipboard.text;
+                                if let (true, Some(text)) = (wanted, offer.text) {
+                                    if offer.seq != last_remote_clip {
+                                        last_remote_clip = offer.seq;
+                                        debug!("clipboard text from peer ({} chars)", text.chars().count());
+                                        clip.set_text(text);
+                                    }
+                                }
                             }
                             Err(e) => warn!("bad clip offer: {e}"),
                         }
+                    }
+                    Some(InboundEvent::File { peer, msg, payload }) => {
+                        transfer.frame(peer, msg, payload).await;
                     }
                     Some(InboundEvent::Raw(ty, payload)) => {
                         debug!(?ty, len = payload.len(), "unhandled frame");

@@ -113,6 +113,11 @@ pub(crate) fn pointer_pos() -> Option<(i32, i32)> {
     xdo::pointer()
 }
 
+pub(crate) fn primary_button_down() -> bool {
+    const BUTTON1_MASK: u32 = 1 << 8;
+    xdo::pointer_state().is_some_and(|(_, _, mask)| mask & BUTTON1_MASK != 0)
+}
+
 pub(crate) fn warp_cursor(x: i32, y: i32) {
     xdo::warp(x, y);
 }

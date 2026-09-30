@@ -9,6 +9,7 @@ pub use host_net::fill_host_net;
 pub use injector::WinInputInjector;
 pub use screen::cursor_pos;
 pub use screen::init_dpi_awareness;
+pub use screen::primary_button_down;
 pub use screen::set_cursor_visible;
 pub use screen::virtual_origin;
 pub use screen::warp_cursor;

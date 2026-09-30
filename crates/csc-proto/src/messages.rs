@@ -115,6 +115,73 @@ pub struct ClipOfferPayload {
     pub files: Vec<FileEntry>,
 }
 
+/// Why a batch of files is being sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPurpose {
+    /// Copied files: the receiver puts them on its clipboard for paste.
+    Clipboard,
+    /// Files dropped on a screen edge: the receiver saves and reports them.
+    Drag,
+}
+
+/// Sender to receiver: files are ready. The receiver answers with FileRequest or FileError.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOfferPayload {
+    pub transfer_id: u64,
+    pub purpose: TransferPurpose,
+    /// Every file and directory, relative to the batch, with `/` separators.
+    pub entries: Vec<FileEntry>,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRequestPayload {
+    pub transfer_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileBeginPayload {
+    pub transfer_id: u64,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEndPayload {
+    pub transfer_id: u64,
+    pub index: u32,
+    pub xxhash64: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDonePayload {
+    pub transfer_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileErrorPayload {
+    pub transfer_id: u64,
+    pub message: String,
+}
+
+/// Binary file chunk: transfer id, entry index, then the bytes.
+pub fn encode_file_data(transfer_id: u64, index: u32, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12 + data.len());
+    body.extend_from_slice(&transfer_id.to_le_bytes());
+    body.extend_from_slice(&index.to_le_bytes());
+    body.extend_from_slice(data);
+    encode_frame(MsgType::FileData, &body, 0)
+}
+
+pub fn decode_file_data(payload: &[u8]) -> Option<(u64, u32, &[u8])> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let index = u32::from_le_bytes(payload[8..12].try_into().ok()?);
+    Some((id, index, &payload[12..]))
+}
+
 pub fn encode_json_frame<T: Serialize>(
     msg_type: MsgType,
     value: &T,

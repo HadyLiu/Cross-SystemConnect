@@ -233,10 +233,11 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <div class="card">
           <h2>文件传输</h2>
           <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
-          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text"/></div>
-          <div class="row"><label class="f">单次上限</label><input id="ft_max_size_mb" type="number"/></div>
-          <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限速保流畅</span></label>
-          <div class="row"><label class="f">MiB/s</label><input id="ft_max_speed_mibs" type="number"/></div>
+          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text" placeholder="默认：下载/Cross-SystemConnect"/></div>
+          <div class="row"><label class="f">单文件上限 MB</label><input id="ft_max_size_mb" type="number"/></div>
+          <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限制传输速度（不勾选则不限速，跑满带宽）</span></label>
+          <div class="row"><label class="f">限速 MiB/s</label><input id="ft_max_speed_mibs" type="number" min="1"/></div>
+          <p class="hint">把文件或文件夹拖到有设备的屏幕边缘，出现提示框后松开即可发送。</p>
         </div>
         <div class="card">
           <h2>快捷键</h2>
@@ -720,7 +721,7 @@ async function load(){
     $('max_inline_mb').value=clip.max_inline_mb||1; $('max_total_mb').value=clip.max_total_mb||64;
     $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
     $('ft_max_size_mb').value=ft.max_size_mb||10240;
-    $('ft_limit_speed').checked=ft.limit_speed!==false; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
+    $('ft_limit_speed').checked=ft.limit_speed===true; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
     const hk=cfg.hotkeys||{};
     $('lock_screen').value=hk.lock_screen||'ScrollLock';
     $('return_to_server').value=hk.return_to_server||'Ctrl+Alt+Home';

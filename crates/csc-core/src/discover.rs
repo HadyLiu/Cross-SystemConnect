@@ -24,6 +24,9 @@ pub struct Announce {
 pub enum Datagram {
     Announce(Announce),
     Search,
+    /// A search sent straight to one client by a host that has no session with it.
+    /// A client that still believes it is linked to that host holds a dead session.
+    SearchUnlinked,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,13 @@ pub fn encode_search() -> Vec<u8> {
     out
 }
 
+/// Search with a trailing "not linked" flag. Older builds read it as a plain search.
+pub fn encode_search_unlinked() -> Vec<u8> {
+    let mut out = encode_search();
+    out.push(1);
+    out
+}
+
 pub fn encode_announce(a: &Announce) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + a.name.len() + a.host_name.len() + 6);
     out.extend_from_slice(MAGIC);
@@ -67,6 +77,7 @@ pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
         return None;
     }
     match buf[5] {
+        KIND_SEARCH if buf.get(6) == Some(&1) => Some(Datagram::SearchUnlinked),
         KIND_SEARCH => Some(Datagram::Search),
         KIND_ANNOUNCE => {
             let mut off = 6;
@@ -220,6 +231,10 @@ mod tests {
     #[test]
     fn search_packet() {
         assert_eq!(decode_datagram(&encode_search()), Some(Datagram::Search));
+        assert_eq!(
+            decode_datagram(&encode_search_unlinked()),
+            Some(Datagram::SearchUnlinked)
+        );
     }
 
     #[test]

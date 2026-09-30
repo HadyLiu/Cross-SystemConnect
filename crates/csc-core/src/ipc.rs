@@ -23,6 +23,7 @@ pub struct AppState {
     pub layout_reload: watch::Sender<u64>,
     /// File the core logger is appending to.
     pub log_path: PathBuf,
+    pub transfer: crate::transfer::TransferHandle,
 }
 
 /// Bind the local IPC endpoint, then serve it in the background.
@@ -281,6 +282,29 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 Ok(()) => IpcResponse::ok(req.id, json!({"ok": true})),
                 Err(e) => IpcResponse::err(req.id, e),
             }
+        }
+        "send_files" => {
+            let peer = req
+                .params
+                .get("peer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let paths: Vec<PathBuf> = req
+                .params
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|p| p.as_str()).map(PathBuf::from).collect())
+                .unwrap_or_default();
+            if peer.is_empty() || paths.is_empty() {
+                return IpcResponse::err(req.id, "peer and paths are required");
+            }
+            info!("sending {} dropped item(s) to {peer}", paths.len());
+            state
+                .transfer
+                .send_files(peer, paths, csc_proto::TransferPurpose::Drag)
+                .await;
+            IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "rescan" => {
             state.status.write().await.discovered.clear();

@@ -109,7 +109,7 @@ pub struct FileTransferConfig {
     pub receive_dir: String,
     #[serde(default = "default_ft_max")]
     pub max_size_mb: i32,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub limit_speed: bool,
     #[serde(default = "default_speed")]
     pub max_speed_mibs: i32,
@@ -128,7 +128,7 @@ impl Default for FileTransferConfig {
             enabled: true,
             receive_dir: String::new(),
             max_size_mb: 10240,
-            limit_speed: true,
+            limit_speed: false,
             max_speed_mibs: 4,
         }
     }

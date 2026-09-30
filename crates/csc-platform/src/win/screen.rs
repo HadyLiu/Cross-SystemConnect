@@ -92,6 +92,20 @@ pub fn cursor_pos() -> (i32, i32) {
     }
 }
 
+pub fn primary_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::SM_SWAPBUTTON;
+    unsafe {
+        // GetAsyncKeyState reports physical buttons; the primary one may be swapped.
+        let key = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+            VK_RBUTTON
+        } else {
+            VK_LBUTTON
+        };
+        (GetAsyncKeyState(key.0 as i32) as u16 & 0x8000) != 0
+    }
+}
+
 pub fn virtual_origin() -> (i32, i32) {
     unsafe {
         (

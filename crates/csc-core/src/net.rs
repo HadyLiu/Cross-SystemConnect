@@ -37,9 +37,52 @@ pub struct NetStatus {
     pub peer_name: String,
 }
 
+/// Channels into one running session.
+#[derive(Clone)]
+pub struct Link {
+    /// Input and control frames, sent before anything on `bulk`.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// File data. Small queue, so a transfer never delays the pointer by much.
+    bulk: mpsc::Sender<Vec<u8>>,
+    kill: watch::Sender<bool>,
+    since: Instant,
+}
+
+/// The session end of a `Link`.
+pub struct LinkRx {
+    rx: mpsc::Receiver<Vec<u8>>,
+    bulk: mpsc::Receiver<Vec<u8>>,
+    kill: watch::Receiver<bool>,
+}
+
+fn new_link() -> (Link, LinkRx) {
+    let (tx, rx) = mpsc::channel(64);
+    let (btx, brx) = mpsc::channel(4);
+    let (ktx, krx) = watch::channel(false);
+    (
+        Link {
+            tx,
+            bulk: btx,
+            kill: ktx,
+            since: Instant::now(),
+        },
+        LinkRx {
+            rx,
+            bulk: brx,
+            kill: krx,
+        },
+    )
+}
+
+impl Link {
+    fn same(&self, other: &Link) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
+
 #[derive(Clone)]
 pub struct PeerTable {
-    txs: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    txs: Arc<Mutex<HashMap<String, Link>>>,
     active: Arc<Mutex<String>>,
 }
 
@@ -51,8 +94,12 @@ impl PeerTable {
         }
     }
 
-    async fn insert(&self, name: &str, tx: mpsc::Sender<Vec<u8>>) {
-        self.txs.lock().await.insert(name.to_string(), tx);
+    async fn insert(&self, name: &str, link: Link) {
+        if let Some(old) = self.txs.lock().await.insert(name.to_string(), link.clone()) {
+            if !old.same(&link) {
+                let _ = old.kill.send(true);
+            }
+        }
         let mut active = self.active.lock().await;
         if active.is_empty() {
             *active = name.to_string();
@@ -60,13 +107,13 @@ impl PeerTable {
     }
 
     /// Insert only when no link to `name` exists yet.
-    async fn insert_new(&self, name: &str, tx: mpsc::Sender<Vec<u8>>) -> bool {
+    async fn insert_new(&self, name: &str, link: Link) -> bool {
         {
             let mut txs = self.txs.lock().await;
             if txs.keys().any(|k| k.eq_ignore_ascii_case(name)) {
                 return false;
             }
-            txs.insert(name.to_string(), tx);
+            txs.insert(name.to_string(), link);
         }
         let mut active = self.active.lock().await;
         if active.is_empty() {
@@ -75,16 +122,52 @@ impl PeerTable {
         true
     }
 
+    /// End the session to `name`, if any. Used when the other side shows it
+    /// has already given that session up. Links younger than `min_age` are kept: the other side may not have
+    /// registered them yet.
+    async fn evict_older_than(&self, name: &str, min_age: Duration) -> bool {
+        let link = {
+            let txs = self.txs.lock().await;
+            txs.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(k, l)| (k.clone(), l.clone()))
+        };
+        let Some((key, link)) = link else {
+            return false;
+        };
+        if link.since.elapsed() < min_age {
+            return false;
+        }
+        let _ = link.kill.send(true);
+        self.remove(&key).await;
+        true
+    }
+
     /// Remove `name` only if it still points at this link, not a newer one.
-    async fn remove_owned(&self, name: &str, tx: &mpsc::Sender<Vec<u8>>) {
+    async fn remove_owned(&self, name: &str, link: &Link) {
         let owned = self
             .txs
             .lock()
             .await
             .get(name)
-            .is_some_and(|cur| cur.same_channel(tx));
+            .is_some_and(|cur| cur.same(link));
         if owned {
             self.remove(name).await;
+        }
+    }
+
+    fn find(txs: &HashMap<String, Link>, name: &str) -> Option<Link> {
+        txs.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, l)| l.clone())
+    }
+
+    /// Queue file data; waits while the peer's bulk queue is full.
+    pub async fn send_bulk(&self, name: &str, frame: Vec<u8>) -> bool {
+        let link = Self::find(&*self.txs.lock().await, name);
+        match link {
+            Some(link) => link.bulk.send(frame).await.is_ok(),
+            None => false,
         }
     }
 
@@ -115,14 +198,9 @@ impl PeerTable {
     }
 
     pub async fn send_to(&self, name: &str, frame: Vec<u8>) {
-        let txs = self.txs.lock().await;
-        let tx = txs
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, tx)| tx.clone());
-        drop(txs);
-        if let Some(tx) = tx {
-            let _ = tx.send(frame).await;
+        let link = Self::find(&*self.txs.lock().await, name);
+        if let Some(link) = link {
+            let _ = link.tx.send(frame).await;
         }
     }
 
@@ -140,12 +218,26 @@ impl PeerTable {
     }
 }
 
+#[derive(Clone)]
 pub struct NetHub {
     pub status: Arc<RwLock<NetStatus>>,
     peers: PeerTable,
 }
 
 impl NetHub {
+    /// Send to `peer` without making it the target of forwarded input.
+    pub async fn send_control(&self, peer: &str, frame: Vec<u8>) {
+        self.peers.send_to(peer, frame).await;
+    }
+
+    pub async fn send_bulk(&self, peer: &str, frame: Vec<u8>) -> bool {
+        self.peers.send_bulk(peer, frame).await
+    }
+
+    pub async fn peer_names(&self) -> Vec<String> {
+        self.peers.names().await
+    }
+
     pub async fn send_raw(&self, frame: Vec<u8>) {
         self.peers.send_active(frame).await;
     }
@@ -338,6 +430,12 @@ pub enum InboundEvent {
     MouseWheel { v: i32, h: i32 },
     Key { hid: u32, down: bool },
     ClipOffer(serde_json::Value),
+    /// File transfer frame from `peer`, handled by the transfer task.
+    File {
+        peer: String,
+        msg: MsgType,
+        payload: Vec<u8>,
+    },
     Raw(MsgType, Vec<u8>),
     Disconnected { peer: String },
 }
@@ -369,6 +467,7 @@ async fn run_server(
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "全部本机网段".into());
     info!("searching UDP port {port} on {subnet}");
     let search = encode_search();
+    let search_unlinked = crate::discover::encode_search_unlinked();
     let targets = scan_targets(cfg, port, local_ips);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut buf = [0u8; 2048];
@@ -415,7 +514,7 @@ async fn run_server(
                 }
                 // A direct reply passes firewalls that drop unsolicited datagrams,
                 // so the client dials back now instead of after its own refresh.
-                let _ = udp.send_to(&search, src).await;
+                let _ = udp.send_to(&search_unlinked, src).await;
                 if inflight.lock().await.contains(&key) {
                     continue;
                 }
@@ -455,9 +554,6 @@ async fn run_server(
                     info!("ignoring TCP from {addr}: no announce seen yet");
                     continue;
                 };
-                if peers.contains(&key).await {
-                    continue;
-                }
                 spawn_server_link(
                     cfg.clone(),
                     live.clone(),
@@ -510,13 +606,17 @@ fn spawn_server_link(
         };
         match tls {
             Ok((stream, peer_cert)) => {
-                let (tx, rx) = mpsc::channel(64);
-                if !peers.insert_new(&key, tx.clone()).await {
-                    debug!("already linked to {key}; dropping extra connection {peer_addr}");
-                    if dialed {
+                let (tx, rx) = new_link();
+                if dialed {
+                    if !peers.insert_new(&key, tx.clone()).await {
+                        debug!("already linked to {key}; dropping extra connection {peer_addr}");
                         inflight.lock().await.remove(&key);
+                        return;
                     }
-                    return;
+                } else {
+                    // The client only dials back when it has no session with us,
+                    // so any link we still hold for it is dead.
+                    peers.insert(&key, tx.clone()).await;
                 }
                 let how = if dialed { "dialed" } else { "dialed back by client" };
                 info!("connected to client {key} at {peer_addr} ({how})");
@@ -626,9 +726,16 @@ async fn run_client(
                         continue;
                     }
                 }
-                if decode_datagram(&buf[..n]) == Some(Datagram::Search) {
+                let datagram = decode_datagram(&buf[..n]);
+                if matches!(datagram, Some(Datagram::Search | Datagram::SearchUnlinked)) {
                     let _ = udp.send_to(&announce, src).await;
                     let key = src.ip().to_string();
+                    if datagram == Some(Datagram::SearchUnlinked)
+                        && peers.evict_older_than(&key, Duration::from_secs(3)).await
+                    {
+                        info!("keyboard host {key} has no session with us; dropping the stale one");
+                        refresh_link_status(&ctx.status, &peers).await;
+                    }
                     if !peers.contains(&key).await && dialing.lock().await.insert(key.clone()) {
                         let ctx = ctx.clone();
                         let dialing = dialing.clone();
@@ -677,7 +784,7 @@ struct ClientCtx {
 /// Run one control session with the keyboard host, whichever side opened the TCP.
 async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
     let key = peer.ip().to_string();
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = new_link();
     let link = ClientLink {
         peers: ctx.peers.clone(),
         status: ctx.status.clone(),
@@ -872,7 +979,7 @@ struct ClientLink {
     peers: PeerTable,
     status: Arc<RwLock<NetStatus>>,
     key: String,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: Link,
 }
 
 struct Admit {
@@ -896,7 +1003,7 @@ async fn session<S>(
     peer_cert: Vec<u8>,
     status: &Arc<RwLock<NetStatus>>,
     peer: String,
-    outbound: mpsc::Receiver<Vec<u8>>,
+    outbound: LinkRx,
     inbound: mpsc::Sender<InboundEvent>,
     link: Option<ClientLink>,
     admit: Option<Admit>,
@@ -939,7 +1046,7 @@ async fn session_inner<S>(
     peer_cert: Vec<u8>,
     status: &Arc<RwLock<NetStatus>>,
     peer: String,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
+    mut outbound: LinkRx,
     mut inbound: mpsc::Sender<InboundEvent>,
     link: Option<ClientLink>,
     admit: Option<Admit>,
@@ -1045,7 +1152,7 @@ where
             }
         }
         for frame in early {
-            dispatch_frame(frame, status, &mut inbound).await?;
+            dispatch_frame(frame, &peer, status, &mut inbound).await?;
         }
         let _ = inbound.send(InboundEvent::Hello(remote)).await;
     }
@@ -1080,6 +1187,8 @@ where
     let mut tmp = [0u8; 16 * 1024];
     loop {
         tokio::select! {
+            // Input frames go out before queued file data.
+            biased;
             read = reader.read(&mut tmp) => {
                 let n = read?;
                 if n == 0 {
@@ -1091,12 +1200,15 @@ where
                     match try_decode_frame(&mut buf)? {
                         None => break,
                         Some(frame) => {
-                            dispatch_frame(frame, status, &mut inbound).await?;
+                            dispatch_frame(frame, &peer, status, &mut inbound).await?;
                         }
                     }
                 }
             }
-            frame = outbound.recv() => {
+            _ = outbound.kill.changed() => {
+                anyhow::bail!("replaced by a newer session");
+            }
+            frame = outbound.rx.recv() => {
                 match frame {
                     Some(frame) => {
                         let mut w = writer.lock().await;
@@ -1105,6 +1217,12 @@ where
                         }
                     }
                     None => break,
+                }
+            }
+            Some(frame) = outbound.bulk.recv() => {
+                let mut w = writer.lock().await;
+                if w.write_all(&frame).await.is_err() {
+                    break;
                 }
             }
             _ = tokio::time::sleep_until(last_rx + idle_limit), if hb_enabled => {
@@ -1200,10 +1318,27 @@ async fn allow_control(admit: &Admit, hello: &HelloPayload, fingerprint: &str) -
 
 async fn dispatch_frame(
     frame: csc_proto::Frame,
+    peer: &str,
     status: &Arc<RwLock<NetStatus>>,
     inbound: &mut mpsc::Sender<InboundEvent>,
 ) -> anyhow::Result<()> {
     match frame.msg_type {
+        MsgType::FileOffer
+        | MsgType::FileRequest
+        | MsgType::FileBegin
+        | MsgType::FileData
+        | MsgType::FileEnd
+        | MsgType::FileDone
+        | MsgType::FileError
+        | MsgType::FileCancel => {
+            let _ = inbound
+                .send(InboundEvent::File {
+                    peer: peer.to_string(),
+                    msg: frame.msg_type,
+                    payload: frame.payload,
+                })
+                .await;
+        }
         MsgType::Hello => {
             if let Some(h) = decode_hello_bin(&frame.payload) {
                 {

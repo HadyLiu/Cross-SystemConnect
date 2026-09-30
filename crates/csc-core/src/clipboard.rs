@@ -1,92 +1,99 @@
-//! Clipboard sync orchestration (offer / request / data).
+//! Watches the system clipboard on its own thread. Clipboard calls can block
+//! (an X11 owner that answers slowly), so they never run on the input loop.
 
-use csc_platform::{Clipboard, FileEntry};
-use csc_proto::{ClipOfferPayload, MsgType};
-use tracing::debug;
+use csc_platform::clip::{change_token, ClipContent, SystemClipboard};
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
-#[derive(Default)]
-pub struct ClipboardSync {
-    seq: u64,
-    last_remote_seq: u64,
-    ignore_next: bool,
+const POLL: Duration = Duration::from_millis(400);
+
+#[derive(Debug)]
+pub enum ClipEvent {
+    Text(String),
+    Files(Vec<PathBuf>),
 }
 
-impl ClipboardSync {
-    #[allow(dead_code)]
-    pub fn on_local_changed(&mut self, clip: &mut dyn Clipboard) -> Option<ClipOfferPayload> {
-        if self.ignore_next {
-            self.ignore_next = false;
-            return None;
-        }
-        self.seq += 1;
-        let text = clip.get_text();
-        let files = clip.get_files().map(|paths| {
-            paths
-                .into_iter()
-                .map(|p| FileEntry {
-                    relative_path: p
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file".into()),
-                    size: std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
-                    mtime_unix: 0,
-                    is_directory: p.is_dir(),
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut formats = Vec::new();
-        if text.is_some() {
-            formats.push("text".into());
-        }
-        if files.as_ref().map(|f| !f.is_empty()).unwrap_or(false) {
-            formats.push("files".into());
-        }
-        if formats.is_empty() {
-            return None;
-        }
-        Some(ClipOfferPayload {
-            seq: self.seq,
-            formats,
-            text,
-            files: files
-                .unwrap_or_default()
-                .into_iter()
-                .map(|f| csc_proto::FileEntry {
-                    relative_path: f.relative_path,
-                    size: f.size,
-                    mtime_unix: f.mtime_unix,
-                    is_directory: f.is_directory,
-                })
-                .collect(),
-        })
+enum ClipCmd {
+    SetText(String),
+    SetFiles(Vec<PathBuf>),
+}
+
+/// Sets the local clipboard from remote content. Setting does not echo back as an event.
+#[derive(Clone)]
+pub struct ClipHandle {
+    tx: std_mpsc::Sender<ClipCmd>,
+}
+
+impl ClipHandle {
+    pub fn set_text(&self, text: String) {
+        let _ = self.tx.send(ClipCmd::SetText(text));
     }
 
-    pub fn apply_remote_offer(&mut self, clip: &mut dyn Clipboard, offer: &ClipOfferPayload) {
-        if offer.seq <= self.last_remote_seq {
+    pub fn set_files(&self, files: Vec<PathBuf>) {
+        let _ = self.tx.send(ClipCmd::SetFiles(files));
+    }
+}
+
+pub fn spawn(events: mpsc::Sender<ClipEvent>) -> ClipHandle {
+    let (tx, rx) = std_mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("clipboard".into())
+        .spawn(move || run(rx, events));
+    ClipHandle { tx }
+}
+
+fn run(rx: std_mpsc::Receiver<ClipCmd>, events: mpsc::Sender<ClipEvent>) {
+    let mut clip = loop {
+        if let Some(c) = SystemClipboard::open() {
+            break c;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    };
+    // What is on the clipboard now does not count as a new copy.
+    let mut last = clip.read();
+    let mut token = change_token();
+    info!("clipboard watcher ready");
+    loop {
+        match rx.recv_timeout(POLL) {
+            Ok(ClipCmd::SetText(text)) => {
+                match clip.set_text(&text) {
+                    Ok(()) => last = ClipContent::Text(text),
+                    Err(e) => warn!("set clipboard text: {e:#}"),
+                }
+                token = change_token();
+                continue;
+            }
+            Ok(ClipCmd::SetFiles(files)) => {
+                match clip.set_files(&files) {
+                    Ok(()) => last = ClipContent::Files(files),
+                    Err(e) => warn!("set clipboard files: {e:#}"),
+                }
+                token = change_token();
+                continue;
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let now = change_token();
+        if now.is_some() && now == token {
+            continue;
+        }
+        token = now;
+        let content = clip.read();
+        if content == last || content == ClipContent::Empty {
+            continue;
+        }
+        last = content.clone();
+        let ev = match content {
+            ClipContent::Text(t) => ClipEvent::Text(t),
+            ClipContent::Files(f) => ClipEvent::Files(f),
+            ClipContent::Empty => continue,
+        };
+        if events.blocking_send(ev).is_err() {
             return;
         }
-        self.last_remote_seq = offer.seq;
-        self.ignore_next = true;
-        if let Some(t) = &offer.text {
-            clip.set_text(t);
-        }
-        if !offer.files.is_empty() {
-            let entries: Vec<_> = offer
-                .files
-                .iter()
-                .map(|f| FileEntry {
-                    relative_path: f.relative_path.clone(),
-                    size: f.size,
-                    mtime_unix: f.mtime_unix,
-                    is_directory: f.is_directory,
-                })
-                .collect();
-            clip.set_files_lazy(&entries);
-        }
-        debug!(seq = offer.seq, "applied remote clip offer");
-    }
-
-    pub fn offer_msg_type() -> MsgType {
-        MsgType::ClipOffer
     }
 }

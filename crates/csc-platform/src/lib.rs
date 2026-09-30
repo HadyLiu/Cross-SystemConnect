@@ -1,8 +1,12 @@
 //! Platform abstractions for input, clipboard, screen, and host info.
 
+pub mod clip;
 mod host;
 pub mod keymap;
+mod notify;
 mod traits;
+
+pub use notify::notify;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
@@ -112,6 +116,22 @@ pub fn set_cursor_visible(visible: bool) {
 
 #[cfg(not(windows))]
 pub fn set_cursor_visible(_visible: bool) {}
+
+/// True while the primary (left) mouse button is held, for example during a drag.
+pub fn primary_button_down() -> bool {
+    #[cfg(windows)]
+    {
+        win::primary_button_down()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::primary_button_down()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        false
+    }
+}
 
 /// Process-wide setup that must run before any screen or cursor call.
 pub fn init_process() {

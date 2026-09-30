@@ -47,7 +47,7 @@ fn item(label: &str, event: UserEvent) -> ksni::MenuItem<LinuxTray> {
     ksni::menu::StandardItem {
         label: label.into(),
         activate: Box::new(move |tray: &mut LinuxTray| {
-            let _ = tray.proxy.send_event(event);
+            let _ = tray.proxy.send_event(event.clone());
         }),
         ..Default::default()
     }

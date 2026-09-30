@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod drop_zone;
 mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
@@ -27,10 +28,11 @@ use wry::{
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum UserEvent {
     ShowSettings,
     Quit,
+    DropZone(Option<drop_zone::Zone>),
 }
 
 pub(crate) fn app_title() -> String {
@@ -387,8 +389,11 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    drop_zone::watch(proxy.clone());
+
     let mut window = None::<tao::window::Window>;
     let mut webview = None::<wry::WebView>;
+    let mut drop_window = None::<drop_zone::DropWindow>;
     let mut warmed = false;
 
     if open_settings {
@@ -444,6 +449,21 @@ fn main() -> anyhow::Result<()> {
                     w.set_focus();
                 }
             }
+            Event::UserEvent(UserEvent::DropZone(zone)) => match zone {
+                Some(zone) => {
+                    if drop_window.is_none() {
+                        drop_window = drop_zone::DropWindow::create(event_loop);
+                    }
+                    if let Some(dw) = drop_window.as_ref() {
+                        dw.show(&zone);
+                    }
+                }
+                None => {
+                    if let Some(dw) = drop_window.as_ref() {
+                        dw.hide();
+                    }
+                }
+            },
             Event::UserEvent(UserEvent::Quit) => {
                 let _ = ipc_client::quit_core();
                 #[cfg(not(target_os = "linux"))]

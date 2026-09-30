@@ -80,6 +80,20 @@ pub fn screen_size() -> Option<(i32, i32)> {
     with(|c| (c.width, c.height))
 }
 
+/// Pointer position and the X button/modifier mask.
+pub fn pointer_state() -> Option<(i32, i32, u32)> {
+    with(|c| unsafe {
+        let (mut root, mut child) = (0, 0);
+        let (mut rx, mut ry, mut wx, mut wy) = (0, 0, 0, 0);
+        let mut mask = 0;
+        let ok = (c.query)(
+            c.dpy, c.root, &mut root, &mut child, &mut rx, &mut ry, &mut wx, &mut wy, &mut mask,
+        );
+        (ok != 0).then_some((rx, ry, mask))
+    })
+    .flatten()
+}
+
 pub fn pointer() -> Option<(i32, i32)> {
     with(|c| unsafe {
         let mut root = 0;

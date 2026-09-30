@@ -26,6 +26,9 @@ pub enum MsgType {
     FileEnd = 0x52,
     FileCancel = 0x53,
     FileError = 0x54,
+    FileOffer = 0x55,
+    FileBegin = 0x56,
+    FileDone = 0x57,
 }
 
 impl MsgType {
@@ -49,6 +52,9 @@ impl MsgType {
             0x52 => Self::FileEnd,
             0x53 => Self::FileCancel,
             0x54 => Self::FileError,
+            0x55 => Self::FileOffer,
+            0x56 => Self::FileBegin,
+            0x57 => Self::FileDone,
             _ => return None,
         })
     }
@@ -74,6 +80,8 @@ pub enum FrameError {
     BadVersion(u8),
     #[error("unknown message type {0:#x}")]
     BadType(u8),
+    #[error("frame of {0} bytes is too large")]
+    TooLarge(usize),
 }
 
 pub fn encode_frame(msg_type: MsgType, payload: &[u8], flags: u32) -> Vec<u8> {
@@ -87,33 +95,45 @@ pub fn encode_frame(msg_type: MsgType, payload: &[u8], flags: u32) -> Vec<u8> {
     out
 }
 
+/// Largest payload accepted; a bigger length means a corrupt stream.
+pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
 /// Try decode one frame from the front of `buf`. On success advances buf.
+/// Frames of a type this build does not know are skipped, so a newer peer
+/// can add messages without breaking the session.
 pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
-    if buf.len() < HEADER_SIZE {
-        return Ok(None);
+    loop {
+        if buf.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        if magic != MAGIC {
+            return Err(FrameError::BadMagic);
+        }
+        let version = buf[2];
+        if version != VERSION {
+            return Err(FrameError::BadVersion(version));
+        }
+        let flags = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        if len > MAX_PAYLOAD {
+            return Err(FrameError::TooLarge(len));
+        }
+        if buf.len() < HEADER_SIZE + len {
+            return Ok(None);
+        }
+        let ty = MsgType::from_u8(buf[3]);
+        buf.advance(HEADER_SIZE);
+        let payload = buf.split_to(len).to_vec();
+        if let Some(msg_type) = ty {
+            return Ok(Some(Frame {
+                version,
+                msg_type,
+                flags,
+                payload,
+            }));
+        }
     }
-    let magic = u16::from_le_bytes([buf[0], buf[1]]);
-    if magic != MAGIC {
-        return Err(FrameError::BadMagic);
-    }
-    let version = buf[2];
-    if version != VERSION {
-        return Err(FrameError::BadVersion(version));
-    }
-    let ty = MsgType::from_u8(buf[3]).ok_or(FrameError::BadType(buf[3]))?;
-    let flags = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-    if buf.len() < HEADER_SIZE + len {
-        return Ok(None);
-    }
-    buf.advance(HEADER_SIZE);
-    let payload = buf.split_to(len).to_vec();
-    Ok(Some(Frame {
-        version,
-        msg_type: ty,
-        flags,
-        payload,
-    }))
 }
 
 #[cfg(test)]
@@ -127,6 +147,17 @@ mod tests {
         let f = try_decode_frame(&mut buf).unwrap().unwrap();
         assert_eq!(f.msg_type, MsgType::Heartbeat);
         assert_eq!(f.payload, b"hi");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn unknown_type_is_skipped() {
+        let mut raw = encode_frame(MsgType::Heartbeat, b"x", 0);
+        raw[3] = 0xEE;
+        raw.extend(encode_frame(MsgType::Key, b"k", 0));
+        let mut buf = BytesMut::from(&raw[..]);
+        let f = try_decode_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(f.msg_type, MsgType::Key);
         assert!(buf.is_empty());
     }
 }
