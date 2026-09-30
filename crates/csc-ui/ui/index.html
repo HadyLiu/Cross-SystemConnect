@@ -447,14 +447,14 @@ function loadPlaces(list, self){
   let moved=false;
   raw.forEach(s=>{
     const mapped=fromSaved(s.x, s.y);
-    const pos=onRing(mapped.x, mapped.y)?mapped:nearestSlot(mapped.x, mapped.y, s.name);
+    const pos=onRing(mapped.x, mapped.y)?mapped:nearestSlot(mapped.x, mapped.y, s.name, false);
     if(pos.x!==s.x||pos.y!==s.y) moved=true;
     places.push({name:s.name, x:pos.x, y:pos.y});
   });
   if(moved) placesDirty=true;
 }
-function nearestSlot(x, y, name){
-  const taken=new Set(places.filter(p=>p.name!==name).map(p=>p.x+','+p.y));
+function nearestSlot(x, y, name, liveOnly=true){
+  const taken=new Set(places.filter(p=>p.name!==name&&(!liveOnly||isLive(p.name))).map(p=>p.x+','+p.y));
   let best=null, bestD=1e18;
   for(const s of SLOTS){
     if(taken.has(s[0]+','+s[1])) continue;
@@ -468,11 +468,33 @@ function nearestSlot(x, y, name){
     if(d<nd){ nd=d; near=s; }
   }
   const side=sectorOf(near[0], near[1]);
-  const n=places.filter(p=>p.name!==name && sectorOf(p.x, p.y)===side).length;
+  const n=places.filter(p=>p.name!==name && isLive(p.name) && sectorOf(p.x, p.y)===side).length;
   return {x:near[0]*(n+1), y:near[1]*(n+1)};
 }
+function isLive(name){
+  return livePeers.some(p=>p.name===name);
+}
+// Offline computers keep their place (and edges) until a connected one takes the slot.
+function claimSlot(name, x, y){
+  places=places.filter(s=>s.name===name||isLive(s.name)||s.x!==x||s.y!==y);
+}
+// A place saved under a computer's address (before its name was known) belongs to that computer.
+function adoptAddressPlaces(){
+  livePeers.forEach(p=>{
+    if(!p.address||p.address===p.name) return;
+    const stale=places.find(s=>s.name===p.address);
+    if(!stale) return;
+    if(places.some(s=>s.name===p.name)) places=places.filter(s=>s!==stale);
+    else stale.name=p.name;
+    placesDirty=true;
+  });
+}
+function canonLayout(layout){
+  const l=layout||{};
+  return JSON.stringify(Object.keys(l).sort().map(k=>[k, Object.keys(l[k]||{}).sort().map(e=>[e, l[k][e]])]));
+}
 function slotForNew(){
-  const used=new Set(places.map(s=>s.x+','+s.y));
+  const used=new Set(places.filter(s=>isLive(s.name)).map(s=>s.x+','+s.y));
   for(const s of SLOTS){
     if(!used.has(s[0]+','+s[1])) return {x:s[0], y:s[1]};
   }
@@ -485,6 +507,7 @@ function ensurePlace(name){
   let pos=places.find(s=>s.name===name);
   if(pos) return pos;
   const slot=slotForNew();
+  claimSlot(name, slot.x, slot.y);
   pos={name, x:slot.x, y:slot.y};
   places.push(pos);
   placesDirty=true;
@@ -503,7 +526,8 @@ function sectorOf(x, y){
 }
 function layoutFromPlaces(){
   const host=computerName()||'本机';
-  const peers=livePeers.map(p=>places.find(s=>s.name===p.name)).filter(Boolean);
+  // Offline computers stay in the layout, so a reconnect can cross again without a save.
+  const peers=places.filter(s=>s.name&&s.name!==host);
   const opposite={
     right:'left', left:'right', top:'bottom', bottom:'top',
     top_right:'bottom_left', top_left:'bottom_right',
@@ -547,6 +571,8 @@ function renderDesk(){
   if(drag) return;
   const desk=$('desk');
   if(!desk) return;
+  // A controlled computer names its sessions by the host's address; they are not screens to place.
+  if($('role').value!=='server') return;
   const host=computerName()||'本机';
   desk.innerHTML='';
   const hostEl=makeMon(host,'键鼠主机',true);
@@ -588,6 +614,7 @@ document.addEventListener('pointerup', e=>{
   const x=e.clientX-(r.left+r.width/2);
   const y=e.clientY-(r.top+r.height/2);
   const snap=nearestSlot(x, y, name);
+  claimSlot(name, snap.x, snap.y);
   let pos=places.find(s=>s.name===name);
   if(!pos){ pos={name, x:snap.x, y:snap.y}; places.push(pos); }
   else { pos.x=snap.x; pos.y=snap.y; }
@@ -603,6 +630,7 @@ function syncLive(names, discovered){
   if(sig===liveSig) return;
   liveSig=sig;
   livePeers=next;
+  adoptAddressPlaces();
   renderDesk();
 }
 $('name').addEventListener('input',()=>{ if(!drag) renderDesk(); });
@@ -709,6 +737,9 @@ async function load(){
     $('heartbeat_ms').value=n.heartbeat_ms||5000;
     selectedIp=cfg.search_address||'';
     loadPlaces(cfg.screens, computerName());
+    adoptAddressPlaces();
+    // Layouts saved while a computer was offline lost its edges; rebuild them from the places.
+    if(cfg.role==='server' && canonLayout(cfg.layout)!==canonLayout(layoutFromPlaces())) placesDirty=true;
     renderDesk();
     const sw=cfg.switch||{};
     $('edge_delay_ms').value=sw.edge_delay_ms||0;

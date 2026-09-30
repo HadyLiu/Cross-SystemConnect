@@ -759,9 +759,10 @@ impl Core {
         let x = ax - ox;
         let y = ay - oy;
         let dragging = csc_platform::primary_button_down();
-        let Some(dec) = self.switch.on_local_cursor(x, y, raw, Instant::now()) else {
+        let Some(mut dec) = self.switch.on_local_cursor(x, y, raw, Instant::now()) else {
             return;
         };
+        dec.neighbor = self.session_name(&dec.neighbor).await;
         let known_screen = self.peer_screens.iter().any(|(k, size)| {
             k.eq_ignore_ascii_case(&dec.neighbor) && size.width > 1 && size.height > 1
         });
@@ -796,6 +797,26 @@ impl Core {
                     dec.edge, dec.neighbor
                 );
             }
+        }
+    }
+
+    /// Session for a layout name. A layout saved while a computer was known only
+    /// by its address still reaches it once it connects under its name.
+    async fn session_name(&self, name: &str) -> String {
+        if self.net.has_peer(name).await || name.parse::<std::net::IpAddr>().is_err() {
+            return name.to_string();
+        }
+        let by_address = self
+            .status
+            .read()
+            .await
+            .discovered
+            .iter()
+            .find(|p| p.address == name)
+            .map(|p| p.name.clone());
+        match by_address {
+            Some(peer) if self.net.has_peer(&peer).await => peer,
+            _ => name.to_string(),
         }
     }
 
