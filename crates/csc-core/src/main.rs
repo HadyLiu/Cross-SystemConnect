@@ -39,28 +39,46 @@ fn log_path_of(cfg: &Config) -> PathBuf {
     }
 }
 
-fn init_logging(cfg: &Config, log_path: &std::path::Path) -> anyhow::Result<()> {
+fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create log dir {}", parent.display()))?;
+        }
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open log {}", path.display()))
+}
+
+/// Open the configured log, or the default path when that file cannot be created.
+/// A missing directory must not stop the process before IPC is listening.
+fn init_logging(cfg: &Config) -> anyhow::Result<PathBuf> {
     let level = if !cfg.log.level.is_empty() {
         cfg.log.level.as_str()
     } else {
         cfg.log_level.as_str()
     };
     let filter = EnvFilter::try_new(format!("info,csc_core={level}")).unwrap_or_default();
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open log {}", log_path.display()))?;
+    let preferred = log_path_of(cfg);
+    let fallback = default_log_path();
+    let (path, file) = match open_log_file(&preferred) {
+        Ok(file) => (preferred, file),
+        Err(err) if preferred != fallback => {
+            eprintln!("log path {} unavailable: {err:#}", preferred.display());
+            (fallback.clone(), open_log_file(&fallback)?)
+        }
+        Err(err) => return Err(err),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(file)
         .with_ansi(false)
         .init();
-    info!("logging to {}", log_path.display());
-    Ok(())
+    info!("logging to {}", path.display());
+    Ok(path)
 }
 
 fn single_instance_lock() -> anyhow::Result<std::fs::File> {
@@ -97,29 +115,30 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
 
-    let mut cfg = Config::load_or_create(&config_path)?;
-    let log_path = log_path_of(&cfg);
-    init_logging(&cfg, &log_path)?;
-    let _lock = single_instance_lock()?;
-
-    let host = query_host_net_info();
-    if cfg.search_address.is_empty() {
-        if let Some(nic) = host
-            .nics
-            .iter()
-            .find(|n| n.kind == "ethernet")
-            .or(host.nics.first())
-        {
-            cfg.search_address = nic.address.clone();
-            if let Err(e) = cfg.save(&config_path) {
-                warn!("save default search address: {e:#}");
-            }
+    let cfg = Config::load_or_create(&config_path).unwrap_or_else(|e| {
+        eprintln!("config load failed, using defaults: {e:#}");
+        Config::default()
+    });
+    let log_path = match init_logging(&cfg) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("logging disabled: {e:#}");
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::try_new("info").unwrap_or_default())
+                .with_ansi(false)
+                .try_init();
+            log_path_of(&cfg)
         }
-    }
-    info!(
-        "Cross-SystemConnect-core starting name={} host={} ips={:?}",
-        cfg.name, host.host_name, host.ipv4_addresses
-    );
+    };
+    let _lock = match single_instance_lock() {
+        Ok(file) => Some(file),
+        Err(e) => {
+            eprintln!("single instance lock skipped: {e:#}");
+            None
+        }
+    };
+
+    info!("Cross-SystemConnect-core starting name={}", cfg.name);
 
     let screen = create_screen_info().virtual_size();
     let mut switch = SwitchController::default();
@@ -141,17 +160,9 @@ async fn main() -> anyhow::Result<()> {
         },
         local_name: cfg.name.clone(),
         launch_at_login: cfg.gui.launch_at_login,
-        host_name: host.host_name.clone(),
-        local_ipv4: host.ipv4_addresses.clone(),
-        local_nics: host
-            .nics
-            .iter()
-            .map(|n| LocalNic {
-                address: n.address.clone(),
-                kind: n.kind.clone(),
-                name: n.name.clone(),
-            })
-            .collect(),
+        host_name: cfg.name.clone(),
+        local_ipv4: Vec::new(),
+        local_nics: Vec::new(),
         discovery_port: cfg.control_port,
         link_state: match cfg.role {
             csc_config::Role::Server => "searching".into(),
@@ -181,6 +192,51 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
+    let ipc_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_ipc(ipc_state).await {
+            warn!("IPC server stopped: {e:#}");
+        }
+    });
+    // Bind the socket before NIC discovery. A failure there must not leave the UI
+    // with "no such file" on every config and log request.
+    tokio::task::yield_now().await;
+
+    let host = query_host_net_info();
+    {
+        let mut cfg = config.write().await;
+        if cfg.search_address.is_empty() {
+            if let Some(nic) = host
+                .nics
+                .iter()
+                .find(|n| n.kind == "ethernet")
+                .or(host.nics.first())
+            {
+                cfg.search_address = nic.address.clone();
+                if let Err(e) = cfg.save(&config_path) {
+                    warn!("save default search address: {e:#}");
+                }
+            }
+        }
+        info!("host={} ips={:?}", host.host_name, host.ipv4_addresses);
+    }
+    let search = config.read().await.search_address.clone();
+    {
+        let mut s = status.write().await;
+        s.host_name = host.host_name;
+        s.local_ipv4 = host.ipv4_addresses;
+        s.local_nics = host
+            .nics
+            .into_iter()
+            .map(|n| LocalNic {
+                address: n.address,
+                kind: n.kind,
+                name: n.name,
+            })
+            .collect();
+        s.search_subnet = crate::discover::subnet_label(&search).unwrap_or_default();
+    }
+
     let net = spawn_network(
         config.clone(),
         config_path.clone(),
@@ -190,13 +246,6 @@ async fn main() -> anyhow::Result<()> {
         inbound_tx,
     )
     .await?;
-
-    let ipc_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_ipc(ipc_state).await {
-            warn!("IPC server stopped: {e:#}");
-        }
-    });
 
     let mut injector = create_input_injector();
     let mut clipboard = create_clipboard();

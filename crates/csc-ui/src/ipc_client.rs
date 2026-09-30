@@ -12,25 +12,31 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub const CORE_PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
 pub const CORE_BIN: &str = "Cross-SystemConnect-core";
 
+fn ipc_endpoint() -> String {
+    #[cfg(windows)]
+    {
+        CORE_PIPE.to_string()
+    }
+    #[cfg(unix)]
+    {
+        csc_proto::core_socket_path().display().to_string()
+    }
+}
+
 #[cfg(windows)]
-fn open_pipe() -> std::io::Result<std::fs::File> {
+fn open_pipe() -> anyhow::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(CORE_PIPE)
+        .map_err(|e| anyhow::anyhow!("连接内核 {} 失败: {e}", ipc_endpoint()))
 }
 
 #[cfg(unix)]
-fn open_pipe() -> std::io::Result<std::os::unix::net::UnixStream> {
-    let path = if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        std::path::PathBuf::from(runtime).join("cross-systemconnect-core.sock")
-    } else {
-        std::path::PathBuf::from(format!(
-            "/tmp/cross-systemconnect-core-{}.sock",
-            std::env::var("USER").unwrap_or_else(|_| "user".into())
-        ))
-    };
-    std::os::unix::net::UnixStream::connect(path)
+fn open_pipe() -> anyhow::Result<std::os::unix::net::UnixStream> {
+    let path = csc_proto::core_socket_path();
+    std::os::unix::net::UnixStream::connect(&path)
+        .map_err(|e| anyhow::anyhow!("连接内核 {} 失败: {e}", path.display()))
 }
 
 fn call_raw(method: &str, params: Value) -> anyhow::Result<IpcResponse> {
@@ -113,7 +119,8 @@ pub fn ensure_core_running() -> anyhow::Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", core.display()))?;
 
     for _ in 0..80 {
@@ -121,8 +128,14 @@ pub fn ensure_core_running() -> anyhow::Result<()> {
         if try_connect() {
             return Ok(());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "内核已退出 ({status})，无法读取配置、日志和计算机名。端点 {}",
+                ipc_endpoint()
+            );
+        }
     }
-    anyhow::bail!("Cross-SystemConnect-core did not become ready over local IPC")
+    anyhow::bail!("内核在 8 秒内没有就绪。端点 {}", ipc_endpoint())
 }
 
 pub fn get_status() -> anyhow::Result<Value> {
@@ -212,11 +225,8 @@ mod tests {
 
     #[test]
     fn ipc_read_retries_interrupted_then_decodes() {
-        let raw = encode_ipc_message(&IpcResponse::ok(
-            7,
-            serde_json::json!({"text": "line"}),
-        ))
-        .unwrap();
+        let raw =
+            encode_ipc_message(&IpcResponse::ok(7, serde_json::json!({"text": "line"}))).unwrap();
         let conn = InterruptOnce {
             inner: Cursor::new(raw),
             interrupted: false,

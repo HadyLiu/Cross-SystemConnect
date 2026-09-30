@@ -379,9 +379,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw
-            .on_local_cursor(99, 0, Instant::now())
-            .expect("diagonal");
+        let d = sw.on_local_cursor(99, 0, Instant::now()).expect("diagonal");
         assert_eq!(d.neighbor, "CORNER");
         assert_eq!(d.edge, Edge::TopRight);
     }

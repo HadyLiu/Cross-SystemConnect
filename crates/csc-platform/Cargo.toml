@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+csc-config.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

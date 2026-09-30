@@ -178,8 +178,6 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
             </div>
           </div>
           <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
-          <div class="row"><label class="f">端口</label><input id="control_port" type="number" min="1" max="65535" placeholder="24900"/></div>
-          <p class="hint" id="portHint">不修改则使用默认端口 24900。</p>
           <p class="hint" id="ipHint">以太网和 Wi-Fi 都会列出，默认选中以太网</p>
           <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
         </div>
@@ -192,6 +190,11 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
     </section>
     <section class="page" id="page-settings">
       <div class="stack">
+        <div class="card">
+          <h2>端口</h2>
+          <div class="row"><label class="f">端口</label><input id="control_port" type="number" min="1" max="65535" placeholder="24900"/></div>
+          <p class="hint" id="portHint">不修改则使用默认端口 24900。两边必须相同。</p>
+        </div>
         <div class="card">
           <h2>心跳 / 其它</h2>
           <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
@@ -275,7 +278,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <h2>怎么连上</h2>
           <ul>
             <li>两台电脑选同一网段的网卡。以太网和 Wi-Fi 都会列出，有以太网时默认用以太网。</li>
-            <li>端口不改则是 24900。两边必须相同，并在防火墙上放行该端口的 UDP 和 TCP。</li>
+            <li>端口在「设置」里，不改则是 24900。两边必须相同，并在防火墙上放行该端口的 UDP 和 TCP。</li>
             <li>主机搜索时可以同时连多台。新电脑会排队询问：信任（下次不再问）、仅本次、或拒绝。</li>
             <li>计算机名只在本软件里使用，不会修改 Windows 或 Linux 的计算机名。布局里的名字要和对方的计算机名一致。</li>
           </ul>
@@ -566,8 +569,10 @@ document.querySelector('.content').addEventListener('change', scheduleSave);
 
 async function getConfig(){
   const r=await fetch('/config');
-  if(!r.ok) throw new Error('getConfig HTTP '+r.status);
-  return r.json();
+  let j=null;
+  try{ j=await r.json(); }catch(_){}
+  if(!r.ok) throw new Error((j&&j.error)||('getConfig HTTP '+r.status));
+  return j;
 }
 async function saveConfig(body){
   const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -641,7 +646,7 @@ async function load(){
     const cfg=await getConfig();
     if(cfg.error){ msg.className='err'; msg.textContent='内核未就绪: '+cfg.error; return; }
     const g=cfg.gui||{}, l=cfg.log||{}, ft=cfg.file_transfer||{}, n=cfg.network||{};
-    $('name').value=cfg.name||'';
+    $('name').value=cfg.name||cfg.host_name||'';
     setRole(cfg.role||'client');
     $('control_port').value=cfg.control_port||24900;
     $('prevent_sleep').checked=!!g.prevent_sleep;
@@ -708,6 +713,9 @@ async function refreshStatus(){
   if($('portHint')) $('portHint').textContent='不修改则使用默认端口 24900。当前发现端口 '+port+(sub?('，搜索网段 '+sub+'。'):'。');
   if(s.hostName){
     $('osNameHint').textContent='系统计算机名是 '+s.hostName+'，这里的名称只在本软件中使用，不会修改它。';
+    if(!$('name').value.trim() && document.activeElement!==$('name')){
+      $('name').value=s.localName||s.hostName;
+    }
   }
   showPeer(s.pendingPeer);
   if(typeof s.launchAtLogin==='boolean' && document.activeElement!==$('launch_at_login')){

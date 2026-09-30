@@ -395,6 +395,7 @@ name = "csc-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "csc-config",
  "libc",
  "tracing",
  "windows",
@@ -415,6 +416,7 @@ name = "csc-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "csc-config",
  "csc-proto",
  "dirs",
  "image",

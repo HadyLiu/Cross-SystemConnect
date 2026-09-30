@@ -338,11 +338,56 @@ impl Default for Config {
 }
 
 pub fn local_computer_name() -> String {
-    hostname::get()
+    read_os_hostname().unwrap_or_else(|| "PC".into())
+}
+
+/// OS hostname. Linux desktop sessions often have no `HOSTNAME` variable, so
+/// read the kernel name before falling back to the `hostname` crate or the environment.
+fn read_os_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        if let Some(name) = hostname_from_file("/proc/sys/kernel/hostname") {
+            return Some(name);
+        }
+        if let Some(name) = hostname_from_file("/etc/hostname") {
+            return Some(name);
+        }
+    }
+    if let Some(name) = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "PC".into())
+        .and_then(|text| normalize_hostname(&text))
+    {
+        return Some(name);
+    }
+    for key in ["COMPUTERNAME", "HOSTNAME", "HOST"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(name) = normalize_hostname(&value) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn hostname_from_file(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    normalize_hostname(&text)
+}
+
+fn normalize_hostname(raw: &str) -> Option<String> {
+    let name = raw.split(['\n', '\r']).next()?.trim();
+    if name.is_empty() || name == "(none)" {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// `PC` and `LOCAL-PC` are unread fallbacks, not names the user chose.
+fn name_needs_os_hostname(name: &str) -> bool {
+    name.is_empty() || name == "PC" || name == "LOCAL-PC"
 }
 
 fn app_config_dir() -> PathBuf {
@@ -453,16 +498,21 @@ impl Config {
             fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         let mut cfg: Config = serde_json::from_str(&text)
             .with_context(|| format!("parse config {}", path.display()))?;
-        if cfg.name.is_empty() {
-            cfg.name = local_computer_name();
-        }
-        if cfg.name == "LOCAL-PC" {
+        if name_needs_os_hostname(&cfg.name) {
             let host = local_computer_name();
-            rename_layout_host(&mut cfg.layout, "LOCAL-PC", &host);
-            cfg.name = host.clone();
-            info!("Migrated config name LOCAL-PC → {host}");
-            if let Err(e) = cfg.save(path) {
-                warn!("Failed to persist migrated config: {e}");
+            if !host.is_empty() && host != cfg.name {
+                let previous = cfg.name.clone();
+                rename_layout_host(&mut cfg.layout, &previous, &host);
+                for screen in &mut cfg.screens {
+                    if screen.name == previous {
+                        screen.name = host.clone();
+                    }
+                }
+                cfg.name = host.clone();
+                info!("Migrated config name {previous} → {host}");
+                if let Err(e) = cfg.save(path) {
+                    warn!("Failed to persist migrated config: {e}");
+                }
             }
         }
         if cfg.log.level.is_empty() {
@@ -556,5 +606,16 @@ mod tests {
         assert!(cfg.is_trusted_peer("DESK"));
         assert!(!cfg.is_trusted_peer("  "));
         assert!(!cfg.trust_peer(""));
+    }
+
+    #[test]
+    fn hostname_line_ignores_blank_and_placeholder() {
+        assert_eq!(normalize_hostname("desk\n").as_deref(), Some("desk"));
+        assert_eq!(normalize_hostname("  \n"), None);
+        assert_eq!(normalize_hostname("(none)\n"), None);
+        assert!(name_needs_os_hostname(""));
+        assert!(name_needs_os_hostname("PC"));
+        assert!(!name_needs_os_hostname("Desk"));
+        assert!(!local_computer_name().is_empty());
     }
 }

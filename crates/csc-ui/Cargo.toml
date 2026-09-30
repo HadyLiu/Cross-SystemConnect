@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+csc-config.workspace = true
 csc-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -89,15 +89,25 @@ async fn handle_conn_windows(
 #[cfg(unix)]
 async fn run_ipc_unix(state: Arc<AppState>) -> anyhow::Result<()> {
     use std::fs;
+    use std::os::unix::net::UnixStream;
     use tokio::net::UnixListener;
-    let path = unix_socket_path();
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
+    let path = csc_proto::core_socket_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
-    let listener = UnixListener::bind(&path)?;
+    if path.exists() {
+        match UnixStream::connect(&path) {
+            Ok(stream) => {
+                drop(stream);
+                anyhow::bail!("IPC socket already served at {}", path.display());
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    let listener = UnixListener::bind(&path)
+        .map_err(|e| anyhow::anyhow!("bind IPC {}: {e}", path.display()))?;
     info!("IPC listening on {}", path.display());
     loop {
         let (stream, _) = listener.accept().await?;
@@ -108,17 +118,6 @@ async fn run_ipc_unix(state: Arc<AppState>) -> anyhow::Result<()> {
             }
         });
     }
-}
-
-#[cfg(unix)]
-fn unix_socket_path() -> PathBuf {
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("cross-systemconnect-core.sock");
-    }
-    PathBuf::from(format!(
-        "/tmp/cross-systemconnect-core-{}.sock",
-        std::env::var("USER").unwrap_or_else(|_| "user".into())
-    ))
 }
 
 #[cfg(unix)]

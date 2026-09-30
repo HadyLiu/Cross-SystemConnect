@@ -87,7 +87,7 @@ fn parse_v4(ip: &str) -> Option<[u8; 4]> {
 
 pub fn query_host_net_info() -> HostNetInfo {
     let mut info = HostNetInfo {
-        host_name: hostname_fallback(),
+        host_name: csc_config::local_computer_name(),
         ipv4_addresses: Vec::new(),
         nics: Vec::new(),
     };
@@ -104,31 +104,13 @@ pub fn query_host_net_info() -> HostNetInfo {
     info
 }
 
-fn hostname_fallback() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "PC".into())
-}
-
 #[cfg(unix)]
 mod unix_host {
     use super::{looks_virtual, usable_unicast_v4, HostNetInfo, LocalNic};
     use std::ffi::CStr;
 
     pub fn fill_host_net(info: &mut HostNetInfo) {
-        let mut buf = [0u8; 256];
-        // SAFETY: gethostname writes into buf
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
-        if rc == 0 {
-            if let Ok(s) = CStr::from_bytes_until_nul(&buf) {
-                if let Ok(name) = s.to_str() {
-                    if !name.is_empty() {
-                        info.host_name = name.to_string();
-                    }
-                }
-            }
-        }
-        // Enumerate IPv4 via getifaddrs
+        // Enumerate IPv4 via getifaddrs. The computer name is already set.
         unsafe {
             let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
             if libc::getifaddrs(&mut ifap) != 0 {

@@ -98,6 +98,34 @@ pub struct PendingPeer {
     pub address: String,
 }
 
+/// Filesystem path of the core's Unix socket.
+///
+/// Uses `XDG_RUNTIME_DIR` only when that directory already exists. An empty or
+/// missing runtime dir falls back to `/tmp`, and both processes must agree.
+pub fn core_socket_path() -> std::path::PathBuf {
+    socket_path_from(
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub fn socket_path_from(xdg: Option<&str>, user: Option<&str>) -> std::path::PathBuf {
+    if let Some(dir) = xdg.map(str::trim).filter(|s| !s.is_empty()) {
+        let dir = std::path::PathBuf::from(dir);
+        if dir.is_dir() {
+            return dir.join("cross-systemconnect-core.sock");
+        }
+    }
+    let user = user
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("user");
+    std::path::PathBuf::from(format!("/tmp/cross-systemconnect-core-{user}.sock"))
+}
+
 /// Encode length-prefixed JSON for IPC.
 pub fn encode_ipc_message(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let body = serde_json::to_vec(value)?;
@@ -134,5 +162,26 @@ mod tests {
         let (n, value) = try_decode_ipc_message(&raw).unwrap().unwrap();
         assert_eq!(n, raw.len());
         assert_eq!(value["method"], "get_status");
+    }
+
+    #[test]
+    fn socket_path_prefers_an_existing_runtime_dir() {
+        let dir = std::env::temp_dir();
+        let path = socket_path_from(Some(dir.to_str().unwrap()), Some("ada"));
+        assert_eq!(path, dir.join("cross-systemconnect-core.sock"));
+    }
+
+    #[test]
+    fn socket_path_falls_back_when_runtime_dir_is_missing() {
+        let missing = socket_path_from(Some("/this/does/not/exist/csc-runtime"), Some("ada"));
+        assert_eq!(
+            missing,
+            std::path::PathBuf::from("/tmp/cross-systemconnect-core-ada.sock")
+        );
+        let blank = socket_path_from(Some("  "), None);
+        assert_eq!(
+            blank,
+            std::path::PathBuf::from("/tmp/cross-systemconnect-core-user.sock")
+        );
     }
 }
