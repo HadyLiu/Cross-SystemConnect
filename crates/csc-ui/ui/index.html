@@ -216,6 +216,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <h2>边缘切换</h2>
           <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
           <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
+          <div class="row" title="对角放置的电脑：指针贴着外侧边缘、距角落这么多像素内即可切换"><label class="f">对角切换区</label><input id="diagonal_zone_px" type="number" min="1"/></div>
           <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
           <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
           <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
@@ -240,7 +241,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <div class="card">
           <h2>快捷键</h2>
           <div class="row"><label class="f">锁定屏幕</label><input id="lock_screen" type="text"/></div>
-          <div class="row"><label class="f">切回服务端</label><input id="return_to_server" type="text"/></div>
+          <div class="row" title="键鼠在另一台电脑上时按下，立即回到本机"><label class="f">回到本机</label><input id="return_to_server" type="text" placeholder="Ctrl+Alt+Home"/></div>
           <div class="row"><label class="f">切换共享</label><input id="toggle_enable" type="text"/></div>
         </div>
         <div class="card">
@@ -651,6 +652,7 @@ function saveBody(){
     switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
             double_tap_window_ms:Number($('double_tap_window_ms').value),
             corner_dead_zone_px:Number($('corner_dead_zone_px').value),
+            diagonal_zone_px:Number($('diagonal_zone_px').value)||80,
             relative_mouse_moves:$('relative_mouse_moves').checked},
     clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
                files:$('clip_files').checked,max_inline_mb:Number($('max_inline_mb').value),
@@ -709,6 +711,7 @@ async function load(){
     $('double_tap_edge').checked=!!sw.double_tap_edge;
     $('double_tap_window_ms').value=sw.double_tap_window_ms||250;
     $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
+    $('diagonal_zone_px').value=sw.diagonal_zone_px||80;
     $('relative_mouse_moves').checked=!!sw.relative_mouse_moves;
     const clip=cfg.clipboard||{};
     $('clip_enabled').checked=clip.enabled!==false;

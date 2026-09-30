@@ -127,7 +127,11 @@ pub fn capture_start() -> bool {
     {
         win::hook::start()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::grab::start()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
         false
     }
@@ -138,7 +142,9 @@ pub fn capture_start() -> bool {
 pub fn capture_set_grab(grab: bool, park: Option<(i32, i32)>) {
     #[cfg(windows)]
     win::hook::set_grab(grab, park);
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::grab::set_grab(grab, park);
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     let _ = (grab, park);
 }
 
@@ -148,7 +154,11 @@ pub fn capture_drain() -> Vec<Captured> {
     {
         win::hook::drain()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::grab::drain()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
         Vec::new()
     }

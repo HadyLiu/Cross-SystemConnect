@@ -250,8 +250,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                             state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
                         }
                         if layout_changed {
-                            state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
+                            info!("screen layout changed");
                         }
+                        // Switch settings and hotkeys live in the same reload; it keeps sessions.
+                        state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
                         IpcResponse::ok(req.id, json!({"ok": true}))
                     }
                     Err(e) => IpcResponse::err(req.id, e.to_string()),

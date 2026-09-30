@@ -33,6 +33,10 @@ pub struct SwitchConfig {
     pub corner_dead_zone_px: i32,
     #[serde(default)]
     pub relative_mouse_moves: bool,
+    /// Length along an outer side, from a corner, that switches to a diagonal
+    /// neighbor. A single corner pixel is too hard to hit.
+    #[serde(default = "default_diagonal_zone")]
+    pub diagonal_zone_px: i32,
 }
 
 fn default_double_tap_window() -> i32 {
@@ -40,6 +44,9 @@ fn default_double_tap_window() -> i32 {
 }
 fn default_corner() -> i32 {
     10
+}
+fn default_diagonal_zone() -> i32 {
+    80
 }
 
 impl Default for SwitchConfig {
@@ -50,6 +57,7 @@ impl Default for SwitchConfig {
             double_tap_window_ms: 250,
             corner_dead_zone_px: 10,
             relative_mouse_moves: false,
+            diagonal_zone_px: default_diagonal_zone(),
         }
     }
 }

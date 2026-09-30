@@ -222,22 +222,43 @@ impl SwitchController {
         }
     }
 
-    /// Corner that the pointer is in, using the configured dead-zone size.
+    /// Distance from a corner, along a side, that counts as that corner.
+    fn diagonal_zone(&self, side_len: i32) -> i32 {
+        let z = self
+            .cfg
+            .diagonal_zone_px
+            .max(self.cfg.corner_dead_zone_px)
+            .max(1);
+        z.min((side_len / 3).max(1))
+    }
+
+    /// Corner zone the pointer is pressing into: it must touch an outer side
+    /// and be within the diagonal zone of one end of that side.
     fn diagonal_at(&self, x: i32, y: i32) -> Option<Edge> {
-        let d = self.cfg.corner_dead_zone_px.max(0);
         let m = self.monitor_at(x, y);
         let (ol, or, ot, ob) = self.outer_sides(&m);
-        let left = ol && x <= m.left + d;
-        let right = or && x >= m.right - 1 - d;
-        let top = ot && y <= m.top + d;
-        let bottom = ob && y >= m.bottom - 1 - d;
-        if left && top {
+        let zy = self.diagonal_zone(m.height());
+        let zx = self.diagonal_zone(m.width());
+        let on_left = ol && x <= m.left;
+        let on_right = or && x >= m.right - 1;
+        let on_top = ot && y <= m.top;
+        let on_bottom = ob && y >= m.bottom - 1;
+        let others: Vec<Rect> = self
+            .monitor_list()
+            .into_iter()
+            .filter(|o| *o != m)
+            .collect();
+        let near_top = y <= m.top + zy && !others.iter().any(|o| o.bottom <= m.top);
+        let near_bottom = y >= m.bottom - 1 - zy && !others.iter().any(|o| o.top >= m.bottom);
+        let near_left = x <= m.left + zx && !others.iter().any(|o| o.right <= m.left);
+        let near_right = x >= m.right - 1 - zx && !others.iter().any(|o| o.left >= m.right);
+        if (on_left && near_top) || (on_top && near_left) {
             Some(Edge::TopLeft)
-        } else if right && top {
+        } else if (on_right && near_top) || (on_top && near_right) {
             Some(Edge::TopRight)
-        } else if left && bottom {
+        } else if (on_left && near_bottom) || (on_bottom && near_left) {
             Some(Edge::BottomLeft)
-        } else if right && bottom {
+        } else if (on_right && near_bottom) || (on_bottom && near_right) {
             Some(Edge::BottomRight)
         } else {
             None
@@ -248,14 +269,11 @@ impl SwitchController {
         if !self.enabled || self.state != SwitchState::Local {
             return None;
         }
-        let edge = if let Some(diag) = self.diagonal_at(x, y) {
-            if self.layout.neighbor(&self.local_name, diag).is_some() {
-                diag
-            } else {
-                // No machine on this corner: keep the corner from triggering a side.
-                self.pending_edge = None;
-                return None;
-            }
+        let diagonal = self
+            .diagonal_at(x, y)
+            .filter(|d| self.layout.neighbor(&self.local_name, *d).is_some());
+        let edge = if let Some(diag) = diagonal {
+            diag
         } else if let Some(edge) = self.hit_outer_edge(x, y) {
             edge
         } else {
@@ -356,6 +374,23 @@ impl SwitchController {
             (_, true, _, true) => Some(Edge::BottomRight),
             _ => None,
         };
+        let zx = self.diagonal_zone(remote.width);
+        let zy = self.diagonal_zone(remote.height);
+        let near_top = *cursor_y <= zy;
+        let near_bottom = *cursor_y >= remote.height - 1 - zy;
+        let near_left = *cursor_x <= zx;
+        let near_right = *cursor_x >= remote.width - 1 - zx;
+        let zone_diagonal = if (past_left && near_top) || (past_top && near_left) {
+            Some(Edge::TopLeft)
+        } else if (past_right && near_top) || (past_top && near_right) {
+            Some(Edge::TopRight)
+        } else if (past_left && near_bottom) || (past_bottom && near_left) {
+            Some(Edge::BottomLeft)
+        } else if (past_right && near_bottom) || (past_bottom && near_right) {
+            Some(Edge::BottomRight)
+        } else {
+            None
+        };
         let horizontal = if past_left {
             Some(Edge::Left)
         } else if past_right {
@@ -372,7 +407,9 @@ impl SwitchController {
         };
         // Leave only through a side that leads somewhere. Other sides hold the
         // pointer, as a physical screen edge would.
-        let crossed = [diagonal, horizontal, vertical].into_iter().flatten();
+        let crossed = [diagonal, zone_diagonal, horizontal, vertical]
+            .into_iter()
+            .flatten();
         let way_back = self
             .layout
             .edge_toward(&self.active_remote, &self.local_name)
@@ -513,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn corner_without_diagonal_does_not_switch() {
+    fn corner_without_diagonal_uses_the_side() {
         let mut layout_map = csc_config::LayoutMap::new();
         let mut e = BTreeMap::new();
         e.insert("right".into(), "SIDE".into());
@@ -528,11 +565,51 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        assert!(sw.on_local_cursor(99, 0, Instant::now()).is_none());
-        let side = sw
-            .on_local_cursor(99, 40, Instant::now())
-            .expect("right edge");
+        let side = sw.on_local_cursor(99, 0, Instant::now()).expect("right edge");
         assert_eq!(side.neighbor, "SIDE");
         assert_eq!(side.edge, Edge::Right);
+    }
+
+    #[test]
+    fn diagonal_zone_reaches_corner_of_uneven_monitors() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut host = BTreeMap::new();
+        host.insert("bottom_right".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), host);
+        let mut remote = BTreeMap::new();
+        remote.insert("top_left".into(), "LOCAL".into());
+        layout_map.insert("REMOTE".into(), remote);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 3360, height: 1080 },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        sw.set_screen(
+            ScreenSize { width: 3360, height: 1080 },
+            vec![
+                Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
+                Rect { left: 1920, top: 0, right: 3360, bottom: 900 },
+            ],
+        );
+        // Right side of the shorter monitor, near its bottom.
+        let d = sw.on_local_cursor(3359, 860, Instant::now()).expect("diagonal");
+        assert_eq!(d.edge, Edge::BottomRight);
+        // Bottom side of the taller monitor, near its right end is inner: no switch.
+        assert!(sw.on_local_cursor(1900, 1079, Instant::now()).is_none());
+        // Middle of the right side does not switch.
+        assert!(sw.on_local_cursor(3359, 450, Instant::now()).is_none());
+
+        let remote_size = ScreenSize { width: 1000, height: 800 };
+        let (mut x, mut y) = (0, 0);
+        sw.confirm_entered(d.edge, d.position_pct, remote_size, &mut x, &mut y, "REMOTE");
+        // Leaving across the top near the left end returns diagonally.
+        x = 40;
+        y = 5;
+        let back = sw
+            .on_remote_relative(0, -20, &mut x, &mut y, remote_size)
+            .expect("return");
+        assert_eq!(back.edge, Edge::TopLeft);
     }
 }

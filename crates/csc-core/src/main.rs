@@ -121,6 +121,47 @@ impl HeldInput {
             net.send_captured(Captured::Button { button, down: false }).await;
         }
     }
+
+    /// Release everything this computer injected on behalf of a remote host.
+    fn release_injected(&mut self, injector: &mut dyn csc_platform::InputInjector) {
+        for hid in self.keys.drain() {
+            injector.key(hid, false);
+        }
+        for button in self.buttons.drain() {
+            injector.mouse_button(button, false);
+        }
+    }
+}
+
+/// A key combination such as `Ctrl+Alt+Home`, as HID usages.
+/// Modifiers are stored left-handed; either hand matches.
+#[derive(Debug, Clone, PartialEq)]
+struct Hotkey {
+    mods: Vec<u32>,
+    key: u32,
+}
+
+impl Hotkey {
+    fn parse(text: &str) -> Option<Self> {
+        use csc_platform::keymap::{fold_modifier, hid_from_name};
+        let mut usages = text
+            .split('+')
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| hid_from_name(p).map(fold_modifier))
+            .collect::<Option<Vec<u32>>>()?;
+        let key = usages.pop()?;
+        Some(Self { mods: usages, key })
+    }
+
+    /// True when `hid` going down completes the combination, given the keys already held.
+    fn completes(&self, hid: u32, held: &std::collections::HashSet<u32>) -> bool {
+        use csc_platform::keymap::fold_modifier;
+        fold_modifier(hid) == self.key
+            && self
+                .mods
+                .iter()
+                .all(|m| held.iter().any(|k| fold_modifier(*k) == *m))
+    }
 }
 
 /// Keep the pointer just inside the edge it crossed, so the physical mouse
@@ -407,7 +448,20 @@ async fn main() -> anyhow::Result<()> {
     let mut park_x = 0i32;
     let mut park_y = 0i32;
     let mut enter_point = (0i32, 0i32);
+    // Just inside the edge the pointer left through, for returns that cross no edge.
+    let mut home_point = (screen.width / 2, screen.height / 2);
     let mut held = HeldInput::default();
+    // Keys and buttons this computer injected for a remote host, released if that host goes away.
+    let mut injected = HeldInput::default();
+    let hotkey_of = |cfg: &Config| {
+        let text = cfg.hotkeys.return_to_server.clone();
+        let parsed = Hotkey::parse(&text);
+        if parsed.is_none() && !text.trim().is_empty() {
+            warn!("return hotkey {text:?} not understood");
+        }
+        parsed
+    };
+    let mut return_hotkey = hotkey_of(&*config.read().await);
     let mut last_miss = Instant::now() - Duration::from_secs(5);
     let mut tick = tokio::time::interval(Duration::from_millis(8));
     let mut next_nic = Instant::now();
@@ -433,6 +487,19 @@ async fn main() -> anyhow::Result<()> {
                         ScreenLayout::load(&cfg.layout),
                     );
                     switch.set_screen(screen, monitors.clone());
+                    return_hotkey = hotkey_of(&cfg);
+                }
+                if grab && !net.has_peer(switch.active_remote()).await {
+                    warn!(
+                        "session to {} is gone; returning input to this computer",
+                        switch.active_remote()
+                    );
+                    switch.unlock_to_local();
+                    held = HeldInput::default();
+                    release_pointer(&mut grab, Some(home_point));
+                    grab_armed = false;
+                    let mut s = status.write().await;
+                    s.active_screen = s.local_name.clone();
                 }
                 if Instant::now() >= next_nic {
                     next_nic = Instant::now() + Duration::from_secs(3);
@@ -505,6 +572,33 @@ async fn main() -> anyhow::Result<()> {
                             polled
                         };
                         for step in steps {
+                            if let csc_platform::Captured::Key { hid, down: true } = step {
+                                if return_hotkey
+                                    .as_ref()
+                                    .is_some_and(|k| k.completes(hid, &held.keys))
+                                {
+                                    let current = switch.active_remote().to_string();
+                                    held.release_all(&net).await;
+                                    let leave_msg = SwitchPayload {
+                                        edge: csc_proto::Edge::Left,
+                                        position_pct: 0.5,
+                                    };
+                                    net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                                    switch.unlock_to_local();
+                                    release_pointer(&mut grab, Some(home_point));
+                                    grab_armed = false;
+                                    let mut s = status.write().await;
+                                    s.active_screen = s.local_name.clone();
+                                    info!("return hotkey: input back from {current}");
+                                    break;
+                                }
+                            }
+                            if let csc_platform::Captured::Key { hid, down: false } = step {
+                                if !held.keys.contains(&hid) {
+                                    // Release of the hotkey's own key, which the remote never saw.
+                                    continue;
+                                }
+                            }
                             let csc_platform::Captured::Move { dx, dy } = step else {
                                 held.track(step);
                                 net.send_captured(step).await;
@@ -602,6 +696,11 @@ async fn main() -> anyhow::Result<()> {
                                         &dec.neighbor,
                                     );
                                     enter_point = (x, y);
+                                    home_point = reentry_point(
+                                        entry,
+                                        dec.position_pct,
+                                        switch.monitor_at(x, y),
+                                    );
                                     held = HeldInput::default();
                                     if hooked {
                                         // Moves are measured from the park point, and Windows
@@ -643,16 +742,20 @@ async fn main() -> anyhow::Result<()> {
                 match ev {
                     None => break,
                     Some(InboundEvent::Disconnected { peer }) => {
+                        info!("session {peer} disconnected");
                         let mut s = status.write().await;
-                        if s.active_screen.eq_ignore_ascii_case(&peer) || s.peer_name.eq_ignore_ascii_case(&peer) {
+                        let active = grab
+                            && (switch.active_remote().eq_ignore_ascii_case(&peer)
+                                || s.active_screen.eq_ignore_ascii_case(&peer));
+                        if active {
                             switch.unlock_to_local();
                             held = HeldInput::default();
-                            release_pointer(&mut grab, None);
+                            release_pointer(&mut grab, Some(home_point));
                             grab_armed = false;
                             s.active_screen = s.local_name.clone();
                         }
-                        if !s.peer_name.split(',').any(|n| n.trim().eq_ignore_ascii_case(&peer)) {
-                            // peer list is refreshed from the network task; drop this name locally
+                        if !grab {
+                            injected.release_injected(injector.as_mut());
                         }
                         let left: Vec<&str> = s.peer_name.split(',').map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&peer)).collect();
                         s.peer_name = left.join(", ");
@@ -721,6 +824,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Some(InboundEvent::MouseButton { button, down }) => {
                         if !grab {
+                            injected.track(csc_platform::Captured::Button { button, down });
                             injector.mouse_button(button, down);
                         }
                     }
@@ -731,6 +835,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Some(InboundEvent::Key { hid, down }) => {
                         if !grab {
+                            injected.track(csc_platform::Captured::Key { hid, down });
                             injector.key(hid, down);
                         }
                     }
@@ -754,4 +859,22 @@ async fn main() -> anyhow::Result<()> {
     info!("Cross-SystemConnect-core exiting");
     // Ensure network/IPC tasks die with the process (do not leave a stray kernel).
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Hotkey;
+    use std::collections::HashSet;
+
+    #[test]
+    fn return_hotkey_matches_either_hand() {
+        let hk = Hotkey::parse("Ctrl+Alt+Home").expect("parse");
+        let home = 0x4A;
+        let held: HashSet<u32> = [0xE4, 0xE2].into_iter().collect();
+        assert!(hk.completes(home, &held));
+        let only_ctrl: HashSet<u32> = [0xE0].into_iter().collect();
+        assert!(!hk.completes(home, &only_ctrl));
+        assert!(!hk.completes(0x4D, &held));
+        assert!(Hotkey::parse("Ctrl+Nope").is_none());
+    }
 }

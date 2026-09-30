@@ -197,7 +197,66 @@ fn open() -> Option<Conn> {
     }
 }
 
-unsafe fn dlopen(name: &[u8]) -> Option<*mut c_void> {
+#[repr(C)]
+struct XineramaScreenInfo {
+    screen_number: c_int,
+    x_org: libc::c_short,
+    y_org: libc::c_short,
+    width: libc::c_short,
+    height: libc::c_short,
+}
+
+type XineramaIsActive = unsafe extern "C" fn(*mut c_void) -> c_int;
+type XineramaQueryScreens = unsafe extern "C" fn(*mut c_void, *mut c_int) -> *mut XineramaScreenInfo;
+type XFree = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+/// Physical monitors as `(x, y, width, height)`, from Xinerama. Empty when
+/// Xinerama is missing or inactive.
+pub fn monitors() -> Vec<(i32, i32, i32, i32)> {
+    with(|c| unsafe {
+        let mut out = Vec::new();
+        let Some(lib) = dlopen_quiet(b"libXinerama.so.1\0") else {
+            return out;
+        };
+        let (Some(active), Some(query), Some(x11)) = (
+            sym::<XineramaIsActive>(lib, "XineramaIsActive"),
+            sym::<XineramaQueryScreens>(lib, "XineramaQueryScreens"),
+            dlopen_quiet(b"libX11.so.6\0"),
+        ) else {
+            return out;
+        };
+        let Some(free) = sym::<XFree>(x11, "XFree") else {
+            return out;
+        };
+        if active(c.dpy) == 0 {
+            return out;
+        }
+        let mut n = 0;
+        let list = query(c.dpy, &mut n);
+        if list.is_null() {
+            return out;
+        }
+        for i in 0..n.max(0) as usize {
+            let s = &*list.add(i);
+            if s.width > 0 && s.height > 0 {
+                out.push((s.x_org as i32, s.y_org as i32, s.width as i32, s.height as i32));
+            }
+        }
+        free(list as *mut c_void);
+        out
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) unsafe fn dlopen_quiet(name: &[u8]) -> Option<*mut c_void> {
+    let handle = libc::dlopen(
+        name.as_ptr() as *const libc::c_char,
+        libc::RTLD_NOW | libc::RTLD_GLOBAL,
+    );
+    (!handle.is_null()).then_some(handle)
+}
+
+pub(crate) unsafe fn dlopen(name: &[u8]) -> Option<*mut c_void> {
     let handle = libc::dlopen(
         name.as_ptr() as *const libc::c_char,
         libc::RTLD_NOW | libc::RTLD_GLOBAL,
@@ -219,7 +278,7 @@ unsafe fn dlopen(name: &[u8]) -> Option<*mut c_void> {
     }
 }
 
-unsafe fn sym<T: Copy>(handle: *mut c_void, name: &str) -> Option<T> {
+pub(crate) unsafe fn sym<T: Copy>(handle: *mut c_void, name: &str) -> Option<T> {
     let cstr = std::ffi::CString::new(name).ok()?;
     let ptr = libc::dlsym(handle, cstr.as_ptr());
     if ptr.is_null() {

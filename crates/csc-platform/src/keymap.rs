@@ -96,9 +96,84 @@ pub fn evdev_from_hid(hid: u32) -> Option<u16> {
         .map(|r| r.evdev)
 }
 
+/// HID usage for a Linux evdev key code.
+pub fn hid_from_evdev(code: u16) -> Option<u32> {
+    TABLE
+        .iter()
+        .find(|r| r.evdev == code)
+        .map(|r| r.hid as u32)
+}
+
+pub const HID_LEFT_CTRL: u32 = 0xE0;
+pub const HID_LEFT_SHIFT: u32 = 0xE1;
+pub const HID_LEFT_ALT: u32 = 0xE2;
+pub const HID_LEFT_GUI: u32 = 0xE3;
+
+/// Left-hand modifier for a right-hand one; other usages unchanged.
+pub fn fold_modifier(hid: u32) -> u32 {
+    match hid {
+        0xE4..=0xE7 => hid - 4,
+        other => other,
+    }
+}
+
+/// HID usage for a key name as written in a hotkey such as `Ctrl+Alt+Home`.
+/// Modifiers map to their left-hand usage. Case does not matter.
+pub fn hid_from_name(name: &str) -> Option<u32> {
+    let n = name.trim().to_ascii_lowercase();
+    let b = n.as_bytes();
+    if b.len() == 1 {
+        return match b[0] {
+            c @ b'a'..=b'z' => Some(0x04 + (c - b'a') as u32),
+            b'0' => Some(0x27),
+            c @ b'1'..=b'9' => Some(0x1E + (c - b'1') as u32),
+            _ => None,
+        };
+    }
+    if let Some(num) = n.strip_prefix('f').and_then(|s| s.parse::<u32>().ok()) {
+        return (1..=12).contains(&num).then(|| 0x3A + num - 1);
+    }
+    Some(match n.as_str() {
+        "ctrl" | "control" => HID_LEFT_CTRL,
+        "shift" => HID_LEFT_SHIFT,
+        "alt" => HID_LEFT_ALT,
+        "win" | "super" | "meta" | "cmd" => HID_LEFT_GUI,
+        "enter" | "return" => 0x28,
+        "esc" | "escape" => 0x29,
+        "backspace" => 0x2A,
+        "tab" => 0x2B,
+        "space" => 0x2C,
+        "capslock" => 0x39,
+        "printscreen" | "print" => 0x46,
+        "scrolllock" => 0x47,
+        "pause" | "break" => 0x48,
+        "insert" | "ins" => 0x49,
+        "home" => 0x4A,
+        "pageup" | "pgup" => 0x4B,
+        "delete" | "del" => 0x4C,
+        "end" => 0x4D,
+        "pagedown" | "pgdn" => 0x4E,
+        "right" => 0x4F,
+        "left" => 0x50,
+        "down" => 0x51,
+        "up" => 0x52,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotkey_names() {
+        assert_eq!(hid_from_name("Home"), Some(0x4A));
+        assert_eq!(hid_from_name("ctrl"), Some(HID_LEFT_CTRL));
+        assert_eq!(hid_from_name("F12"), Some(0x45));
+        assert_eq!(hid_from_name("q"), Some(0x14));
+        assert_eq!(hid_from_evdev(102), Some(0x4A));
+        assert_eq!(fold_modifier(0xE6), HID_LEFT_ALT);
+    }
 
     #[test]
     fn letters_and_modifiers_roundtrip() {

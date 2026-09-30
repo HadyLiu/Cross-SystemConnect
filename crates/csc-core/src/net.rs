@@ -876,7 +876,53 @@ struct Admit {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs one control session and always reports `Disconnected` when it ends,
+/// whether the peer closed, reset, timed out or sent garbage.
+#[allow(clippy::too_many_arguments)]
 async fn session<S>(
+    cfg: &Config,
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    stream: S,
+    peer_cert: Vec<u8>,
+    status: &Arc<RwLock<NetStatus>>,
+    peer: String,
+    outbound: mpsc::Receiver<Vec<u8>>,
+    inbound: mpsc::Sender<InboundEvent>,
+    link: Option<ClientLink>,
+    admit: Option<Admit>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let result = session_inner(
+        cfg,
+        live,
+        config_path,
+        stream,
+        peer_cert,
+        status,
+        peer.clone(),
+        outbound,
+        inbound.clone(),
+        link,
+        admit,
+    )
+    .await;
+    let _ = inbound.send(InboundEvent::Disconnected { peer }).await;
+    result
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_inner<S>(
     cfg: &Config,
     live: &Arc<RwLock<Config>>,
     config_path: &Path,
@@ -1003,7 +1049,7 @@ where
     let hb_writer = writer.clone();
     let hb_enabled = cfg.network.heartbeat_enabled;
     let hb_ms = cfg.network.heartbeat_ms.max(500) as u64;
-    let heartbeat = tokio::spawn(async move {
+    let _heartbeat = AbortOnDrop(tokio::spawn(async move {
         if !hb_enabled {
             return;
         }
@@ -1016,7 +1062,11 @@ where
                 break;
             }
         }
-    });
+    }));
+    // A peer that vanished without closing TCP is noticed by its missing heartbeats.
+    let idle_limit = Duration::from_millis(hb_ms * 4);
+
+    let mut last_rx = tokio::time::Instant::now();
 
     let mut tmp = [0u8; 16 * 1024];
     loop {
@@ -1024,9 +1074,9 @@ where
             read = reader.read(&mut tmp) => {
                 let n = read?;
                 if n == 0 {
-                    let _ = inbound.send(InboundEvent::Disconnected { peer: peer.clone() }).await;
                     break;
                 }
+                last_rx = tokio::time::Instant::now();
                 buf.extend_from_slice(&tmp[..n]);
                 loop {
                     match try_decode_frame(&mut buf)? {
@@ -1042,17 +1092,17 @@ where
                     Some(frame) => {
                         let mut w = writer.lock().await;
                         if w.write_all(&frame).await.is_err() {
-                            let _ = inbound.send(InboundEvent::Disconnected { peer: peer.clone() }).await;
                             break;
                         }
                     }
                     None => break,
                 }
             }
+            _ = tokio::time::sleep_until(last_rx + idle_limit), if hb_enabled => {
+                anyhow::bail!("no data from {peer} for {}s", idle_limit.as_secs());
+            }
         }
     }
-
-    heartbeat.abort();
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
 mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
 mod linux_tray;
 
+#[cfg(not(target_os = "linux"))]
 use anyhow::Context;
 use serde_json::json;
 use std::borrow::Cow;
@@ -170,8 +172,16 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
         }
     } else if path == "/config" && method == Method::POST {
         let body: serde_json::Value = serde_json::from_slice(req.body())?;
+        let launch = body
+            .pointer("/gui/launch_at_login")
+            .and_then(|v| v.as_bool());
         match ipc_client::save_config(body) {
             Ok(v) => {
+                if let Some(enabled) = launch {
+                    if let Err(e) = autostart::apply(enabled) {
+                        tracing::warn!("launch at login: {e:#}");
+                    }
+                }
                 let out = serde_json::to_vec(&v)?;
                 Ok(cors_headers(Response::builder())
                     .header(CONTENT_TYPE, "application/json")
@@ -288,6 +298,13 @@ fn main() -> anyhow::Result<()> {
     if let Err(e) = ipc_client::ensure_core_running() {
         tracing::error!("start core failed: {e:#}");
         // Continue so tray still appears; settings will show IPC errors
+    }
+    // The login entry follows the saved setting, which is off by default.
+    let launch = ipc_client::get_config()
+        .ok()
+        .and_then(|c| c.pointer("/gui/launch_at_login").and_then(|v| v.as_bool()));
+    if let Some(Err(e)) = launch.map(autostart::apply) {
+        tracing::warn!("launch at login: {e:#}");
     }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();

@@ -1,3 +1,4 @@
+pub mod grab;
 mod xdo;
 
 use crate::stub::StubInputCapture;
@@ -82,6 +83,29 @@ impl ScreenInfo for LinuxScreenInfo {
                 width: 1920,
                 height: 1080,
             })
+    }
+
+    fn monitors(&self) -> Vec<Rect> {
+        let list: Vec<Rect> = xdo::monitors()
+            .into_iter()
+            .map(|(x, y, w, h)| Rect {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            })
+            .collect();
+        if list.is_empty() {
+            let s = self.virtual_size();
+            vec![Rect {
+                left: 0,
+                top: 0,
+                right: s.width,
+                bottom: s.height,
+            }]
+        } else {
+            list
+        }
     }
 }
 
