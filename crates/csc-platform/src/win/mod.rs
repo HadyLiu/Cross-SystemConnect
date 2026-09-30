@@ -1,4 +1,5 @@
 mod capture;
+pub mod dragsrc;
 pub mod hook;
 mod host_net;
 mod injector;

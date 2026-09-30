@@ -1,5 +1,6 @@
 pub mod grab;
 mod xdo;
+pub mod xdnd;
 
 use crate::stub::StubInputCapture;
 use crate::traits::*;

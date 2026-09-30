@@ -1,12 +1,15 @@
-//! Small always-on-top window at a screen edge while files are dragged there.
-//! Dropping on it sends the files to the computer beyond that edge.
+//! Always-on-top window at a screen edge while files are dragged there.
+//!
+//! When the computer beyond the edge can take a virtual drag, the window is a
+//! thin strip: files entering it hand the drag to that computer, where the
+//! pointer carries on and the user drops them. Otherwise it is a larger
+//! target, and dropping on it sends the files to that computer's receive folder.
 
 use crate::{ipc_client, UserEvent};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 use tao::dpi::{PhysicalPosition, PhysicalSize};
-use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
+use tao::event_loop::EventLoopWindowTarget;
 use tao::window::{Window, WindowBuilder};
 use wry::{DragDropEvent, WebView, WebViewBuilder};
 
@@ -17,52 +20,47 @@ pub struct Zone {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    pub virtual_drag: bool,
 }
 
-fn zone_from_status(v: &serde_json::Value) -> Option<Zone> {
+pub fn zone_from_status(v: &serde_json::Value) -> Option<Zone> {
     let z = v.get("dropZone")?;
     let int = |k: &str| z.get(k).and_then(|n| n.as_i64()).map(|n| n as i32);
+    let virtual_drag = z.get("virtualDrag").and_then(|b| b.as_bool()).unwrap_or(false);
+    let min = if virtual_drag { 4 } else { 40 };
     Some(Zone {
         peer: z.get("peer")?.as_str()?.to_string(),
         x: int("x")?,
         y: int("y")?,
-        width: int("width")?.max(40),
-        height: int("height")?.max(40),
+        width: int("width")?.max(min),
+        height: int("height")?.max(min),
+        virtual_drag,
     })
-}
-
-/// Follow the core's drop zone. Polls fast: the zone only matters while a drag
-/// is held against the edge.
-pub fn watch(proxy: EventLoopProxy<UserEvent>) {
-    std::thread::spawn(move || {
-        let mut last: Option<Zone> = None;
-        loop {
-            std::thread::sleep(Duration::from_millis(80));
-            let zone = ipc_client::get_status()
-                .ok()
-                .and_then(|v| zone_from_status(&v));
-            if zone != last {
-                last = zone.clone();
-                if proxy.send_event(UserEvent::DropZone(zone)).is_err() {
-                    return;
-                }
-            }
-        }
-    });
 }
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;height:100%;background:#16202c;color:#e8f1ff;font:14px system-ui,sans-serif;overflow:hidden}
 body{display:flex;align-items:center;justify-content:center;text-align:center;box-sizing:border-box;
 border:3px dashed #4da3ff;border-radius:10px}
+body.strip{border:0;border-radius:0;background:#3b8cff}
+body.strip>div{display:none}
 .big{font-size:30px;line-height:1.2}
 b{color:#7cc4ff;word-break:break-all}
 </style></head><body><div><div class="big">⇪</div>松开发送到<br><b id="p"></b></div></body></html>"#;
 
+fn to_strings(paths: &[std::path::PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
 pub struct DropWindow {
     window: Window,
     webview: WebView,
-    peer: Rc<RefCell<String>>,
+    zone: Rc<RefCell<Option<Zone>>>,
+    /// The current drag was already handed to the other computer.
+    handed: Rc<Cell<bool>>,
 }
 
 impl DropWindow {
@@ -92,24 +90,38 @@ impl DropWindow {
                 return None;
             }
         };
-        let peer = Rc::new(RefCell::new(String::new()));
-        let target_peer = peer.clone();
+        let zone: Rc<RefCell<Option<Zone>>> = Rc::new(RefCell::new(None));
+        let handed = Rc::new(Cell::new(false));
+        let (h_zone, h_handed) = (zone.clone(), handed.clone());
         let builder = WebViewBuilder::new()
             .with_html(HTML)
             .with_drag_drop_handler(move |event| {
-                if let DragDropEvent::Drop { paths, .. } = event {
-                    let peer = target_peer.borrow().clone();
-                    let paths: Vec<String> = paths
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect();
-                    if !peer.is_empty() && !paths.is_empty() {
-                        std::thread::spawn(move || {
-                            if let Err(e) = ipc_client::send_files(&peer, &paths) {
-                                tracing::warn!("send dropped files: {e:#}");
-                            }
-                        });
+                let Some(z) = h_zone.borrow().clone() else {
+                    return true;
+                };
+                match event {
+                    DragDropEvent::Enter { paths, .. } if z.virtual_drag && !h_handed.get() => {
+                        let paths = to_strings(&paths);
+                        if !paths.is_empty() {
+                            h_handed.set(true);
+                            std::thread::spawn(move || {
+                                if let Err(e) = ipc_client::drag_enter(&z.peer, &paths) {
+                                    tracing::warn!("hand drag to {}: {e:#}", z.peer);
+                                }
+                            });
+                        }
                     }
+                    DragDropEvent::Drop { paths, .. } if !h_handed.get() => {
+                        let paths = to_strings(&paths);
+                        if !paths.is_empty() {
+                            std::thread::spawn(move || {
+                                if let Err(e) = ipc_client::send_files(&z.peer, &paths) {
+                                    tracing::warn!("send dropped files: {e:#}");
+                                }
+                            });
+                        }
+                    }
+                    _ => {}
                 }
                 true
             });
@@ -125,7 +137,8 @@ impl DropWindow {
             Ok(webview) => Some(Self {
                 window,
                 webview,
-                peer,
+                zone,
+                handed,
             }),
             Err(e) => {
                 tracing::error!("drop window webview: {e}");
@@ -135,11 +148,20 @@ impl DropWindow {
     }
 
     pub fn show(&self, zone: &Zone) {
-        *self.peer.borrow_mut() = zone.peer.clone();
+        let same_edge = self
+            .zone
+            .borrow()
+            .as_ref()
+            .is_some_and(|z| z.peer == zone.peer && z.virtual_drag == zone.virtual_drag);
+        if !same_edge {
+            self.handed.set(false);
+        }
+        *self.zone.borrow_mut() = Some(zone.clone());
         let name = serde_json::to_string(&zone.peer).unwrap_or_else(|_| "\"\"".into());
-        let _ = self
-            .webview
-            .evaluate_script(&format!("document.getElementById('p').textContent={name};"));
+        let _ = self.webview.evaluate_script(&format!(
+            "document.getElementById('p').textContent={name};document.body.className={};",
+            if zone.virtual_drag { "'strip'" } else { "''" }
+        ));
         self.window
             .set_inner_size(PhysicalSize::new(zone.width as u32, zone.height as u32));
         self.window
@@ -150,5 +172,7 @@ impl DropWindow {
 
     pub fn hide(&self) {
         self.window.set_visible(false);
+        self.handed.set(false);
+        *self.zone.borrow_mut() = None;
     }
 }

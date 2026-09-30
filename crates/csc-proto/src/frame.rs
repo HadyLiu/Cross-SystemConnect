@@ -12,6 +12,8 @@ pub enum MsgType {
     Heartbeat = 0x02,
     SwitchEnter = 0x10,
     SwitchLeave = 0x11,
+    /// Controlled computer to keyboard host: its real pointer is pressing an outer edge.
+    EdgeHit = 0x12,
     MouseMove = 0x20,
     MouseButton = 0x21,
     MouseWheel = 0x22,
@@ -19,6 +21,8 @@ pub enum MsgType {
     ClipOffer = 0x30,
     ClipRequest = 0x31,
     ClipData = 0x32,
+    /// Keyboard host to the computer that copied files: send them for pasting.
+    PasteRequest = 0x33,
     DragBegin = 0x40,
     DragCancel = 0x41,
     FileRequest = 0x50,
@@ -29,7 +33,17 @@ pub enum MsgType {
     FileOffer = 0x55,
     FileBegin = 0x56,
     FileDone = 0x57,
+    FileAck = 0x58,
 }
+
+/// Peer supports dragging a virtual file onto its desktop (`DragBegin`).
+pub const CAP_VIRTUAL_DRAG: u32 = 1 << 0;
+/// Peer reports edge contact itself (`EdgeHit`) instead of the host guessing.
+pub const CAP_EDGE_REPORT: u32 = 1 << 1;
+/// Peer acknowledges received file bytes (`FileAck`).
+pub const CAP_FILE_ACK: u32 = 1 << 2;
+/// Everything this build supports.
+pub const CAPABILITIES: u32 = CAP_VIRTUAL_DRAG | CAP_EDGE_REPORT | CAP_FILE_ACK;
 
 impl MsgType {
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -38,6 +52,7 @@ impl MsgType {
             0x02 => Self::Heartbeat,
             0x10 => Self::SwitchEnter,
             0x11 => Self::SwitchLeave,
+            0x12 => Self::EdgeHit,
             0x20 => Self::MouseMove,
             0x21 => Self::MouseButton,
             0x22 => Self::MouseWheel,
@@ -45,6 +60,7 @@ impl MsgType {
             0x30 => Self::ClipOffer,
             0x31 => Self::ClipRequest,
             0x32 => Self::ClipData,
+            0x33 => Self::PasteRequest,
             0x40 => Self::DragBegin,
             0x41 => Self::DragCancel,
             0x50 => Self::FileRequest,
@@ -55,6 +71,7 @@ impl MsgType {
             0x55 => Self::FileOffer,
             0x56 => Self::FileBegin,
             0x57 => Self::FileDone,
+            0x58 => Self::FileAck,
             _ => return None,
         })
     }

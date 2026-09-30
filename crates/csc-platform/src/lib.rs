@@ -5,6 +5,7 @@ mod host;
 pub mod keymap;
 mod notify;
 mod traits;
+pub mod vdrag;
 
 pub use notify::notify;
 
@@ -181,6 +182,50 @@ pub fn capture_drain() -> Vec<Captured> {
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
         Vec::new()
+    }
+}
+
+/// Hand movement of the local mouse since the last call, before the system
+/// clips the cursor at the screen edge. None where it cannot be measured.
+pub fn take_raw_motion() -> Option<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        win::hook::take_raw_motion()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::grab::take_raw_motion()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        None
+    }
+}
+
+/// Catch Ctrl+V on this computer (while it is not grabbed) instead of letting
+/// the focused program paste. Used while the last copy was files on another computer.
+pub fn paste_watch(enable: bool) {
+    #[cfg(windows)]
+    win::hook::paste_watch(enable);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::grab::paste_watch(enable);
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    let _ = enable;
+}
+
+/// Ctrl+V presses caught since the last call.
+pub fn paste_hits() -> u32 {
+    #[cfg(windows)]
+    {
+        win::hook::paste_hits()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::grab::paste_hits()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        0
     }
 }
 

@@ -2,18 +2,22 @@
 
 mod autostart;
 mod drop_zone;
+mod folder_picker;
 mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod status_poller;
+mod transfer_window;
 
 #[cfg(not(target_os = "linux"))]
 use anyhow::Context;
 use serde_json::json;
 use std::borrow::Cow;
+use std::sync::{Mutex, OnceLock};
 use tao::{
     event::{Event, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     window::WindowBuilder,
 };
 #[cfg(not(target_os = "linux"))]
@@ -33,6 +37,19 @@ pub(crate) enum UserEvent {
     ShowSettings,
     Quit,
     DropZone(Option<drop_zone::Zone>),
+    /// Incoming batches from the core status.
+    Transfers(Vec<serde_json::Value>),
+    /// Settings page asked for the folder dialog, starting at this path.
+    PickFolder(String),
+}
+
+/// Lets the settings page's HTTP handler reach the event loop.
+static PROXY: OnceLock<Mutex<EventLoopProxy<UserEvent>>> = OnceLock::new();
+
+fn post_event(ev: UserEvent) {
+    if let Some(p) = PROXY.get().and_then(|p| p.lock().ok()) {
+        let _ = p.send_event(ev);
+    }
 }
 
 pub(crate) fn app_title() -> String {
@@ -115,6 +132,42 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
             .status(status)
             .header(CONTENT_TYPE, "application/json")
             .body(Cow::Owned(body))?);
+    }
+
+    if path == "/pick-folder" && method == Method::POST {
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let current = body
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        post_event(UserEvent::PickFolder(current));
+        return Ok(cors_headers(Response::builder())
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(br#"{"ok":true}"#.to_vec()))?);
+    }
+
+    if path == "/open-folder" && method == Method::POST {
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let given = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        std::thread::spawn(move || {
+            let dir = if given.is_empty() {
+                ipc_client::receive_dir().unwrap_or_default()
+            } else {
+                given
+            };
+            if !dir.is_empty() {
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = open::that(&dir) {
+                    tracing::warn!("open {dir}: {e}");
+                }
+            }
+        });
+        return Ok(cors_headers(Response::builder())
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(br#"{"ok":true}"#.to_vec()))?);
     }
 
     if path == "/logs" && method == Method::GET {
@@ -311,6 +364,7 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let _ = PROXY.set(Mutex::new(proxy.clone()));
 
     #[cfg(not(target_os = "linux"))]
     let mut tray_icon = {
@@ -389,11 +443,13 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    drop_zone::watch(proxy.clone());
+    status_poller::spawn(proxy.clone());
 
     let mut window = None::<tao::window::Window>;
     let mut webview = None::<wry::WebView>;
     let mut drop_window = None::<drop_zone::DropWindow>;
+    let mut transfer_window = None::<transfer_window::TransferWindow>;
+    let mut transfers: Vec<serde_json::Value> = Vec::new();
     let mut warmed = false;
 
     if open_settings {
@@ -464,6 +520,25 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             },
+            Event::UserEvent(UserEvent::Transfers(list)) => {
+                if transfer_window.is_none() && !list.is_empty() {
+                    transfer_window = transfer_window::TransferWindow::create(event_loop);
+                }
+                if let Some(tw) = transfer_window.as_mut() {
+                    tw.update(&list);
+                }
+                transfers = list;
+            }
+            Event::UserEvent(UserEvent::PickFolder(current)) => {
+                if let Some(path) = folder_picker::pick("选择接收文件夹", &current) {
+                    if let Some(wv) = webview.as_ref() {
+                        let arg = serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".into());
+                        let _ = wv.evaluate_script(&format!(
+                            "window.onFolderPicked&&window.onFolderPicked({arg});"
+                        ));
+                    }
+                }
+            }
             Event::UserEvent(UserEvent::Quit) => {
                 let _ = ipc_client::quit_core();
                 #[cfg(not(target_os = "linux"))]
@@ -480,6 +555,11 @@ fn main() -> anyhow::Result<()> {
                 if let Some(w) = window.as_ref() {
                     if w.id() == window_id {
                         w.set_visible(false);
+                    }
+                }
+                if let Some(tw) = transfer_window.as_mut() {
+                    if tw.id() == window_id {
+                        tw.close(&transfers);
                     }
                 }
             }

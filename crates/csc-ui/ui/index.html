@@ -215,6 +215,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <div class="card">
           <h2>边缘切换</h2>
           <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
+          <div class="row" title="指针到达边缘后，还要继续往外推这么多像素才切换；0 表示碰到边缘就切换"><label class="f">推过边缘 px</label><input id="edge_push_px" type="number" min="0" max="200"/></div>
           <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
           <div class="row" title="对角放置的电脑：指针贴着外侧边缘、距角落这么多像素内即可切换"><label class="f">对角切换区</label><input id="diagonal_zone_px" type="number" min="1"/></div>
           <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
@@ -226,18 +227,19 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <label class="check"><input id="clip_enabled" type="checkbox"/><span>启用剪贴板共享</span></label>
           <label class="check"><input id="clip_text" type="checkbox"/><span>文本</span></label>
           <label class="check"><input id="clip_image" type="checkbox"/><span>图片</span></label>
-          <label class="check"><input id="clip_files" type="checkbox"/><span>文件</span></label>
-          <div class="row"><label class="f">内联 MB</label><input id="max_inline_mb" type="number"/></div>
-          <div class="row"><label class="f">总上限 MB</label><input id="max_total_mb" type="number"/></div>
+          <div class="row" title="复制的文字超过这个大小时不同步，并提示"><label class="f">文字上限 MB</label><input id="max_inline_mb" type="number" min="1" max="15"/></div>
+          <p class="hint">文字最大 15 MB。</p>
         </div>
         <div class="card">
           <h2>文件传输</h2>
           <label class="check"><input id="ft_enabled" type="checkbox"/><span>启用</span></label>
-          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text" placeholder="默认：下载/Cross-SystemConnect"/></div>
+          <label class="check"><input id="clip_files" type="checkbox"/><span>复制文件后，在另一台电脑按 Ctrl+V 传输</span></label>
+          <div class="row"><label class="f">接收目录</label><input id="ft_receive_dir" type="text" placeholder="默认：桌面"/></div>
+          <div class="row"><label class="f"></label><button class="btn" id="ft_pick_dir" type="button">浏览…</button><button class="btn" id="ft_open_dir" type="button">打开</button></div>
           <div class="row"><label class="f">单文件上限 MB</label><input id="ft_max_size_mb" type="number"/></div>
           <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限制传输速度（不勾选则不限速，跑满带宽）</span></label>
           <div class="row"><label class="f">限速 MiB/s</label><input id="ft_max_speed_mibs" type="number" min="1"/></div>
-          <p class="hint">把文件或文件夹拖到有设备的屏幕边缘，出现提示框后松开即可发送。</p>
+          <p class="hint">把文件或文件夹拖过屏幕边缘，到另一台电脑上松开即可；进度只在接收的电脑上显示。</p>
         </div>
         <div class="card">
           <h2>快捷键</h2>
@@ -651,13 +653,14 @@ function saveBody(){
     screens,
     layout:layoutFromPlaces(),
     switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
+            edge_push_px:Math.max(0,Math.min(200,Number($('edge_push_px').value)||0)),
             double_tap_window_ms:Number($('double_tap_window_ms').value),
             corner_dead_zone_px:Number($('corner_dead_zone_px').value),
             diagonal_zone_px:Number($('diagonal_zone_px').value)||80,
             relative_mouse_moves:$('relative_mouse_moves').checked},
     clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
-               files:$('clip_files').checked,max_inline_mb:Number($('max_inline_mb').value),
-               max_total_mb:Number($('max_total_mb').value)},
+               files:$('clip_files').checked,
+               max_inline_mb:Math.max(1,Math.min(15,Number($('max_inline_mb').value)||15))},
     file_transfer:{enabled:$('ft_enabled').checked,receive_dir:$('ft_receive_dir').value,
                    max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
                    max_speed_mibs:Number($('ft_max_speed_mibs').value)},
@@ -709,6 +712,7 @@ async function load(){
     renderDesk();
     const sw=cfg.switch||{};
     $('edge_delay_ms').value=sw.edge_delay_ms||0;
+    $('edge_push_px').value=(sw.edge_push_px??8);
     $('double_tap_edge').checked=!!sw.double_tap_edge;
     $('double_tap_window_ms').value=sw.double_tap_window_ms||250;
     $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
@@ -718,7 +722,7 @@ async function load(){
     $('clip_enabled').checked=clip.enabled!==false;
     $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
     $('clip_files').checked=!!clip.files;
-    $('max_inline_mb').value=clip.max_inline_mb||1; $('max_total_mb').value=clip.max_total_mb||64;
+    $('max_inline_mb').value=clip.max_inline_mb||15;
     $('ft_enabled').checked=ft.enabled!==false; $('ft_receive_dir').value=ft.receive_dir||'';
     $('ft_max_size_mb').value=ft.max_size_mb||10240;
     $('ft_limit_speed').checked=ft.limit_speed===true; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
@@ -849,6 +853,20 @@ $('rescanBtn').onclick=async()=>{
   }finally{
     setTimeout(()=>{ btn.disabled=false; }, 1500);
   }
+};
+$('ft_pick_dir').onclick=()=>{
+  fetch('/pick-folder',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({current:$('ft_receive_dir').value})}).catch(()=>{});
+};
+$('ft_open_dir').onclick=()=>{
+  fetch('/open-folder',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:$('ft_receive_dir').value})}).catch(()=>{});
+};
+// Called by the app after the folder picker closes with a choice.
+window.onFolderPicked=(path)=>{
+  if(!path) return;
+  $('ft_receive_dir').value=path;
+  scheduleSave();
 };
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);

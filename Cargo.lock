@@ -430,6 +430,8 @@ dependencies = [
  "libc",
  "tracing",
  "windows",
+ "windows-core",
+ "x11rb",
 ]
 
 [[package]]
@@ -450,6 +452,7 @@ dependencies = [
  "csc-config",
  "csc-proto",
  "dirs",
+ "gtk",
  "image",
  "ksni",
  "open",
@@ -460,6 +463,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "windows",
  "wry",
 ]
 

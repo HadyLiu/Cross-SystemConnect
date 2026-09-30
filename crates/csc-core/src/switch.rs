@@ -21,6 +21,64 @@ pub struct EnterDecision {
     pub position_pct: f32,
 }
 
+/// How far the pointer pushes outward after it reached an edge.
+/// The system holds the cursor at the edge, so the push is measured as the
+/// part of the raw hand movement that did not move the cursor.
+#[derive(Debug, Default, Clone)]
+pub struct EdgePush {
+    edge: Option<Edge>,
+    acc: i32,
+}
+
+fn outward(edge: Edge, dx: i32, dy: i32) -> i32 {
+    match edge {
+        Edge::Left => -dx,
+        Edge::Right => dx,
+        Edge::Top => -dy,
+        Edge::Bottom => dy,
+        Edge::TopLeft => (-dx).max(-dy),
+        Edge::TopRight => dx.max(-dy),
+        Edge::BottomLeft => (-dx).max(dy),
+        Edge::BottomRight => dx.max(dy),
+    }
+}
+
+impl EdgePush {
+    /// Add one step at `edge`: `raw` is the hand movement, `moved` how far the
+    /// cursor actually went. True once the push reaches `need` pixels.
+    pub fn step(&mut self, edge: Edge, raw: (i32, i32), moved: (i32, i32), need: i32) -> bool {
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.acc = 0;
+        }
+        let push = outward(edge, raw.0, raw.1);
+        if push < 0 {
+            self.acc = 0;
+        } else {
+            self.acc += (push - outward(edge, moved.0, moved.1).max(0)).max(0);
+        }
+        self.acc >= need.max(0)
+    }
+
+    pub fn reset(&mut self) {
+        self.edge = None;
+        self.acc = 0;
+    }
+
+    pub fn amount(&self) -> i32 {
+        self.acc
+    }
+}
+
+/// An outer edge the real pointer of this (controlled) computer pushed through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeReport {
+    pub edge: Edge,
+    /// Corner zone the pointer is in, if any; the host prefers it when the layout has one.
+    pub corner: Option<Edge>,
+    pub position_pct: f32,
+}
+
 pub struct SwitchController {
     local_name: String,
     screen: ScreenSize,
@@ -35,6 +93,10 @@ pub struct SwitchController {
     pending_edge: Option<Edge>,
     pending_since: Option<Instant>,
     pending_second_tap: bool,
+    push: EdgePush,
+    last_local: Option<(i32, i32)>,
+    /// The active remote reports its own edge contact (EdgeHit).
+    remote_reports: bool,
 }
 
 impl Default for SwitchController {
@@ -51,6 +113,9 @@ impl Default for SwitchController {
             pending_edge: None,
             pending_since: None,
             pending_second_tap: false,
+            push: EdgePush::default(),
+            last_local: None,
+            remote_reports: false,
         }
     }
 }
@@ -136,6 +201,67 @@ impl SwitchController {
         self.pending_edge = None;
         self.pending_since = None;
         self.pending_second_tap = false;
+        self.push.reset();
+        self.last_local = None;
+        self.remote_reports = false;
+    }
+
+    /// The active remote judges its own edges and sends EdgeHit; the host
+    /// then only tracks an estimate of the remote pointer for entry positions.
+    pub fn set_remote_reports(&mut self, on: bool) {
+        self.remote_reports = on;
+    }
+
+    pub fn edge_push_px(&self) -> i32 {
+        self.cfg.edge_push_px
+    }
+
+    /// Keyboard host: the active remote pushed through `edge`. Picks the side
+    /// the pointer leaves through, as `on_remote_relative` would.
+    pub fn on_remote_edge(&self, report: &EdgeReport) -> Option<EnterDecision> {
+        if self.state != SwitchState::Remote {
+            return None;
+        }
+        let leads = |e: Edge| self.layout.neighbor(&self.active_remote, e).is_some();
+        let way_back = self
+            .layout
+            .edge_toward(&self.active_remote, &self.local_name)
+            .is_some();
+        let edge = match report.corner.filter(|c| leads(*c)) {
+            Some(c) => c,
+            None if leads(report.edge) => report.edge,
+            // No link back to this computer: any side returns, so the pointer cannot get stuck.
+            None if !way_back && !is_corner(report.edge) => report.edge,
+            None => return None,
+        };
+        Some(EnterDecision {
+            neighbor: self.local_name.clone(),
+            edge,
+            position_pct: report.position_pct.clamp(0.0, 1.0),
+        })
+    }
+
+    /// Controlled computer: the real pointer is at (x, y) after moving by
+    /// `moved`, while the host sent `raw`. Reports an outer edge once the
+    /// pointer pushed `edge_push_px` past it. Any outer edge counts; the
+    /// keyboard host knows which ones lead somewhere.
+    pub fn probe_edge(&self, push: &mut EdgePush, x: i32, y: i32, raw: (i32, i32), moved: (i32, i32)) -> Option<EdgeReport> {
+        let Some(edge) = self.hit_outer_edge(x, y) else {
+            push.reset();
+            return None;
+        };
+        let corner = self.diagonal_at(x, y);
+        let along = corner.unwrap_or(edge);
+        if !push.step(along, raw, moved, self.cfg.edge_push_px) {
+            return None;
+        }
+        push.reset();
+        let d = self.make_decision(String::new(), edge, x, y);
+        Some(EdgeReport {
+            edge,
+            corner,
+            position_pct: d.position_pct,
+        })
     }
 
     pub fn active_remote(&self) -> &str {
@@ -265,10 +391,17 @@ impl SwitchController {
         }
     }
 
-    pub fn on_local_cursor(&mut self, x: i32, y: i32, now: Instant) -> Option<EnterDecision> {
+    /// Local pointer at (x, y). `raw` is the hand movement since the last call
+    /// when the platform can measure it; without it the edge switches on contact.
+    pub fn on_local_cursor(&mut self, x: i32, y: i32, raw: Option<(i32, i32)>, now: Instant) -> Option<EnterDecision> {
         if !self.enabled || self.state != SwitchState::Local {
             return None;
         }
+        let moved = self
+            .last_local
+            .map(|(lx, ly)| (x - lx, y - ly))
+            .unwrap_or((0, 0));
+        self.last_local = Some((x, y));
         let diagonal = self
             .diagonal_at(x, y)
             .filter(|d| self.layout.neighbor(&self.local_name, *d).is_some());
@@ -279,9 +412,15 @@ impl SwitchController {
         } else {
             self.pending_edge = None;
             self.pending_second_tap = false;
+            self.push.reset();
             return None;
         };
         let neighbor = self.layout.neighbor(&self.local_name, edge)?.to_string();
+        if let Some(raw) = raw {
+            if !self.push.step(edge, raw, moved, self.cfg.edge_push_px) {
+                return None;
+            }
+        }
 
         if self.cfg.double_tap_edge {
             if self.pending_edge == Some(edge) && self.pending_second_tap {
@@ -363,6 +502,11 @@ impl SwitchController {
         }
         *cursor_x += dx;
         *cursor_y += dy;
+        if self.remote_reports {
+            *cursor_x = (*cursor_x).clamp(0, remote.width.max(1) - 1);
+            *cursor_y = (*cursor_y).clamp(0, remote.height.max(1) - 1);
+            return None;
+        }
         let past_left = *cursor_x < 0;
         let past_right = *cursor_x >= remote.width;
         let past_top = *cursor_y < 0;
@@ -442,10 +586,90 @@ impl SwitchController {
     }
 }
 
+fn is_corner(e: Edge) -> bool {
+    matches!(
+        e,
+        Edge::TopLeft | Edge::TopRight | Edge::BottomLeft | Edge::BottomRight
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn edge_needs_a_push_past_it() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("right".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 100, height: 100 },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        let t = Instant::now();
+        // Arriving at the edge: the cursor moved as far as the hand did.
+        assert!(sw.on_local_cursor(95, 50, Some((0, 0)), t).is_none());
+        assert!(sw.on_local_cursor(99, 50, Some((4, 0)), t).is_none());
+        // Sliding along the edge does not count.
+        assert!(sw.on_local_cursor(99, 60, Some((0, 10)), t).is_none());
+        assert!(sw.on_local_cursor(99, 60, Some((5, 0)), t).is_none());
+        // Pulling back resets the push.
+        assert!(sw.on_local_cursor(99, 60, Some((-1, 0)), t).is_none());
+        assert!(sw.on_local_cursor(99, 60, Some((5, 0)), t).is_none());
+        let d = sw.on_local_cursor(99, 60, Some((3, 0)), t).expect("pushed 8 px");
+        assert_eq!(d.edge, Edge::Right);
+    }
+
+    #[test]
+    fn controlled_side_reports_only_real_outer_edges() {
+        let mut sw = SwitchController::default();
+        let screen = ScreenSize { width: 3360, height: 1080 };
+        sw.configure("B".into(), screen, SwitchConfig::default(), ScreenLayout::default());
+        // Two monitors, the right one shorter: its bottom is not the desktop bottom,
+        // but the host's bounding box would put the edge at 1080.
+        sw.set_screen(
+            screen,
+            vec![
+                Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
+                Rect { left: 1920, top: 0, right: 3360, bottom: 900 },
+            ],
+        );
+        let mut push = EdgePush::default();
+        assert!(sw.probe_edge(&mut push, 1919, 500, (50, 0), (0, 0)).is_none(), "inner border");
+        assert!(sw.probe_edge(&mut push, 3359, 450, (4, 0), (4, 0)).is_none());
+        let r = sw
+            .probe_edge(&mut push, 3359, 450, (9, 0), (0, 0))
+            .expect("pushed through the right side");
+        assert_eq!((r.edge, r.corner), (Edge::Right, None));
+        assert!((r.position_pct - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn host_follows_edge_reports_from_the_remote() {
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize { width: 100, height: 100 },
+            SwitchConfig::default(),
+            two_way_layout(),
+        );
+        let remote = ScreenSize { width: 200, height: 100 };
+        let (mut x, mut y) = (0, 0);
+        sw.confirm_entered(Edge::Left, 0.5, remote, &mut x, &mut y, "REMOTE");
+        sw.set_remote_reports(true);
+        // The estimate alone never leaves.
+        assert!(sw.on_remote_relative(-400, 0, &mut x, &mut y, remote).is_none());
+        let report = |edge| EdgeReport { edge, corner: None, position_pct: 0.3 };
+        assert!(sw.on_remote_edge(&report(Edge::Right)).is_none());
+        let back = sw.on_remote_edge(&report(Edge::Left)).expect("left leads home");
+        assert_eq!(back.edge, Edge::Left);
+        assert!((back.position_pct - 0.3).abs() < 1e-6);
+    }
 
     #[test]
     fn edge_enter_right() {
@@ -463,7 +687,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw.on_local_cursor(99, 50, Instant::now()).expect("enter");
+        let d = sw.on_local_cursor(99, 50, None, Instant::now()).expect("enter");
         assert_eq!(d.neighbor, "REMOTE");
         assert_eq!(d.edge, Edge::Right);
     }
@@ -485,7 +709,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw.on_local_cursor(99, 0, Instant::now()).expect("diagonal");
+        let d = sw.on_local_cursor(99, 0, None, Instant::now()).expect("diagonal");
         assert_eq!(d.neighbor, "CORNER");
         assert_eq!(d.edge, Edge::TopRight);
     }
@@ -519,10 +743,10 @@ mod tests {
             ],
         );
         // Inner border between the monitors does not switch, even below the short monitor.
-        assert!(sw.on_local_cursor(1919, 500, Instant::now()).is_none());
-        assert!(sw.on_local_cursor(1919, 1000, Instant::now()).is_none());
+        assert!(sw.on_local_cursor(1919, 500, None, Instant::now()).is_none());
+        assert!(sw.on_local_cursor(1919, 1000, None, Instant::now()).is_none());
         // Right side of the right monitor switches, with the position on that monitor.
-        let d = sw.on_local_cursor(3359, 450, Instant::now()).expect("right edge");
+        let d = sw.on_local_cursor(3359, 450, None, Instant::now()).expect("right edge");
         assert_eq!(d.edge, Edge::Right);
         assert!((d.position_pct - 0.5).abs() < 0.01);
     }
@@ -565,7 +789,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let side = sw.on_local_cursor(99, 0, Instant::now()).expect("right edge");
+        let side = sw.on_local_cursor(99, 0, None, Instant::now()).expect("right edge");
         assert_eq!(side.neighbor, "SIDE");
         assert_eq!(side.edge, Edge::Right);
     }
@@ -594,12 +818,12 @@ mod tests {
             ],
         );
         // Right side of the shorter monitor, near its bottom.
-        let d = sw.on_local_cursor(3359, 860, Instant::now()).expect("diagonal");
+        let d = sw.on_local_cursor(3359, 860, None, Instant::now()).expect("diagonal");
         assert_eq!(d.edge, Edge::BottomRight);
         // Bottom side of the taller monitor, near its right end is inner: no switch.
-        assert!(sw.on_local_cursor(1900, 1079, Instant::now()).is_none());
+        assert!(sw.on_local_cursor(1900, 1079, None, Instant::now()).is_none());
         // Middle of the right side does not switch.
-        assert!(sw.on_local_cursor(3359, 450, Instant::now()).is_none());
+        assert!(sw.on_local_cursor(3359, 450, None, Instant::now()).is_none());
 
         let remote_size = ScreenSize { width: 1000, height: 800 };
         let (mut x, mut y) = (0, 0);

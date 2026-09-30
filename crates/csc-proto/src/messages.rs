@@ -119,10 +119,24 @@ pub struct ClipOfferPayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferPurpose {
-    /// Copied files: the receiver puts them on its clipboard for paste.
+    /// Sent by older versions for copied files; handled like `Paste`.
     Clipboard,
-    /// Files dropped on a screen edge: the receiver saves and reports them.
+    /// Files dropped on the edge window: saved to the receive folder.
     Drag,
+    /// Copied files pasted with Ctrl+V on the receiver: saved to the receive folder.
+    Paste,
+    /// Files dragged across and released over a folder on the receiver.
+    DragDrop,
+}
+
+impl TransferPurpose {
+    /// Clipboard batches from older versions are pastes now.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Clipboard => Self::Paste,
+            other => other,
+        }
+    }
 }
 
 /// Sender to receiver: files are ready. The receiver answers with FileRequest or FileError.
@@ -133,11 +147,71 @@ pub struct FileOfferPayload {
     /// Every file and directory, relative to the batch, with `/` separators.
     pub entries: Vec<FileEntry>,
     pub total_bytes: u64,
+    /// Computer the files come from when the keyboard host relays them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// Sender to keyboard host: pass this batch on to that computer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relay_to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRequestPayload {
     pub transfer_id: u64,
+    /// Entry indexes the receiver does not want (name conflicts it skips).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<u32>,
+}
+
+/// Receiver to sender: this many bytes of the batch are written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAckPayload {
+    pub transfer_id: u64,
+    pub bytes: u64,
+}
+
+/// Controlled computer to keyboard host: the real pointer pushed through an outer edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeHitPayload {
+    pub edge: Edge,
+    pub position_pct: f32,
+    /// Mouse button 1 was held, so a file drag may follow with `DragBegin`.
+    #[serde(default)]
+    pub dragging: bool,
+    /// Corner zone the pointer is in; the host prefers it when the layout has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner: Option<Edge>,
+}
+
+/// Keyboard host to the computer that copied files: send them to `to` for pasting.
+/// An empty `to` means the keyboard host itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasteRequestPayload {
+    pub seq: u64,
+    #[serde(default)]
+    pub to: String,
+}
+
+/// Source to target: a file drag crossed onto the target. The target starts a
+/// system drag of virtual files and answers `FileRequest` once they are dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DragBeginPayload {
+    pub transfer_id: u64,
+    pub entries: Vec<FileEntry>,
+    pub total_bytes: u64,
+    /// Target computer when the source is a controlled computer (relayed by the host).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub to: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DragCancelPayload {
+    pub transfer_id: u64,
+    /// `user`, `no_target`, `pointer_left` or `unsupported`.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +245,15 @@ pub fn encode_file_data(transfer_id: u64, index: u32, data: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&index.to_le_bytes());
     body.extend_from_slice(data);
     encode_frame(MsgType::FileData, &body, 0)
+}
+
+/// Rewrite the transfer id at the front of a FileData payload, for relaying.
+pub fn set_file_data_id(payload: &mut [u8], transfer_id: u64) -> bool {
+    if payload.len() < 12 {
+        return false;
+    }
+    payload[0..8].copy_from_slice(&transfer_id.to_le_bytes());
+    true
 }
 
 pub fn decode_file_data(payload: &[u8]) -> Option<(u64, u32, &[u8])> {

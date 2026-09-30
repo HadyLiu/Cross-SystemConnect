@@ -24,6 +24,25 @@ pub struct AppState {
     /// File the core logger is appending to.
     pub log_path: PathBuf,
     pub transfer: crate::transfer::TransferHandle,
+    /// Progress of incoming batches, merged into `get_status`.
+    pub board: crate::progress::TransferBoard,
+    /// Files dragged into the edge window: (peer, paths).
+    pub drag_enter: tokio::sync::mpsc::Sender<(String, Vec<PathBuf>)>,
+}
+
+fn param_u64(params: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        let v = params.get(*k)?;
+        v.as_u64().or_else(|| v.as_str()?.parse().ok())
+    })
+}
+
+fn param_paths(params: &serde_json::Value) -> Vec<PathBuf> {
+    params
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|p| p.as_str()).map(PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 /// Bind the local IPC endpoint, then serve it in the background.
@@ -213,11 +232,17 @@ async fn handle_conn_unix(
 async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
     match req.method.as_str() {
         "get_status" | "getStatus" => {
-            let s = state.status.read().await.clone();
+            let mut s = state.status.read().await.clone();
+            s.transfers = state.board.snapshot();
             match serde_json::to_value(s) {
                 Ok(v) => IpcResponse::ok(req.id, v),
                 Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
+        }
+        "receive_dir" => {
+            let dir = crate::transfer::receive_root(&*state.config.read().await);
+            let _ = std::fs::create_dir_all(&dir);
+            IpcResponse::ok(req.id, json!({"path": dir.display().to_string()}))
         }
         "get_config" | "getConfig" => {
             let cfg = state.config.read().await.clone();
@@ -290,12 +315,7 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let paths: Vec<PathBuf> = req
-                .params
-                .get("paths")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|p| p.as_str()).map(PathBuf::from).collect())
-                .unwrap_or_default();
+            let paths = param_paths(&req.params);
             if peer.is_empty() || paths.is_empty() {
                 return IpcResponse::err(req.id, "peer and paths are required");
             }
@@ -304,6 +324,58 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .transfer
                 .send_files(peer, paths, csc_proto::TransferPurpose::Drag)
                 .await;
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
+        "drag_enter" => {
+            let peer = req
+                .params
+                .get("peer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let paths = param_paths(&req.params);
+            if peer.is_empty() || paths.is_empty() {
+                return IpcResponse::err(req.id, "peer and paths are required");
+            }
+            let _ = state.drag_enter.try_send((peer, paths));
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
+        "cancel_transfer" => {
+            let Some(id) = param_u64(&req.params, &["id", "transferId"]) else {
+                return IpcResponse::err(req.id, "id is required");
+            };
+            state.transfer.cancel(id).await;
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
+        "dismiss_transfer" => {
+            let Some(id) = param_u64(&req.params, &["id", "transferId"]) else {
+                return IpcResponse::err(req.id, "id is required");
+            };
+            state.board.dismiss(id);
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
+        "resolve_conflict" => {
+            let Some(id) = param_u64(&req.params, &["transferId", "id"]) else {
+                return IpcResponse::err(req.id, "transferId is required");
+            };
+            let decisions: Vec<(u32, crate::transfer::Choice)> = req
+                .params
+                .get("decisions")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|d| {
+                            let index = d.get("index")?.as_u64()? as u32;
+                            let choice = serde_json::from_value(d.get("choice")?.clone()).ok()?;
+                            Some((index, choice))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if decisions.is_empty() {
+                return IpcResponse::err(req.id, "decisions are required");
+            }
+            state.transfer.resolve(id, decisions).await;
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "rescan" => {

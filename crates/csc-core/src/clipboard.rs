@@ -1,5 +1,7 @@
 //! Watches the system clipboard on its own thread. Clipboard calls can block
 //! (an X11 owner that answers slowly), so they never run on the input loop.
+//! Copied files are only reported; they are sent when someone pastes them on
+//! another computer, and never put on a clipboard here.
 
 use csc_platform::clip::{change_token, ClipContent, SystemClipboard};
 use std::path::PathBuf;
@@ -18,7 +20,6 @@ pub enum ClipEvent {
 
 enum ClipCmd {
     SetText(String),
-    SetFiles(Vec<PathBuf>),
 }
 
 /// Sets the local clipboard from remote content. Setting does not echo back as an event.
@@ -30,10 +31,6 @@ pub struct ClipHandle {
 impl ClipHandle {
     pub fn set_text(&self, text: String) {
         let _ = self.tx.send(ClipCmd::SetText(text));
-    }
-
-    pub fn set_files(&self, files: Vec<PathBuf>) {
-        let _ = self.tx.send(ClipCmd::SetFiles(files));
     }
 }
 
@@ -62,14 +59,6 @@ fn run(rx: std_mpsc::Receiver<ClipCmd>, events: mpsc::Sender<ClipEvent>) {
                 match clip.set_text(&text) {
                     Ok(()) => last = ClipContent::Text(text),
                     Err(e) => warn!("set clipboard text: {e:#}"),
-                }
-                token = change_token();
-                continue;
-            }
-            Ok(ClipCmd::SetFiles(files)) => {
-                match clip.set_files(&files) {
-                    Ok(()) => last = ClipContent::Files(files),
-                    Err(e) => warn!("set clipboard files: {e:#}"),
                 }
                 token = change_token();
                 continue;

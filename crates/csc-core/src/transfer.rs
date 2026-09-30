@@ -1,41 +1,117 @@
-//! File batches between computers, for copied files (clipboard) and files
-//! dropped on a screen edge.
+//! File batches between computers: pasted files, files dropped on the edge
+//! window, and files dragged onto the other screen.
 //!
-//! Sender: FileOffer. Receiver checks names and limits, then FileRequest or FileError.
-//! Sender streams FileBegin / FileData / FileEnd per entry and FileDone, all on
-//! the bulk queue so they stay in order and never hold up pointer input.
+//! Sender: FileOffer (or DragBegin for a drag). Receiver checks names and
+//! limits, asks about name conflicts, then FileRequest or FileError.
+//! Sender streams FileBegin / FileData / FileEnd per entry and FileDone on the
+//! bulk queue, so they stay in order and never hold up pointer input. The
+//! receiver acknowledges every MiB (FileAck) and the sender keeps at most
+//! `WINDOW` bytes unacknowledged. The keyboard host relays batches between
+//! controlled computers (see `relay`).
 
-use crate::clipboard::ClipHandle;
 use crate::net::NetHub;
 use crate::path_safe::{check_relative_path, name_problem};
+use crate::progress::TransferBoard;
+use crate::relay::{self, Hop, Relay};
 use csc_config::{default_config_path, Config};
+use csc_platform::vdrag::StagedFeed;
 use csc_proto::{
-    decode_file_data, encode_file_data, encode_json_frame, FileBeginPayload, FileDonePayload,
-    FileEndPayload, FileEntry, FileErrorPayload, FileOfferPayload, FileRequestPayload, MsgType,
-    TransferPurpose,
+    decode_file_data, encode_file_data, encode_json_frame, DragBeginPayload, DragCancelPayload,
+    FileAckPayload, FileBeginPayload, FileDonePayload, FileEndPayload, FileEntry,
+    FileErrorPayload, FileOfferPayload, FileRequestPayload, MsgType, TransferConflict,
+    TransferProgress, TransferPurpose, TransferState, CAP_FILE_ACK,
 };
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
+use tracing::{debug, info, warn};
 use xxhash_rust::xxh64::Xxh64;
 
 const CHUNK: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 20_000;
 const OFFER_TTL: Duration = Duration::from_secs(30 * 60);
+/// Unacknowledged bytes a sender may have in flight.
+const WINDOW: u64 = 8 * 1024 * 1024;
+/// A receiver that acknowledges nothing for this long is given up.
+const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const TITLE: &str = "Cross-SystemConnect 文件传输";
+/// Hidden temporary name used while replacing an existing file.
+const PART_SUFFIX: &str = ".csc-part";
+/// Placeholder marker inside a dragged folder copied by a file manager.
+pub const FOLDER_MARKER: &str = ".csc-drag";
+
+/// What to do with a top-level name that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Choice {
+    Skip,
+    KeepBoth,
+    Replace,
+}
+
+/// Where an incoming batch is written.
+pub enum Sink {
+    /// Into a folder. Existing names are asked about in the transfer window.
+    Dir(PathBuf),
+    /// Over placeholder files a file manager copied, one per top-level item.
+    InPlace(Vec<PathBuf>),
+    /// Into a staging folder that Explorer reads while it grows.
+    Staged(Arc<StagedFeed>),
+}
 
 pub enum TransferCmd {
     Send {
         peer: String,
         paths: Vec<PathBuf>,
         purpose: TransferPurpose,
+        relay_to: String,
+    },
+    /// Check and register files dragged toward `peer`; nothing is sent yet.
+    PrepareDrag {
+        peer: String,
+        paths: Vec<PathBuf>,
+        to: String,
+        reply: oneshot::Sender<Result<DragBeginPayload, String>>,
+    },
+    /// Target: a drag from `peer` is over this screen; wait for the drop.
+    ParkDrag {
+        peer: String,
+        begin: DragBeginPayload,
+    },
+    /// Target: the drag was dropped; receive into `sink`.
+    BindDrop {
+        id: u64,
+        sink: Sink,
+    },
+    /// Target: the drag ended without a drop.
+    CancelDrag {
+        id: u64,
+        reason: String,
+    },
+    /// Keyboard host: pass a drag from `from` on to `to`.
+    RelayDragBegin {
+        from: String,
+        begin: DragBeginPayload,
+        to: String,
+    },
+    /// Keyboard host: `from` may send a batch for `to` through us.
+    AllowRelay {
+        from: String,
+        to: String,
+    },
+    Cancel {
+        id: u64,
+    },
+    Resolve {
+        id: u64,
+        decisions: Vec<(u32, Choice)>,
     },
     Frame {
         peer: String,
@@ -51,23 +127,85 @@ pub struct TransferHandle {
 }
 
 impl TransferHandle {
+    async fn cmd(&self, cmd: TransferCmd) {
+        let _ = self.tx.send(cmd).await;
+    }
+
     pub async fn send_files(&self, peer: String, paths: Vec<PathBuf>, purpose: TransferPurpose) {
-        let _ = self
-            .tx
-            .send(TransferCmd::Send {
-                peer,
-                paths,
-                purpose,
-            })
-            .await;
+        self.send_via(peer, paths, purpose, String::new()).await;
+    }
+
+    pub async fn send_via(
+        &self,
+        peer: String,
+        paths: Vec<PathBuf>,
+        purpose: TransferPurpose,
+        relay_to: String,
+    ) {
+        self.cmd(TransferCmd::Send {
+            peer,
+            paths,
+            purpose,
+            relay_to,
+        })
+        .await;
+    }
+
+    pub async fn prepare_drag(
+        &self,
+        peer: String,
+        paths: Vec<PathBuf>,
+        to: String,
+    ) -> Result<DragBeginPayload, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd(TransferCmd::PrepareDrag {
+            peer,
+            paths,
+            to,
+            reply,
+        })
+        .await;
+        rx.await.unwrap_or_else(|_| Err("传输服务未运行".into()))
+    }
+
+    pub async fn park_drag(&self, peer: String, begin: DragBeginPayload) {
+        self.cmd(TransferCmd::ParkDrag { peer, begin }).await;
+    }
+
+    pub async fn bind_drop(&self, id: u64, sink: Sink) {
+        self.cmd(TransferCmd::BindDrop { id, sink }).await;
+    }
+
+    pub async fn cancel_drag(&self, id: u64, reason: &str) {
+        self.cmd(TransferCmd::CancelDrag {
+            id,
+            reason: reason.into(),
+        })
+        .await;
+    }
+
+    pub async fn relay_drag(&self, from: String, begin: DragBeginPayload, to: String) {
+        self.cmd(TransferCmd::RelayDragBegin { from, begin, to }).await;
+    }
+
+    pub async fn allow_relay(&self, from: String, to: String) {
+        self.cmd(TransferCmd::AllowRelay { from, to }).await;
+    }
+
+    pub async fn cancel(&self, id: u64) {
+        self.cmd(TransferCmd::Cancel { id }).await;
+    }
+
+    pub async fn resolve(&self, id: u64, decisions: Vec<(u32, Choice)>) {
+        self.cmd(TransferCmd::Resolve { id, decisions }).await;
     }
 
     pub async fn frame(&self, peer: String, msg: MsgType, payload: Vec<u8>) {
-        let _ = self.tx.send(TransferCmd::Frame { peer, msg, payload }).await;
+        self.cmd(TransferCmd::Frame { peer, msg, payload }).await;
     }
 
     pub async fn peer_gone(&self, peer: String) {
-        let _ = self.tx.send(TransferCmd::PeerGone(peer)).await;
+        self.cmd(TransferCmd::PeerGone(peer)).await;
     }
 }
 
@@ -90,19 +228,16 @@ fn mib(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
-/// Where received files go: the configured folder, else Downloads/Cross-SystemConnect.
+/// Where received files go: the configured folder, else the desktop.
 pub fn receive_root(cfg: &Config) -> PathBuf {
-    if !cfg.file_transfer.receive_dir.trim().is_empty() {
-        return PathBuf::from(cfg.file_transfer.receive_dir.trim());
+    let set = cfg.file_transfer.receive_dir.trim();
+    if !set.is_empty() {
+        return PathBuf::from(set);
     }
-    dirs::download_dir()
-        .map(|d| d.join("Cross-SystemConnect"))
+    dirs::desktop_dir()
+        .or_else(dirs::download_dir)
         .or_else(|| default_config_path().parent().map(|p| p.join("received")))
         .unwrap_or_else(|| PathBuf::from("received"))
-}
-
-fn clipboard_root(cfg: &Config) -> PathBuf {
-    receive_root(cfg).join(".clipboard")
 }
 
 // ---------------------------------------------------------------- planning
@@ -149,6 +284,14 @@ fn plan(paths: &[PathBuf]) -> Result<Plan, String> {
     Ok(plan)
 }
 
+fn mtime_of(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn walk(path: &Path, rel: String, plan: &mut Plan, problems: &mut Vec<String>) -> Result<(), String> {
     if plan.entries.len() >= MAX_ENTRIES {
         return Err(format!("文件数量超过 {MAX_ENTRIES} 个，请压缩后再发送"));
@@ -167,7 +310,7 @@ fn walk(path: &Path, rel: String, plan: &mut Plan, problems: &mut Vec<String>) -
         plan.entries.push(FileEntry {
             relative_path: rel.clone(),
             size: 0,
-            mtime_unix: 0,
+            mtime_unix: mtime_of(&meta),
             is_directory: true,
         });
         plan.sources.push(None);
@@ -192,12 +335,109 @@ fn walk(path: &Path, rel: String, plan: &mut Plan, problems: &mut Vec<String>) -
         plan.entries.push(FileEntry {
             relative_path: rel,
             size: meta.len(),
-            mtime_unix: 0,
+            mtime_unix: mtime_of(&meta),
             is_directory: false,
         });
         plan.sources.push(Some(path.to_path_buf()));
     }
     Ok(())
+}
+
+/// "a.txt" or "a.txt 等 5 项".
+fn batch_title(entries: &[FileEntry]) -> String {
+    let tops: Vec<&FileEntry> = entries
+        .iter()
+        .filter(|e| !e.relative_path.contains('/'))
+        .collect();
+    match tops.as_slice() {
+        [] => "文件".into(),
+        [one] => one.relative_path.clone(),
+        [first, ..] => format!("{} 等 {} 项", first.relative_path, tops.len()),
+    }
+}
+
+// ---------------------------------------------------------------- layout of a batch
+
+/// Top-level item of each entry, and the path below it.
+struct Shape {
+    /// Index of each entry's top-level entry.
+    top_of: Vec<usize>,
+    /// Path of each entry below its top-level item, with `/` separators.
+    rest: Vec<Option<String>>,
+    tops: Vec<usize>,
+}
+
+fn shape(entries: &[FileEntry], cfg: &Config) -> Result<Shape, String> {
+    if entries.is_empty() || entries.len() > MAX_ENTRIES {
+        return Err("文件列表为空或过多".into());
+    }
+    let per_file = cfg.file_transfer.max_size_mb.max(0) as u64 * 1024 * 1024;
+    if let Some(big) = entries.iter().find(|e| e.size > per_file) {
+        return Err(format!("“{}” 超过单个文件上限", big.relative_path));
+    }
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    let mut s = Shape {
+        top_of: Vec::with_capacity(entries.len()),
+        rest: Vec::with_capacity(entries.len()),
+        tops: Vec::new(),
+    };
+    for (i, e) in entries.iter().enumerate() {
+        check_relative_path(&e.relative_path)
+            .map_err(|why| format!("{}：{why}", e.relative_path))?;
+        match e.relative_path.split_once('/') {
+            None => {
+                if by_name.insert(&e.relative_path, i).is_some() {
+                    return Err(format!("重复的名称 {}", e.relative_path));
+                }
+                s.tops.push(i);
+                s.top_of.push(i);
+                s.rest.push(None);
+            }
+            Some((top, rest)) => {
+                let t = *by_name
+                    .get(top)
+                    .filter(|t| entries[**t].is_directory)
+                    .ok_or_else(|| format!("{}：缺少上级文件夹", e.relative_path))?;
+                s.top_of.push(t);
+                s.rest.push(Some(rest.to_string()));
+            }
+        }
+    }
+    Ok(s)
+}
+
+fn below(base: &Path, rest: &Option<String>) -> PathBuf {
+    let mut p = base.to_path_buf();
+    if let Some(rest) = rest {
+        for part in rest.split('/') {
+            p.push(part);
+        }
+    }
+    p
+}
+
+/// `name`, or `name (1)`, `name (2)` ... so nothing in `dir` is overwritten.
+fn unique_name(dir: &Path, name: &str, taken: &HashSet<String>) -> String {
+    let free = |n: &str| !taken.contains(n) && std::fs::symlink_metadata(dir.join(n)).is_err();
+    if free(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    (1..10_000)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|candidate| free(candidate))
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn part_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}{PART_SUFFIX}"))
 }
 
 // ---------------------------------------------------------------- state
@@ -212,35 +452,82 @@ struct Outgoing {
     cancel: Arc<AtomicBool>,
 }
 
+struct Sending {
+    peer: String,
+    cancel: Arc<AtomicBool>,
+    acked: Arc<AtomicU64>,
+    wake: Arc<Notify>,
+}
+
 struct Current {
     index: u32,
-    file: std::fs::File,
+    /// None for an entry being skipped (older senders ignore `skip`).
+    file: Option<std::fs::File>,
     path: PathBuf,
     hasher: Xxh64,
     written: u64,
+}
+
+enum Target {
+    Dir(PathBuf),
+    InPlace,
+    Staged(Arc<StagedFeed>),
 }
 
 struct Incoming {
     peer: String,
     purpose: TransferPurpose,
     entries: Vec<FileEntry>,
+    shape: Shape,
+    target: Target,
     /// Local path of each entry.
     targets: Vec<PathBuf>,
-    /// Local paths of the top-level items, for the clipboard or the report.
+    /// Temporary path for files that replace an existing one.
+    temps: Vec<Option<PathBuf>>,
+    skip: Vec<bool>,
+    /// Top-level items written from scratch, removed again if the batch fails.
+    fresh: Vec<PathBuf>,
+    /// Local paths of the kept top-level items.
     tops: Vec<PathBuf>,
-    dir: PathBuf,
-    total: u64,
     current: Option<Current>,
+    requested: bool,
+    received: u64,
+    acked: u64,
+    /// Waiting for the user to choose, by top-level entry index.
+    conflicts: Vec<TransferConflict>,
+}
+
+impl Incoming {
+    fn dest(&self) -> String {
+        match &self.target {
+            Target::Dir(d) => d.display().to_string(),
+            Target::InPlace => self
+                .tops
+                .first()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            Target::Staged(_) => String::new(),
+        }
+    }
+}
+
+/// A drag over this screen that has not been dropped yet.
+struct Parked {
+    peer: String,
+    begin: DragBeginPayload,
+    at: Instant,
 }
 
 struct Engine {
     net: NetHub,
     config: Arc<RwLock<Config>>,
-    clip: ClipHandle,
+    board: TransferBoard,
     outgoing: HashMap<u64, Outgoing>,
-    /// Cancel flags of batches being streamed, by transfer id.
-    sending: HashMap<u64, (String, Arc<AtomicBool>)>,
+    sending: HashMap<u64, Sending>,
     incoming: HashMap<u64, Incoming>,
+    parked: HashMap<u64, Parked>,
+    relay: Relay,
     next_id: u64,
 }
 
@@ -248,7 +535,7 @@ pub fn spawn(
     rx: mpsc::Receiver<TransferCmd>,
     net: NetHub,
     config: Arc<RwLock<Config>>,
-    clip: ClipHandle,
+    board: TransferBoard,
 ) {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -257,10 +544,12 @@ pub fn spawn(
     let engine = Engine {
         net,
         config,
-        clip,
+        board,
         outgoing: HashMap::new(),
         sending: HashMap::new(),
         incoming: HashMap::new(),
+        parked: HashMap::new(),
+        relay: Relay::default(),
         next_id: seed << 12,
     };
     tokio::spawn(engine.run(rx));
@@ -270,28 +559,71 @@ fn parse<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
     serde_json::from_slice(payload).ok()
 }
 
+/// The transfer id of any JSON file frame.
+fn id_of(payload: &[u8]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Id {
+        transfer_id: u64,
+    }
+    parse::<Id>(payload).map(|i| i.transfer_id)
+}
+
 impl Engine {
     async fn run(mut self, mut rx: mpsc::Receiver<TransferCmd>) {
-        {
-            let root = clipboard_root(&*self.config.read().await);
-            tokio::task::spawn_blocking(move || prune_clipboard_dirs(&root));
-        }
+        tokio::task::spawn_blocking(csc_platform::vdrag::cleanup_stale);
         while let Some(cmd) = rx.recv().await {
             self.outgoing.retain(|_, o| o.created.elapsed() < OFFER_TTL);
+            self.parked.retain(|_, p| p.at.elapsed() < OFFER_TTL);
             self.sending
-                .retain(|_, (_, cancel)| Arc::strong_count(cancel) > 1);
+                .retain(|_, s| Arc::strong_count(&s.cancel) > 1);
             match cmd {
                 TransferCmd::Send {
                     peer,
                     paths,
                     purpose,
-                } => self.offer(peer, paths, purpose).await,
+                    relay_to,
+                } => self.offer(peer, paths, purpose, relay_to).await,
+                TransferCmd::PrepareDrag {
+                    peer,
+                    paths,
+                    to,
+                    reply,
+                } => {
+                    let r = self.prepare_drag(peer, paths, to).await;
+                    let _ = reply.send(r);
+                }
+                TransferCmd::ParkDrag { peer, begin } => {
+                    self.parked.insert(
+                        begin.transfer_id,
+                        Parked {
+                            peer,
+                            begin,
+                            at: Instant::now(),
+                        },
+                    );
+                }
+                TransferCmd::BindDrop { id, sink } => self.bind_drop(id, sink).await,
+                TransferCmd::CancelDrag { id, reason } => {
+                    if let Some(p) = self.parked.remove(&id) {
+                        let c = DragCancelPayload {
+                            transfer_id: id,
+                            reason,
+                        };
+                        self.send_json(&p.peer, MsgType::DragCancel, &c).await;
+                    }
+                }
+                TransferCmd::RelayDragBegin { from, begin, to } => {
+                    self.relay_drag(from, begin, to).await
+                }
+                TransferCmd::AllowRelay { from, to } => self.relay.allow(&from, &to),
+                TransferCmd::Cancel { id } => self.cancel_incoming(id).await,
+                TransferCmd::Resolve { id, decisions } => self.resolve(id, decisions).await,
                 TransferCmd::Frame { peer, msg, payload } => {
-                    if let Err(e) = self.on_frame(&peer, msg, &payload).await {
+                    if let Err(e) = self.on_frame(&peer, msg, payload).await {
                         warn!("file transfer from {peer}: {e:#}");
                     }
                 }
-                TransferCmd::PeerGone(peer) => self.peer_gone(&peer),
+                TransferCmd::PeerGone(peer) => self.peer_gone(&peer).await,
             }
         }
     }
@@ -302,63 +634,32 @@ impl Engine {
         }
     }
 
-    async fn offer(&mut self, peer: String, paths: Vec<PathBuf>, purpose: TransferPurpose) {
+    fn new_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    async fn planned(&self, paths: Vec<PathBuf>) -> Result<Plan, String> {
         let cfg = self.config.read().await.clone();
-        let planned = tokio::task::spawn_blocking(move || plan(&paths)).await;
-        let plan = match planned {
-            Ok(Ok(p)) => p,
-            Ok(Err(msg)) => {
-                popup(msg, true);
-                return;
-            }
-            Err(e) => {
-                warn!("plan transfer: {e}");
-                return;
-            }
-        };
-        let limit = match purpose {
-            TransferPurpose::Clipboard => cfg.clipboard.max_total_mb.max(0) as u64 * 1024 * 1024,
-            TransferPurpose::Drag => u64::MAX,
-        };
-        if plan.total > limit {
-            popup(
-                format!(
-                    "复制的文件共 {}，超过剪贴板文件上限 {} MB，未同步到 {peer}。\n可以把文件拖到屏幕边缘发送，或在设置中调大上限。",
-                    mib(plan.total),
-                    cfg.clipboard.max_total_mb
-                ),
-                true,
-            );
-            return;
-        }
+        let plan = tokio::task::spawn_blocking(move || plan(&paths))
+            .await
+            .map_err(|e| e.to_string())??;
         let per_file = cfg.file_transfer.max_size_mb.max(0) as u64 * 1024 * 1024;
         if let Some(big) = plan.entries.iter().find(|e| e.size > per_file) {
-            popup(
-                format!(
-                    "“{}” 大小 {}，超过单个文件上限 {} MB，已取消发送。",
-                    big.relative_path,
-                    mib(big.size),
-                    cfg.file_transfer.max_size_mb
-                ),
-                true,
-            );
-            return;
+            return Err(format!(
+                "“{}” 大小 {}，超过单个文件上限 {} MB，已取消发送。",
+                big.relative_path,
+                mib(big.size),
+                cfg.file_transfer.max_size_mb
+            ));
         }
-        self.next_id += 1;
-        let id = self.next_id;
-        let offer = FileOfferPayload {
-            transfer_id: id,
-            purpose,
-            entries: plan.entries.clone(),
-            total_bytes: plan.total,
-        };
-        info!(
-            "offering {} entries ({}) to {peer} for {:?}",
-            plan.entries.len(),
-            mib(plan.total),
-            purpose
-        );
-        self.send_json(&peer, MsgType::FileOffer, &offer).await;
+        Ok(plan)
+    }
+
+    fn register(&mut self, peer: String, purpose: TransferPurpose, plan: Plan) -> (u64, Vec<FileEntry>, u64) {
+        let id = self.new_id();
+        let entries = plan.entries.clone();
+        let total = plan.total;
         self.outgoing.insert(
             id,
             Outgoing {
@@ -371,64 +672,213 @@ impl Engine {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
+        (id, entries, total)
     }
 
-    async fn on_frame(&mut self, peer: &str, msg: MsgType, payload: &[u8]) -> anyhow::Result<()> {
+    async fn offer(&mut self, peer: String, paths: Vec<PathBuf>, purpose: TransferPurpose, relay_to: String) {
+        let plan = match self.planned(paths).await {
+            Ok(p) => p,
+            Err(msg) => {
+                popup(msg, true);
+                return;
+            }
+        };
+        info!(
+            "offering {} entries ({}) to {peer} for {:?}{}",
+            plan.entries.len(),
+            mib(plan.total),
+            purpose,
+            if relay_to.is_empty() { String::new() } else { format!(" via host to {relay_to}") }
+        );
+        let (id, entries, total) = self.register(peer.clone(), purpose, plan);
+        let offer = FileOfferPayload {
+            transfer_id: id,
+            purpose,
+            entries,
+            total_bytes: total,
+            origin: String::new(),
+            relay_to,
+        };
+        self.send_json(&peer, MsgType::FileOffer, &offer).await;
+    }
+
+    async fn prepare_drag(&mut self, peer: String, paths: Vec<PathBuf>, to: String) -> Result<DragBeginPayload, String> {
+        let plan = self.planned(paths).await?;
+        let (id, entries, total) = self.register(peer, TransferPurpose::DragDrop, plan);
+        Ok(DragBeginPayload {
+            transfer_id: id,
+            entries,
+            total_bytes: total,
+            to,
+            origin: String::new(),
+        })
+    }
+
+    async fn on_frame(&mut self, peer: &str, msg: MsgType, payload: Vec<u8>) -> anyhow::Result<()> {
+        let id = if msg == MsgType::FileData {
+            decode_file_data(&payload).map(|(id, _, _)| id)
+        } else {
+            id_of(&payload)
+        }
+        .ok_or_else(|| anyhow::anyhow!("bad {msg:?} frame"))?;
+
+        if let Some(hop) = self.relay.hop(peer, id) {
+            self.relay_frame(hop, msg, &payload).await;
+            return Ok(());
+        }
         match msg {
             MsgType::FileOffer => {
                 let offer: FileOfferPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad offer"))?;
-                self.accept_offer(peer, offer).await;
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad offer"))?;
+                if offer.relay_to.is_empty() {
+                    self.accept_offer(peer, offer).await;
+                } else {
+                    self.relay_offer(peer, offer).await;
+                }
             }
             MsgType::FileRequest => {
                 let req: FileRequestPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad request"))?;
-                self.start_sending(peer, req.transfer_id);
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad request"))?;
+                self.start_sending(peer, req).await;
             }
-            MsgType::FileCancel => {
-                let req: FileRequestPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad cancel"))?;
-                self.cancel_send(req.transfer_id);
+            MsgType::FileAck => {
+                let ack: FileAckPayload =
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad ack"))?;
+                if let Some(s) = self.sending.get(&ack.transfer_id) {
+                    s.acked.fetch_max(ack.bytes, Ordering::AcqRel);
+                    s.wake.notify_one();
+                }
+            }
+            MsgType::FileCancel | MsgType::DragCancel => {
+                if self.cancel_send(id) {
+                    info!("{peer} cancelled transfer {id}");
+                } else if self.parked.remove(&id).is_some() {
+                    debug!("{peer} withdrew drag {id}");
+                } else if let Some(inc) = self.incoming.remove(&id) {
+                    discard(inc);
+                    self.board.finish(id, TransferState::Cancelled, "对方已取消");
+                }
             }
             MsgType::FileError => {
                 let err: FileErrorPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad error"))?;
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad error"))?;
                 if self.cancel_send(err.transfer_id) {
-                    popup(format!("{peer} 未能接收文件：{}", err.message), true);
+                    popup(format!("{} 未能接收文件：{}", self.label(peer).await, err.message), true);
                 } else if let Some(inc) = self.incoming.remove(&err.transfer_id) {
                     discard(inc);
-                    popup(format!("从 {peer} 接收文件失败：{}", err.message), true);
+                    self.board
+                        .finish(err.transfer_id, TransferState::Failed, err.message);
                 }
             }
             MsgType::FileBegin => {
                 let b: FileBeginPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad begin"))?;
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad begin"))?;
                 if let Err(msg) = self.begin_entry(peer, &b) {
                     self.fail_incoming(b.transfer_id, &msg).await;
                 }
             }
             MsgType::FileData => {
                 let (id, index, data) =
-                    decode_file_data(payload).ok_or_else(|| anyhow::anyhow!("bad data"))?;
-                if let Err(msg) = self.write_data(peer, id, index, data) {
-                    self.fail_incoming(id, &msg).await;
+                    decode_file_data(&payload).ok_or_else(|| anyhow::anyhow!("bad data"))?;
+                match self.write_data(peer, id, index, data) {
+                    Ok(Some(ack)) => self.send_json(peer, MsgType::FileAck, &ack).await,
+                    Ok(None) => {}
+                    Err(msg) => self.fail_incoming(id, &msg).await,
                 }
             }
             MsgType::FileEnd => {
                 let end: FileEndPayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad end"))?;
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad end"))?;
                 if let Err(msg) = self.end_entry(peer, &end) {
                     self.fail_incoming(end.transfer_id, &msg).await;
                 }
             }
             MsgType::FileDone => {
                 let done: FileDonePayload =
-                    parse(payload).ok_or_else(|| anyhow::anyhow!("bad done"))?;
-                self.finish(peer, done.transfer_id);
+                    parse(&payload).ok_or_else(|| anyhow::anyhow!("bad done"))?;
+                self.finish(peer, done.transfer_id).await;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    async fn label(&self, peer: &str) -> String {
+        self.net.peer_label(peer).await
+    }
+
+    // ------------------------------------------------------------ relaying
+
+    async fn relay_offer(&mut self, from: &str, mut offer: FileOfferPayload) {
+        let to = offer.relay_to.clone();
+        let src_id = offer.transfer_id;
+        if !self.relay.take_allowed(from, &to) || !self.net.has_peer(&to).await {
+            let e = FileErrorPayload {
+                transfer_id: src_id,
+                message: format!("键鼠主机无法转发到 {to}"),
+            };
+            self.send_json(from, MsgType::FileError, &e).await;
+            return;
+        }
+        let rid = self.new_id();
+        self.relay.open(&self.net, from, src_id, &to, rid);
+        offer.transfer_id = rid;
+        offer.relay_to.clear();
+        offer.origin = self.label(from).await;
+        self.send_json(&to, MsgType::FileOffer, &offer).await;
+    }
+
+    async fn relay_drag(&mut self, from: String, mut begin: DragBeginPayload, to: String) {
+        let src_id = begin.transfer_id;
+        let rid = self.new_id();
+        self.relay.open(&self.net, &from, src_id, &to, rid);
+        begin.transfer_id = rid;
+        begin.to.clear();
+        begin.origin = self.label(&from).await;
+        self.send_json(&to, MsgType::DragBegin, &begin).await;
+    }
+
+    async fn relay_frame(&mut self, hop: Hop, msg: MsgType, payload: &[u8]) {
+        match hop {
+            Hop::ToTarget { dst, rid } => {
+                let Some(frame) = relay::rewrite(msg, payload, rid) else {
+                    return;
+                };
+                match msg {
+                    MsgType::FileCancel | MsgType::DragCancel => {
+                        self.net.send_control(&dst, frame).await;
+                        self.relay.close(rid);
+                    }
+                    _ => {
+                        if !self.relay.push(rid, frame) {
+                            warn!("relay queue to {dst} overflowed; dropping batch {rid}");
+                            self.relay.close(rid);
+                            let e = FileErrorPayload {
+                                transfer_id: rid,
+                                message: "键鼠主机转发失败".into(),
+                            };
+                            self.send_json(&dst, MsgType::FileError, &e).await;
+                        } else if matches!(msg, MsgType::FileDone | MsgType::FileError) {
+                            self.relay.close(rid);
+                        }
+                    }
+                }
+            }
+            Hop::ToSource { src, src_id } => {
+                // The host acknowledges the source itself as it forwards.
+                if msg == MsgType::FileAck {
+                    return;
+                }
+                if let Some(frame) = relay::rewrite(msg, payload, src_id) {
+                    self.net.send_control(&src, frame).await;
+                }
+                if matches!(msg, MsgType::FileError | MsgType::FileCancel | MsgType::DragCancel) {
+                    if let Some(Hop::ToTarget { rid, .. }) = self.relay.hop(&src, src_id) {
+                        self.relay.close(rid);
+                    }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ receiving
@@ -436,149 +886,259 @@ impl Engine {
     async fn accept_offer(&mut self, peer: &str, offer: FileOfferPayload) {
         let id = offer.transfer_id;
         let cfg = self.config.read().await.clone();
-        let refuse = |why: String| FileErrorPayload {
-            transfer_id: id,
-            message: why,
-        };
-        let allowed = match offer.purpose {
-            TransferPurpose::Clipboard => cfg.clipboard.enabled && cfg.clipboard.files,
-            TransferPurpose::Drag => cfg.file_transfer.enabled,
+        let purpose = offer.purpose.normalized();
+        let allowed = match purpose {
+            TransferPurpose::Paste | TransferPurpose::Clipboard => cfg.clipboard.files,
+            TransferPurpose::Drag | TransferPurpose::DragDrop => cfg.file_transfer.enabled,
         };
         if !allowed {
-            let e = refuse("对方已关闭文件共享".into());
+            let e = FileErrorPayload {
+                transfer_id: id,
+                message: "对方已关闭文件接收".into(),
+            };
             self.send_json(peer, MsgType::FileError, &e).await;
             return;
         }
-        match self.prepare_incoming(peer, &offer, &cfg) {
+        let from = if offer.origin.is_empty() {
+            self.label(peer).await
+        } else {
+            offer.origin.clone()
+        };
+        let via = if offer.origin.is_empty() {
+            String::new()
+        } else {
+            self.label(peer).await
+        };
+        self.receive(
+            peer,
+            id,
+            purpose,
+            offer.entries,
+            offer.total_bytes,
+            Sink::Dir(receive_root(&cfg)),
+            from,
+            via,
+        )
+        .await;
+    }
+
+    async fn bind_drop(&mut self, id: u64, sink: Sink) {
+        let Some(p) = self.parked.remove(&id) else {
+            warn!("drop for unknown drag {id}");
+            if let Sink::Staged(feed) = sink {
+                feed.fail();
+            }
+            return;
+        };
+        let from = if p.begin.origin.is_empty() {
+            self.label(&p.peer).await
+        } else {
+            p.begin.origin.clone()
+        };
+        let via = if p.begin.origin.is_empty() {
+            String::new()
+        } else {
+            self.label(&p.peer).await
+        };
+        self.receive(
+            &p.peer,
+            id,
+            TransferPurpose::DragDrop,
+            p.begin.entries,
+            p.begin.total_bytes,
+            sink,
+            from,
+            via,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn receive(
+        &mut self,
+        peer: &str,
+        id: u64,
+        purpose: TransferPurpose,
+        entries: Vec<FileEntry>,
+        total: u64,
+        sink: Sink,
+        from: String,
+        via: String,
+    ) {
+        let cfg = self.config.read().await.clone();
+        let staged = match &sink {
+            Sink::Staged(feed) => Some(feed.clone()),
+            _ => None,
+        };
+        let title = batch_title(&entries);
+        let files_total = entries.iter().filter(|e| !e.is_directory).count() as u32;
+        match prepare_incoming(peer, purpose, entries, total, sink, &cfg) {
             Ok(inc) => {
                 info!(
-                    "receiving {} entries ({}) from {peer} into {}",
+                    "receiving {} entries ({}) from {from} into {}",
                     inc.entries.len(),
-                    mib(inc.total),
-                    inc.dir.display()
+                    mib(total),
+                    inc.dest()
                 );
+                self.board.upsert(TransferProgress {
+                    id,
+                    peer: from,
+                    via,
+                    title,
+                    files_total,
+                    bytes_total: total,
+                    state: if inc.conflicts.is_empty() {
+                        TransferState::Running
+                    } else {
+                        TransferState::Conflict
+                    },
+                    dest: inc.dest(),
+                    conflicts: inc.conflicts.clone(),
+                    ..Default::default()
+                });
+                let ready = inc.conflicts.is_empty();
                 self.incoming.insert(id, inc);
-                self.send_json(peer, MsgType::FileRequest, &FileRequestPayload { transfer_id: id })
-                    .await;
+                if ready {
+                    self.request(id, HashMap::new()).await;
+                }
             }
             Err(why) => {
-                popup(format!("拒绝接收来自 {peer} 的文件：{why}"), true);
-                self.send_json(peer, MsgType::FileError, &refuse(why)).await;
+                if let Some(feed) = staged {
+                    feed.fail();
+                }
+                popup(format!("拒绝接收来自 {from} 的文件：{why}"), true);
+                let e = FileErrorPayload {
+                    transfer_id: id,
+                    message: why,
+                };
+                self.send_json(peer, MsgType::FileError, &e).await;
             }
         }
     }
 
-    fn prepare_incoming(
-        &self,
-        peer: &str,
-        offer: &FileOfferPayload,
-        cfg: &Config,
-    ) -> Result<Incoming, String> {
-        if offer.entries.is_empty() || offer.entries.len() > MAX_ENTRIES {
-            return Err("文件列表为空或过多".into());
-        }
-        let total: u64 = offer.entries.iter().map(|e| e.size).sum();
-        if total != offer.total_bytes {
-            return Err("文件大小不一致".into());
-        }
-        let limit = match offer.purpose {
-            TransferPurpose::Clipboard => cfg.clipboard.max_total_mb.max(0) as u64 * 1024 * 1024,
-            TransferPurpose::Drag => u64::MAX,
+    async fn resolve(&mut self, id: u64, decisions: Vec<(u32, Choice)>) {
+        let Some(inc) = self.incoming.get(&id).filter(|i| !i.requested) else {
+            return;
         };
-        if total > limit {
-            return Err(format!("共 {}，超过剪贴板文件上限", mib(total)));
+        let wanted: HashSet<u32> = inc.conflicts.iter().map(|c| c.index).collect();
+        let choices: HashMap<usize, Choice> = decisions
+            .into_iter()
+            .filter(|(i, _)| wanted.contains(i))
+            .map(|(i, c)| (i as usize, c))
+            .collect();
+        if choices.len() < wanted.len() {
+            return;
         }
-        let per_file = cfg.file_transfer.max_size_mb.max(0) as u64 * 1024 * 1024;
-        if let Some(big) = offer.entries.iter().find(|e| e.size > per_file) {
-            return Err(format!("“{}” 超过单个文件上限", big.relative_path));
-        }
-        let dir = match offer.purpose {
-            TransferPurpose::Clipboard => clipboard_root(cfg).join(offer.transfer_id.to_string()),
-            TransferPurpose::Drag => receive_root(cfg),
-        };
-        std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
+        self.request(id, choices).await;
+    }
 
-        // Every path is checked before anything is written. Top-level names that
-        // already exist in the folder get a " (n)" suffix instead of overwriting.
-        let mut renamed: HashMap<String, String> = HashMap::new();
-        let mut targets = Vec::with_capacity(offer.entries.len());
-        let mut tops = Vec::new();
-        for e in &offer.entries {
-            let rel = check_relative_path(&e.relative_path)
-                .map_err(|why| format!("{}：{why}", e.relative_path))?;
-            let (top, rest) = match e.relative_path.split_once('/') {
-                Some((t, r)) => (t.to_string(), Some(r)),
-                None => (e.relative_path.clone(), None),
-            };
-            if rest.is_none() {
-                if renamed.contains_key(&top) {
-                    return Err(format!("重复的名称 {top}"));
-                }
-                let local = unique_name(&dir, &top);
-                tops.push(dir.join(&local));
-                renamed.insert(top.clone(), local);
-            }
-            let Some(local_top) = renamed.get(&top) else {
-                return Err(format!("{}：缺少上级文件夹", e.relative_path));
-            };
-            let mut path = dir.join(local_top);
-            if let Some(rest) = rest {
-                path.push(rest.replace('/', std::path::MAIN_SEPARATOR_STR));
-            }
-            debug_assert!(path.starts_with(&dir) && rel.components().count() > 0);
-            targets.push(path);
+    /// Fix the local names and ask the sender for the data.
+    async fn request(&mut self, id: u64, choices: HashMap<usize, Choice>) {
+        let Some(inc) = self.incoming.get_mut(&id) else {
+            return;
+        };
+        if let Err(why) = place(inc, &choices) {
+            self.fail_incoming(id, &why).await;
+            return;
         }
-        Ok(Incoming {
-            peer: peer.to_string(),
-            purpose: offer.purpose,
-            entries: offer.entries.clone(),
-            targets,
-            tops,
-            dir,
-            total,
-            current: None,
-        })
+        inc.requested = true;
+        inc.conflicts.clear();
+        let peer = inc.peer.clone();
+        let skip: Vec<u32> = inc
+            .skip
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let all_skipped = skip.len() == inc.entries.len();
+        let wanted: u64 = inc
+            .entries
+            .iter()
+            .zip(&inc.skip)
+            .filter(|(_, s)| !**s)
+            .map(|(e, _)| e.size)
+            .sum();
+        let files = inc
+            .entries
+            .iter()
+            .zip(&inc.skip)
+            .filter(|(e, s)| !**s && !e.is_directory)
+            .count() as u32;
+        let dest = inc.dest();
+        if all_skipped {
+            self.incoming.remove(&id);
+            self.board.finish(id, TransferState::Cancelled, "已全部跳过");
+            self.send_json(&peer, MsgType::FileCancel, &FileRequestPayload { transfer_id: id, skip: Vec::new() })
+                .await;
+            return;
+        }
+        self.board.update(id, |p| {
+            p.state = TransferState::Running;
+            p.conflicts.clear();
+            p.bytes_total = wanted;
+            p.files_total = files;
+            p.dest = dest;
+        });
+        self.send_json(&peer, MsgType::FileRequest, &FileRequestPayload { transfer_id: id, skip })
+            .await;
+    }
+
+    fn incoming_of(&mut self, peer: &str, id: u64) -> Result<&mut Incoming, String> {
+        self.incoming
+            .get_mut(&id)
+            .filter(|i| i.peer.eq_ignore_ascii_case(peer) && i.requested)
+            .ok_or_else(|| "未知的传输".to_string())
     }
 
     fn begin_entry(&mut self, peer: &str, b: &FileBeginPayload) -> Result<(), String> {
-        let inc = self
-            .incoming
-            .get_mut(&b.transfer_id)
-            .filter(|i| i.peer.eq_ignore_ascii_case(peer))
-            .ok_or("未知的传输")?;
+        let inc = self.incoming_of(peer, b.transfer_id)?;
         if inc.current.is_some() {
             return Err("上一个文件尚未结束".into());
         }
         let i = b.index as usize;
-        let (entry, path) = inc
-            .entries
-            .get(i)
-            .zip(inc.targets.get(i))
-            .ok_or("文件序号无效")?;
-        if entry.is_directory {
-            std::fs::create_dir_all(path).map_err(|e| format!("{}：{e}", path.display()))?;
+        let entry = inc.entries.get(i).ok_or("文件序号无效")?.clone();
+        let path = inc.targets[i].clone();
+        if inc.skip[i] {
+            inc.current = (!entry.is_directory).then(|| Current {
+                index: b.index,
+                file: None,
+                path,
+                hasher: Xxh64::new(0),
+                written: 0,
+            });
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
+        if entry.is_directory {
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+                std::fs::remove_file(&path).map_err(|e| format!("{}：{e}", path.display()))?;
+            }
+            std::fs::create_dir_all(&path).map_err(|e| format!("{}：{e}", path.display()))?;
+            if matches!(inc.target, Target::InPlace) && inc.shape.rest[i].is_none() {
+                let _ = std::fs::remove_file(path.join(FOLDER_MARKER));
+            }
+            return Ok(());
+        }
+        let write_to = inc.temps[i].clone().unwrap_or_else(|| path.clone());
+        if let Some(parent) = write_to.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}：{e}", parent.display()))?;
         }
-        let file = std::fs::File::create(path).map_err(|e| format!("{}：{e}", path.display()))?;
+        let file =
+            std::fs::File::create(&write_to).map_err(|e| format!("{}：{e}", write_to.display()))?;
         inc.current = Some(Current {
             index: b.index,
-            file,
-            path: path.clone(),
+            file: Some(file),
+            path: write_to,
             hasher: Xxh64::new(0),
             written: 0,
         });
         Ok(())
     }
 
-    fn write_data(&mut self, peer: &str, id: u64, index: u32, data: &[u8]) -> Result<(), String> {
-        let inc = self
-            .incoming
-            .get_mut(&id)
-            .filter(|i| i.peer.eq_ignore_ascii_case(peer))
-            .ok_or("未知的传输")?;
+    /// Write a chunk. Returns an acknowledgement to send when one is due.
+    fn write_data(&mut self, peer: &str, id: u64, index: u32, data: &[u8]) -> Result<Option<FileAckPayload>, String> {
+        let board = self.board.clone();
+        let inc = self.incoming_of(peer, id)?;
         let size = inc.entries.get(index as usize).map(|e| e.size).unwrap_or(0);
         let cur = inc
             .current
@@ -588,55 +1148,106 @@ impl Engine {
         if cur.written + data.len() as u64 > size {
             return Err("收到的数据多于文件大小".into());
         }
-        cur.file
-            .write_all(data)
-            .map_err(|e| format!("写入 {}：{e}", cur.path.display()))?;
         cur.hasher.update(data);
         cur.written += data.len() as u64;
-        Ok(())
+        if let Some(file) = cur.file.as_mut() {
+            file.write_all(data)
+                .map_err(|e| format!("写入 {}：{e}", cur.path.display()))?;
+            if let Target::Staged(feed) = &inc.target {
+                feed.progress(index as usize, cur.written);
+            }
+            board.add_bytes(id, data.len() as u64);
+        }
+        inc.received += data.len() as u64;
+        if inc.received - inc.acked >= relay::ACK_STEP {
+            inc.acked = inc.received;
+            return Ok(Some(FileAckPayload {
+                transfer_id: id,
+                bytes: inc.received,
+            }));
+        }
+        Ok(None)
     }
 
     fn end_entry(&mut self, peer: &str, end: &FileEndPayload) -> Result<(), String> {
-        let inc = self
-            .incoming
-            .get_mut(&end.transfer_id)
-            .filter(|i| i.peer.eq_ignore_ascii_case(peer))
-            .ok_or("未知的传输")?;
-        let size = inc.entries.get(end.index as usize).map(|e| e.size).unwrap_or(0);
-        let cur = inc
-            .current
-            .take()
-            .filter(|c| c.index == end.index)
-            .ok_or("结束标记与文件不对应")?;
+        let board = self.board.clone();
+        let inc = self.incoming_of(peer, end.transfer_id)?;
+        let i = end.index as usize;
+        let size = inc.entries.get(i).map(|e| e.size).unwrap_or(0);
+        let Some(cur) = inc.current.take().filter(|c| c.index == end.index) else {
+            // Directories have no current file.
+            return if inc.entries.get(i).is_some_and(|e| e.is_directory) {
+                Ok(())
+            } else {
+                Err("结束标记与文件不对应".into())
+            };
+        };
+        let Some(file) = cur.file else {
+            return Ok(());
+        };
         if cur.written != size {
             return Err(format!("{} 不完整", cur.path.display()));
         }
         if cur.hasher.digest() != end.xxhash64 {
+            drop(file);
             let _ = std::fs::remove_file(&cur.path);
             return Err(format!("{} 校验失败", cur.path.display()));
         }
+        let _ = file.sync_all();
+        let mtime = inc.entries[i].mtime_unix;
+        if mtime > 0 {
+            let t = std::time::UNIX_EPOCH + Duration::from_secs(mtime as u64);
+            let _ = file.set_modified(t);
+        }
+        drop(file);
+        if inc.temps[i].is_some() {
+            let target = &inc.targets[i];
+            if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+                std::fs::remove_dir_all(target).map_err(|e| format!("{}：{e}", target.display()))?;
+            }
+            std::fs::rename(&cur.path, target)
+                .map_err(|e| format!("替换 {}：{e}", target.display()))?;
+        }
+        if let Target::Staged(feed) = &inc.target {
+            feed.complete(i);
+        }
+        board.file_done(end.transfer_id);
         Ok(())
     }
 
-    fn finish(&mut self, peer: &str, id: u64) {
-        let Some(inc) = self.incoming.remove(&id).filter(|i| i.peer.eq_ignore_ascii_case(peer)) else {
+    async fn finish(&mut self, peer: &str, id: u64) {
+        let Some(inc) = self
+            .incoming
+            .remove(&id)
+            .filter(|i| i.peer.eq_ignore_ascii_case(peer))
+        else {
             return;
         };
-        let files = inc.entries.iter().filter(|e| !e.is_directory).count();
-        match inc.purpose {
-            TransferPurpose::Clipboard => {
-                info!("copied files from {peer} are on the clipboard ({files} files)");
-                self.clip.set_files(inc.tops);
+        let files = inc
+            .entries
+            .iter()
+            .zip(&inc.skip)
+            .filter(|(e, s)| !**s && !e.is_directory)
+            .count();
+        let message = match &inc.target {
+            Target::Staged(feed) => {
+                for (i, e) in inc.entries.iter().enumerate() {
+                    if e.is_directory || inc.skip[i] {
+                        feed.complete(i);
+                    }
+                }
+                format!("已接收 {files} 个文件")
             }
-            TransferPurpose::Drag => popup(
-                format!(
-                    "已从 {peer} 接收 {files} 个文件（{}）\n保存在：{}",
-                    mib(inc.total),
-                    inc.dir.display()
-                ),
-                false,
-            ),
-        }
+            _ => format!("已接收 {files} 个文件，保存在 {}", inc.dest()),
+        };
+        let open_path = match (&inc.target, inc.tops.as_slice()) {
+            (Target::Staged(_), _) => String::new(),
+            (_, [one]) => one.display().to_string(),
+            _ => String::new(),
+        };
+        info!("received {files} files from {peer}");
+        self.board.update(id, |p| p.open_path = open_path);
+        self.board.finish(id, TransferState::Done, message);
     }
 
     async fn fail_incoming(&mut self, id: u64, why: &str) {
@@ -645,7 +1256,8 @@ impl Engine {
         };
         let peer = inc.peer.clone();
         discard(inc);
-        popup(format!("从 {peer} 接收文件失败：{why}"), true);
+        warn!("receiving {id} from {peer} failed: {why}");
+        self.board.finish(id, TransferState::Failed, why);
         let e = FileErrorPayload {
             transfer_id: id,
             message: why.to_string(),
@@ -653,7 +1265,18 @@ impl Engine {
         self.send_json(&peer, MsgType::FileError, &e).await;
     }
 
-    fn peer_gone(&mut self, peer: &str) {
+    async fn cancel_incoming(&mut self, id: u64) {
+        let Some(inc) = self.incoming.remove(&id) else {
+            return;
+        };
+        let peer = inc.peer.clone();
+        discard(inc);
+        self.board.finish(id, TransferState::Cancelled, "已取消");
+        self.send_json(&peer, MsgType::FileCancel, &FileRequestPayload { transfer_id: id, skip: Vec::new() })
+            .await;
+    }
+
+    async fn peer_gone(&mut self, peer: &str) {
         let gone: Vec<u64> = self
             .incoming
             .iter()
@@ -663,18 +1286,28 @@ impl Engine {
         for id in gone {
             if let Some(inc) = self.incoming.remove(&id) {
                 discard(inc);
-                popup(format!("与 {peer} 的连接断开，文件未接收完"), true);
+                self.board
+                    .finish(id, TransferState::Failed, "连接断开，文件未接收完");
             }
         }
+        self.parked.retain(|_, p| !p.peer.eq_ignore_ascii_case(peer));
         self.outgoing
             .retain(|_, o| !o.peer.eq_ignore_ascii_case(peer));
-        self.sending.retain(|_, (p, cancel)| {
-            let keep = !p.eq_ignore_ascii_case(peer);
+        self.sending.retain(|_, s| {
+            let keep = !s.peer.eq_ignore_ascii_case(peer);
             if !keep {
-                cancel.store(true, Ordering::Relaxed);
+                s.cancel.store(true, Ordering::Relaxed);
+                s.wake.notify_one();
             }
             keep
         });
+        for (other, other_id) in self.relay.drop_peer(peer) {
+            let e = FileErrorPayload {
+                transfer_id: other_id,
+                message: format!("{peer} 的连接断开"),
+            };
+            self.send_json(&other, MsgType::FileError, &e).await;
+        }
     }
 
     // ------------------------------------------------------------ sending
@@ -685,40 +1318,55 @@ impl Engine {
             o.cancel.store(true, Ordering::Relaxed);
             return true;
         }
-        if let Some((_, cancel)) = self.sending.remove(&id) {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(s) = self.sending.remove(&id) {
+            s.cancel.store(true, Ordering::Relaxed);
+            s.wake.notify_one();
             return true;
         }
         false
     }
 
-    fn start_sending(&mut self, peer: &str, id: u64) {
-        let Some(out) = self.outgoing.remove(&id).filter(|o| o.peer.eq_ignore_ascii_case(peer)) else {
+    async fn start_sending(&mut self, peer: &str, req: FileRequestPayload) {
+        let id = req.transfer_id;
+        let Some(out) = self
+            .outgoing
+            .remove(&id)
+            .filter(|o| o.peer.eq_ignore_ascii_case(peer))
+        else {
             return;
         };
-        self.sending
-            .insert(id, (out.peer.clone(), out.cancel.clone()));
+        let windowed = self.net.peer_caps(peer).await & CAP_FILE_ACK != 0;
+        let acked = Arc::new(AtomicU64::new(0));
+        let wake = Arc::new(Notify::new());
+        self.sending.insert(
+            id,
+            Sending {
+                peer: out.peer.clone(),
+                cancel: out.cancel.clone(),
+                acked: acked.clone(),
+                wake: wake.clone(),
+            },
+        );
         let net = self.net.clone();
         let config = self.config.clone();
+        let skip: HashSet<u32> = req.skip.into_iter().collect();
+        let label = self.label(peer).await;
         tokio::spawn(async move {
             let peer = out.peer.clone();
             let purpose = out.purpose;
-            let files = out.entries.iter().filter(|e| !e.is_directory).count();
-            let total = out.total;
             let cancel = out.cancel.clone();
-            match stream(&net, &config, id, out).await {
-                Ok(()) => {
-                    if purpose == TransferPurpose::Drag {
-                        popup(format!("已发送 {files} 个文件（{}）到 {peer}", mib(total)), false);
-                    } else {
-                        info!("sent copied files to {peer}");
-                    }
-                }
+            let flow = Flow {
+                windowed,
+                acked,
+                wake,
+            };
+            match stream(&net, &config, id, out, &skip, &flow).await {
+                Ok(()) => info!("sent batch {id} ({purpose:?}) to {peer}"),
                 Err(_) if cancel.load(Ordering::Relaxed) => {
                     info!("transfer {id} to {peer} cancelled");
                 }
                 Err(why) => {
-                    popup(format!("发送文件到 {peer} 失败：{why}"), true);
+                    popup(format!("发送文件到 {label} 失败：{why}"), true);
                     if let Ok(frame) = encode_json_frame(
                         MsgType::FileError,
                         &FileErrorPayload {
@@ -730,7 +1378,221 @@ impl Engine {
                     }
                 }
             }
+            drop(cancel);
         });
+    }
+}
+
+/// Decide the local path of every entry. `choices` answers each conflict.
+fn place(inc: &mut Incoming, choices: &HashMap<usize, Choice>) -> Result<(), String> {
+    let n = inc.entries.len();
+    inc.skip = vec![false; n];
+    inc.temps = vec![None; n];
+    inc.fresh.clear();
+    inc.tops.clear();
+    let mut top_path: HashMap<usize, PathBuf> = HashMap::new();
+    let mut replacing: HashSet<usize> = HashSet::new();
+    match &inc.target {
+        Target::Dir(dir) => {
+            let mut taken = HashSet::new();
+            for &t in &inc.shape.tops {
+                let name = &inc.entries[t].relative_path;
+                let local = match choices.get(&t) {
+                    Some(Choice::Skip) => {
+                        inc.skip[t] = true;
+                        continue;
+                    }
+                    Some(Choice::Replace) => {
+                        replacing.insert(t);
+                        name.clone()
+                    }
+                    Some(Choice::KeepBoth) | None => unique_name(dir, name, &taken),
+                };
+                taken.insert(local.clone());
+                let p = dir.join(&local);
+                if !replacing.contains(&t) {
+                    inc.fresh.push(p.clone());
+                }
+                top_path.insert(t, p);
+            }
+        }
+        Target::InPlace => {
+            for (&t, p) in inc.shape.tops.iter().zip(inc.targets.clone()) {
+                top_path.insert(t, p);
+            }
+            inc.fresh = top_path.values().cloned().collect();
+        }
+        Target::Staged(feed) => {
+            for &t in &inc.shape.tops {
+                top_path.insert(t, feed.root.join(&inc.entries[t].relative_path));
+            }
+        }
+    }
+    let mut targets = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = inc.shape.top_of[i];
+        if !top_path.contains_key(&t) {
+            inc.skip[i] = true;
+            targets.push(PathBuf::new());
+            continue;
+        }
+        let path = match &inc.target {
+            Target::Staged(feed) => feed.path(i).map(Path::to_path_buf).unwrap_or_default(),
+            _ => below(&top_path[&t], &inc.shape.rest[i]),
+        };
+        if replacing.contains(&t) && !inc.entries[i].is_directory && std::fs::symlink_metadata(&path).is_ok() {
+            inc.temps[i] = Some(part_path(&path));
+        }
+        targets.push(path);
+    }
+    inc.tops = inc
+        .shape
+        .tops
+        .iter()
+        .filter_map(|t| top_path.get(t).cloned())
+        .collect();
+    inc.targets = targets;
+    Ok(())
+}
+
+fn prepare_incoming(
+    peer: &str,
+    purpose: TransferPurpose,
+    entries: Vec<FileEntry>,
+    total: u64,
+    sink: Sink,
+    cfg: &Config,
+) -> Result<Incoming, String> {
+    let sum: u64 = entries.iter().map(|e| e.size).sum();
+    if sum != total {
+        return Err("文件大小不一致".into());
+    }
+    let shape = shape(&entries, cfg)?;
+    let n = entries.len();
+    let (target, targets, conflicts) = match sink {
+        Sink::Dir(dir) => {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
+            let conflicts = shape
+                .tops
+                .iter()
+                .filter_map(|&t| {
+                    let e = &entries[t];
+                    let meta = std::fs::symlink_metadata(dir.join(&e.relative_path)).ok()?;
+                    let new_size = entries
+                        .iter()
+                        .zip(&shape.top_of)
+                        .filter(|(_, top)| **top == t)
+                        .map(|(e, _)| e.size)
+                        .sum();
+                    Some(TransferConflict {
+                        index: t as u32,
+                        name: e.relative_path.clone(),
+                        is_directory: e.is_directory,
+                        new_size,
+                        old_size: if meta.is_dir() { 0 } else { meta.len() },
+                        old_mtime_unix: mtime_of(&meta),
+                    })
+                })
+                .collect();
+            (Target::Dir(dir), Vec::new(), conflicts)
+        }
+        Sink::InPlace(paths) => {
+            if paths.len() != shape.tops.len() {
+                return Err("放下的位置与文件不对应".into());
+            }
+            (Target::InPlace, paths, Vec::new())
+        }
+        Sink::Staged(feed) => {
+            if feed.len() != n {
+                return Err("暂存区与文件不对应".into());
+            }
+            std::fs::create_dir_all(&feed.root)
+                .map_err(|e| format!("无法创建 {}：{e}", feed.root.display()))?;
+            (Target::Staged(feed), Vec::new(), Vec::new())
+        }
+    };
+    Ok(Incoming {
+        peer: peer.to_string(),
+        purpose,
+        entries,
+        shape,
+        target,
+        targets,
+        temps: vec![None; n],
+        skip: vec![false; n],
+        fresh: Vec::new(),
+        tops: Vec::new(),
+        current: None,
+        requested: false,
+        received: 0,
+        acked: 0,
+        conflicts,
+    })
+}
+
+/// Drop a failed or cancelled batch: the partial file, and every top-level
+/// item this batch created. Files it was replacing stay as they were.
+fn discard(inc: Incoming) {
+    if let Some(cur) = inc.current {
+        if let Some(file) = cur.file {
+            drop(file);
+            let _ = std::fs::remove_file(&cur.path);
+        }
+    }
+    for p in inc.temps.iter().flatten() {
+        let _ = std::fs::remove_file(p);
+    }
+    if !inc.requested {
+        return;
+    }
+    match &inc.target {
+        Target::Staged(feed) => {
+            feed.fail();
+        }
+        _ => {
+            for p in &inc.fresh {
+                if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+                    let _ = std::fs::remove_dir_all(p);
+                } else {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
+    debug!("discarded incoming batch ({:?})", inc.purpose);
+}
+
+// ---------------------------------------------------------------- streaming
+
+struct Flow {
+    windowed: bool,
+    acked: Arc<AtomicU64>,
+    wake: Arc<Notify>,
+}
+
+impl Flow {
+    /// Wait until fewer than `WINDOW` bytes are unacknowledged.
+    async fn room(&self, sent: u64, cancel: &AtomicBool) -> Result<(), String> {
+        if !self.windowed {
+            return Ok(());
+        }
+        let mut since = Instant::now();
+        let mut last = self.acked.load(Ordering::Acquire);
+        while sent.saturating_sub(self.acked.load(Ordering::Acquire)) > WINDOW {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(500), self.wake.notified()).await;
+            let now = self.acked.load(Ordering::Acquire);
+            if now != last {
+                last = now;
+                since = Instant::now();
+            } else if since.elapsed() > ACK_TIMEOUT {
+                return Err("对方长时间没有响应".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -753,6 +1615,8 @@ async fn stream(
     config: &Arc<RwLock<Config>>,
     id: u64,
     out: Outgoing,
+    skip: &HashSet<u32>,
+    flow: &Flow,
 ) -> Result<(), String> {
     let (limit, rate) = {
         let c = config.read().await;
@@ -767,6 +1631,9 @@ async fn stream(
             return Err("已取消".into());
         }
         let index = i as u32;
+        if skip.contains(&index) {
+            continue;
+        }
         bulk_json(net, &out.peer, MsgType::FileBegin, &FileBeginPayload { transfer_id: id, index })
             .await?;
         let Some(src) = &out.sources[i] else {
@@ -778,6 +1645,7 @@ async fn stream(
         let mut hasher = Xxh64::new(0);
         let mut left = entry.size;
         while left > 0 {
+            flow.room(sent, &out.cancel).await?;
             let want = (left as usize).min(CHUNK);
             let n = file
                 .read(&mut buf[..want])
@@ -814,61 +1682,46 @@ async fn stream(
         )
         .await?;
     }
+    info!("sent {} to {}", mib(out.total), out.peer);
     bulk_json(net, &out.peer, MsgType::FileDone, &FileDonePayload { transfer_id: id }).await
-}
-
-/// `name`, or `name (1)`, `name (2)` ... so nothing in `dir` is overwritten.
-fn unique_name(dir: &Path, name: &str) -> String {
-    if !dir.join(name).exists() {
-        return name.to_string();
-    }
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
-    };
-    (1..)
-        .map(|n| format!("{stem} ({n}){ext}"))
-        .find(|candidate| !dir.join(candidate).exists())
-        .unwrap_or_else(|| name.to_string())
-}
-
-/// Drop a failed batch. Clipboard batches are private and removed whole;
-/// for dropped files only the partly written file goes.
-fn discard(inc: Incoming) {
-    if let Some(cur) = inc.current {
-        drop(cur.file);
-        let _ = std::fs::remove_file(&cur.path);
-    }
-    if inc.purpose == TransferPurpose::Clipboard {
-        let _ = std::fs::remove_dir_all(&inc.dir);
-    }
-}
-
-/// Clipboard batches older than a day are no longer on anyone's clipboard.
-fn prune_clipboard_dirs(root: &Path) {
-    let Ok(list) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in list.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > Duration::from_secs(24 * 3600));
-        if old {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("csc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(rel: &str, size: u64, dir: bool) -> FileEntry {
+        FileEntry {
+            relative_path: rel.into(),
+            size,
+            mtime_unix: 0,
+            is_directory: dir,
+        }
+    }
+
+    fn incoming_in(dir: &Path, entries: Vec<FileEntry>) -> Incoming {
+        let total = entries.iter().map(|e| e.size).sum();
+        prepare_incoming(
+            "peer",
+            TransferPurpose::Paste,
+            entries,
+            total,
+            Sink::Dir(dir.to_path_buf()),
+            &Config::default(),
+        )
+        .expect("prepare")
+    }
+
     #[test]
     fn plan_rejects_windows_names() {
-        let dir = std::env::temp_dir().join(format!("csc-plan-{}", std::process::id()));
+        let dir = temp("plan");
         std::fs::create_dir_all(dir.join("ok")).unwrap();
         std::fs::write(dir.join("ok").join("a.txt"), b"hi").unwrap();
         std::fs::write(dir.join("ok").join("bad:name.txt"), b"x").unwrap();
@@ -884,11 +1737,105 @@ mod tests {
 
     #[test]
     fn unique_name_adds_suffix() {
-        let dir = std::env::temp_dir().join(format!("csc-uniq-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("uniq");
         std::fs::write(dir.join("a.txt"), b"").unwrap();
-        assert_eq!(unique_name(&dir, "a.txt"), "a (1).txt");
-        assert_eq!(unique_name(&dir, "b.txt"), "b.txt");
+        let none = HashSet::new();
+        assert_eq!(unique_name(&dir, "a.txt", &none), "a (1).txt");
+        assert_eq!(unique_name(&dir, "b.txt", &none), "b.txt");
+        let taken: HashSet<String> = ["a (1).txt".to_string()].into();
+        assert_eq!(unique_name(&dir, "a.txt", &taken), "a (2).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_top_names_are_conflicts() {
+        let dir = temp("conf");
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        std::fs::create_dir_all(dir.join("pics")).unwrap();
+        let inc = incoming_in(
+            &dir,
+            vec![
+                entry("a.txt", 3, false),
+                entry("pics", 0, true),
+                entry("pics/x.png", 4, false),
+                entry("new.txt", 1, false),
+            ],
+        );
+        let names: Vec<_> = inc.conflicts.iter().map(|c| (c.index, c.name.as_str())).collect();
+        assert_eq!(names, vec![(0, "a.txt"), (1, "pics")]);
+        assert_eq!(inc.conflicts[1].new_size, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn choices_decide_paths_and_skips() {
+        let dir = temp("place");
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        std::fs::create_dir_all(dir.join("pics")).unwrap();
+        std::fs::write(dir.join("pics").join("x.png"), b"old").unwrap();
+        std::fs::write(dir.join("b.txt"), b"old").unwrap();
+        let mut inc = incoming_in(
+            &dir,
+            vec![
+                entry("a.txt", 3, false),
+                entry("pics", 0, true),
+                entry("pics/x.png", 4, false),
+                entry("pics/y.png", 4, false),
+                entry("b.txt", 1, false),
+            ],
+        );
+        let choices: HashMap<usize, Choice> =
+            [(0, Choice::KeepBoth), (1, Choice::Replace), (4, Choice::Skip)].into();
+        place(&mut inc, &choices).unwrap();
+        assert_eq!(inc.targets[0], dir.join("a (1).txt"));
+        assert_eq!(inc.temps[0], None);
+        // Replacing a folder merges: existing files are written beside and renamed over.
+        assert_eq!(inc.targets[2], dir.join("pics").join("x.png"));
+        assert_eq!(inc.temps[2], Some(dir.join("pics").join(".x.png.csc-part")));
+        assert_eq!(inc.temps[3], None);
+        assert_eq!(inc.skip, vec![false, false, false, false, true]);
+        assert_eq!(inc.fresh, vec![dir.join("a (1).txt")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaced_file_survives_a_failed_batch() {
+        let dir = temp("replace");
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        let mut inc = incoming_in(&dir, vec![entry("a.txt", 3, false)]);
+        place(&mut inc, &[(0, Choice::Replace)].into()).unwrap();
+        inc.requested = true;
+        let part = inc.temps[0].clone().unwrap();
+        std::fs::write(&part, b"ne").unwrap();
+        discard(inc);
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_place_uses_the_found_placeholders() {
+        let dir = temp("inplace");
+        let found = dir.join("报告 (1).docx");
+        let entries = vec![entry("报告.docx", 2, false), entry("照片", 0, true), entry("照片/a.jpg", 1, false)];
+        let mut inc = prepare_incoming(
+            "peer",
+            TransferPurpose::DragDrop,
+            entries,
+            3,
+            Sink::InPlace(vec![found.clone(), dir.join("照片")]),
+            &Config::default(),
+        )
+        .unwrap();
+        place(&mut inc, &HashMap::new()).unwrap();
+        assert_eq!(inc.targets[0], found);
+        assert_eq!(inc.targets[2], dir.join("照片").join("a.jpg"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_purposes_map_to_paste() {
+        assert_eq!(TransferPurpose::Clipboard.normalized(), TransferPurpose::Paste);
+        assert_eq!(TransferPurpose::Drag.normalized(), TransferPurpose::Drag);
     }
 }

@@ -37,6 +37,13 @@ pub struct NetStatus {
     pub peer_name: String,
 }
 
+/// What the other side said about itself in HELLO.
+#[derive(Debug, Clone, Default)]
+pub struct PeerInfo {
+    pub host_name: String,
+    pub capabilities: u32,
+}
+
 /// Channels into one running session.
 #[derive(Clone)]
 pub struct Link {
@@ -46,6 +53,7 @@ pub struct Link {
     bulk: mpsc::Sender<Vec<u8>>,
     kill: watch::Sender<bool>,
     since: Instant,
+    info: Arc<std::sync::Mutex<PeerInfo>>,
 }
 
 /// The session end of a `Link`.
@@ -53,25 +61,40 @@ pub struct LinkRx {
     rx: mpsc::Receiver<Vec<u8>>,
     bulk: mpsc::Receiver<Vec<u8>>,
     kill: watch::Receiver<bool>,
+    info: Arc<std::sync::Mutex<PeerInfo>>,
 }
 
 fn new_link() -> (Link, LinkRx) {
     let (tx, rx) = mpsc::channel(64);
     let (btx, brx) = mpsc::channel(4);
     let (ktx, krx) = watch::channel(false);
+    let info = Arc::new(std::sync::Mutex::new(PeerInfo::default()));
     (
         Link {
             tx,
             bulk: btx,
             kill: ktx,
             since: Instant::now(),
+            info: info.clone(),
         },
         LinkRx {
             rx,
             bulk: brx,
             kill: krx,
+            info,
         },
     )
+}
+
+/// Where sessions deliver what they receive, plus state kept across network restarts.
+#[derive(Clone)]
+pub struct Wires {
+    events: mpsc::Sender<InboundEvent>,
+    transfer: crate::transfer::TransferHandle,
+    /// Keyboard host: last TCP address of each controlled computer, for redialing.
+    last_peers: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    /// A session ended: search or announce right away.
+    kick: Arc<tokio::sync::Notify>,
 }
 
 impl Link {
@@ -216,6 +239,12 @@ impl PeerTable {
         names.sort();
         names
     }
+
+    async fn info(&self, name: &str) -> Option<PeerInfo> {
+        let link = Self::find(&*self.txs.lock().await, name)?;
+        let info = link.info.lock().map(|i| i.clone()).unwrap_or_default();
+        Some(info)
+    }
 }
 
 #[derive(Clone)]
@@ -249,6 +278,25 @@ impl NetHub {
 
     pub async fn has_peer(&self, name: &str) -> bool {
         self.peers.contains(name).await
+    }
+
+    /// Capability bits from the peer's HELLO; 0 for older versions or no session.
+    pub async fn peer_caps(&self, name: &str) -> u32 {
+        self.peers
+            .info(name)
+            .await
+            .map(|i| i.capabilities)
+            .unwrap_or(0)
+    }
+
+    /// Computer name to show for a session key (the controlled side keys by address).
+    pub async fn peer_label(&self, name: &str) -> String {
+        self.peers
+            .info(name)
+            .await
+            .map(|i| i.host_name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| name.to_string())
     }
 
     pub async fn send_mouse_move(&self, dx: i32, dy: i32) {
@@ -289,8 +337,15 @@ pub async fn spawn_network(
     app_status: Arc<RwLock<AppStatus>>,
     prompt: Arc<PeerPrompt>,
     mut config_watch: watch::Receiver<u64>,
-    inbound: mpsc::Sender<InboundEvent>,
+    events: mpsc::Sender<InboundEvent>,
+    transfer: crate::transfer::TransferHandle,
 ) -> anyhow::Result<NetHub> {
+    let inbound = Wires {
+        events,
+        transfer,
+        last_peers: Arc::new(Mutex::new(HashMap::new())),
+        kick: Arc::new(tokio::sync::Notify::new()),
+    };
     let peers = PeerTable::new();
     let status = Arc::new(RwLock::new(NetStatus::default()));
     let status2 = status.clone();
@@ -377,7 +432,7 @@ async fn run_role(
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
     peers: &PeerTable,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
 ) -> anyhow::Result<()> {
     let identity = Arc::new(crate::tls::Identity::load(
         config_path.parent().unwrap_or_else(|| Path::new(".")),
@@ -429,9 +484,8 @@ pub enum InboundEvent {
     MouseButton { button: u32, down: bool },
     MouseWheel { v: i32, h: i32 },
     Key { hid: u32, down: bool },
-    ClipOffer(serde_json::Value),
-    /// File transfer frame from `peer`, handled by the transfer task.
-    File {
+    /// JSON message whose sender matters: ClipOffer, EdgeHit, PasteRequest, DragBegin.
+    From {
         peer: String,
         msg: MsgType,
         payload: Vec<u8>,
@@ -452,7 +506,7 @@ async fn run_server(
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
     peers: &PeerTable,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
 ) -> anyhow::Result<()> {
     let port = cfg.control_port;
     let bind = effective_bind(cfg);
@@ -475,14 +529,53 @@ async fn run_server(
     let _stop = StopOnDrop(stop_tx);
     let inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut seen: HashMap<String, (DiscoveredPeer, Instant)> = HashMap::new();
+    let mut udp_fails = 0u32;
+    let mut redial = Redial::default();
+    let kick = inbound.kick.clone();
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                send_to_targets(&udp, &search, &targets).await;
+                udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &search, &targets).await)?;
                 let now = Instant::now();
                 seen.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(15));
                 publish_discovered(app_status, &seen).await;
+                // Controlled computers that were linked before are dialed directly,
+                // without waiting for their announce.
+                let known: Vec<(String, SocketAddr)> = inbound
+                    .last_peers
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(k, a)| (k.clone(), *a))
+                    .collect();
+                for (key, addr) in known {
+                    if peers.contains(&key).await {
+                        redial.reset(&key);
+                        continue;
+                    }
+                    if !redial.due(&key, now) || inflight.lock().await.contains(&key) {
+                        continue;
+                    }
+                    debug!("redialing {key} at {addr}");
+                    inflight.lock().await.insert(key.clone());
+                    spawn_server_link(
+                        cfg.clone(),
+                        live.clone(),
+                        config_path.to_path_buf(),
+                        identity.clone(),
+                        peers.clone(),
+                        inbound.clone(),
+                        status.clone(),
+                        inflight.clone(),
+                        stop_rx.clone(),
+                        key,
+                        ServerLink::Dial(addr),
+                    );
+                }
+            }
+            _ = kick.notified() => {
+                send_to_targets(&udp, &search, &targets).await;
             }
             res = udp.recv_from(&mut buf) => {
                 let Some((n, src)) = udp_datagram(res)? else {
@@ -545,11 +638,20 @@ async fn run_server(
                 };
                 let _ = tcp.set_nodelay(true);
                 let ip = addr.ip().to_string();
-                // Only computers that announced on the selected LAN may dial in.
+                // Only computers that announced on the selected LAN, or were linked
+                // before, may dial in.
+                let known = inbound
+                    .last_peers
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|(_, a)| a.ip() == addr.ip())
+                    .map(|(k, _)| k.clone());
                 let Some(key) = seen
                     .iter()
                     .find(|(_, (p, _))| p.address == ip)
                     .map(|(k, _)| k.clone())
+                    .or(known)
                 else {
                     info!("ignoring TCP from {addr}: no announce seen yet");
                     continue;
@@ -591,7 +693,7 @@ fn spawn_server_link(
     config_path: PathBuf,
     identity: Arc<crate::tls::Identity>,
     peers: PeerTable,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
     status: Arc<RwLock<NetStatus>>,
     inflight: Arc<Mutex<HashSet<String>>>,
     mut stop: watch::Receiver<bool>,
@@ -620,7 +722,14 @@ fn spawn_server_link(
                 }
                 let how = if dialed { "dialed" } else { "dialed back by client" };
                 info!("connected to client {key} at {peer_addr} ({how})");
+                let tcp_addr = if dialed {
+                    peer_addr
+                } else {
+                    SocketAddr::new(peer_addr.ip(), cfg.control_port)
+                };
+                inbound.last_peers.lock().await.insert(key.clone(), tcp_addr);
                 refresh_link_status(&status, &peers).await;
+                let kick = inbound.kick.clone();
                 tokio::select! {
                     result = session(
                         &cfg,
@@ -643,6 +752,7 @@ fn spawn_server_link(
                 }
                 peers.remove_owned(&key, &tx).await;
                 refresh_link_status(&status, &peers).await;
+                kick.notify_one();
             }
             Err(e) if dialed => warn!(
                 "connect {peer_addr}: {e:#} (the client's firewall may block inbound TCP; waiting for it to dial back)"
@@ -667,7 +777,7 @@ async fn run_client(
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
     peers: &PeerTable,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
 ) -> anyhow::Result<()> {
     let port = cfg.control_port;
     let bind = effective_bind(cfg);
@@ -711,9 +821,14 @@ async fn run_client(
     let dialing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut buf = [0u8; 2048];
+    let mut udp_fails = 0u32;
+    let kick = inbound.kick.clone();
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &announce, &targets).await)?;
+            }
+            _ = kick.notified() => {
                 send_to_targets(&udp, &announce, &targets).await;
             }
             res = udp.recv_from(&mut buf) => {
@@ -734,7 +849,7 @@ async fn run_client(
                         && peers.evict_older_than(&key, Duration::from_secs(3)).await
                     {
                         info!("keyboard host {key} has no session with us; dropping the stale one");
-                        refresh_link_status(&ctx.status, &peers).await;
+                        refresh_link_status(&ctx.status, peers).await;
                     }
                     if !peers.contains(&key).await && dialing.lock().await.insert(key.clone()) {
                         let ctx = ctx.clone();
@@ -776,7 +891,7 @@ struct ClientCtx {
     prompt: Arc<PeerPrompt>,
     status: Arc<RwLock<NetStatus>>,
     peers: PeerTable,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
     rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
     stop: watch::Receiver<bool>,
 }
@@ -829,6 +944,48 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
     }
     ctx.peers.remove_owned(&key, &tx).await;
     refresh_link_status(&ctx.status, &ctx.peers).await;
+    ctx.inbound.kick.notify_one();
+}
+
+/// Consecutive discovery rounds where no datagram could be sent. The socket is
+/// probably bound to an address that went away; after a few, restart the network.
+fn count_udp_failure(fails: u32, sent_any: bool) -> anyhow::Result<u32> {
+    if sent_any {
+        return Ok(0);
+    }
+    let fails = fails + 1;
+    if fails >= 3 {
+        anyhow::bail!("discovery could not send for {fails} rounds; rebuilding sockets");
+    }
+    Ok(fails)
+}
+
+/// Back-off for redialing a controlled computer that was linked before.
+#[derive(Default)]
+struct Redial {
+    next: HashMap<String, (Instant, Duration)>,
+}
+
+impl Redial {
+    const FIRST: Duration = Duration::from_secs(2);
+    const MAX: Duration = Duration::from_secs(10);
+
+    fn due(&mut self, key: &str, now: Instant) -> bool {
+        let entry = self
+            .next
+            .entry(key.to_ascii_lowercase())
+            .or_insert((now, Self::FIRST));
+        if now < entry.0 {
+            return false;
+        }
+        entry.0 = now + entry.1;
+        entry.1 = (entry.1 * 2).min(Self::MAX);
+        true
+    }
+
+    fn reset(&mut self, key: &str) {
+        self.next.remove(&key.to_ascii_lowercase());
+    }
 }
 
 struct StopOnDrop(watch::Sender<bool>);
@@ -918,12 +1075,23 @@ fn udp_datagram(
     }
 }
 
-async fn send_to_targets(sock: &UdpSocket, packet: &[u8], targets: &[SocketAddr]) {
+/// Send to every target. True when at least one datagram went out.
+async fn send_to_targets(sock: &UdpSocket, packet: &[u8], targets: &[SocketAddr]) -> bool {
+    let mut any = targets.is_empty();
+    let mut first_err = None;
     for dest in targets {
-        if let Err(e) = sock.send_to(packet, dest).await {
-            tracing::debug!("discovery send {dest}: {e}");
+        match sock.send_to(packet, dest).await {
+            Ok(_) => any = true,
+            Err(e) => {
+                tracing::debug!("discovery send {dest}: {e}");
+                first_err.get_or_insert(e);
+            }
         }
     }
+    if let (false, Some(e)) = (any, first_err) {
+        warn!("discovery send failed on every target: {e}");
+    }
+    any
 }
 
 async fn connect_peer(addr: SocketAddr) -> anyhow::Result<TcpStream> {
@@ -991,7 +1159,6 @@ struct Admit {
     address: String,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Runs one control session and always reports `Disconnected` when it ends,
 /// whether the peer closed, reset, timed out or sent garbage.
 #[allow(clippy::too_many_arguments)]
@@ -1004,7 +1171,7 @@ async fn session<S>(
     status: &Arc<RwLock<NetStatus>>,
     peer: String,
     outbound: LinkRx,
-    inbound: mpsc::Sender<InboundEvent>,
+    inbound: Wires,
     link: Option<ClientLink>,
     admit: Option<Admit>,
 ) -> anyhow::Result<()>
@@ -1025,7 +1192,7 @@ where
         admit,
     )
     .await;
-    let _ = inbound.send(InboundEvent::Disconnected { peer }).await;
+    let _ = inbound.events.send(InboundEvent::Disconnected { peer }).await;
     result
 }
 
@@ -1047,7 +1214,7 @@ async fn session_inner<S>(
     status: &Arc<RwLock<NetStatus>>,
     peer: String,
     mut outbound: LinkRx,
-    mut inbound: mpsc::Sender<InboundEvent>,
+    mut inbound: Wires,
     link: Option<ClientLink>,
     admit: Option<Admit>,
 ) -> anyhow::Result<()>
@@ -1064,7 +1231,13 @@ where
         host_name: cfg.name.clone(),
         screen_width: size.width,
         screen_height: size.height,
-        capabilities: 0,
+        capabilities: local_capabilities(),
+    };
+    let remember = |remote: &HelloPayload| {
+        if let Ok(mut info) = outbound.info.lock() {
+            info.host_name = remote.host_name.clone();
+            info.capabilities = remote.capabilities;
+        }
     };
     // The keyboard host speaks first. The controlled computer answers only after trust,
     // so a cancelled prompt never pins a certificate on the host.
@@ -1092,9 +1265,11 @@ where
             }
         };
         // Keep reading while the user decides, so the host's send buffer cannot fill.
+        // Heartbeats tell the host this computer is still here and only waiting.
         let announced = remote.clone();
         let mut decision = std::pin::pin!(allow_control(&admit, &remote, &peer_fp));
         let mut discard = [0u8; 4096];
+        let mut waiting = tokio::time::interval(HELLO_KEEPALIVE);
         loop {
             while try_decode_frame(&mut buf)?.is_some() {}
             tokio::select! {
@@ -1103,6 +1278,10 @@ where
                         return Ok(());
                     }
                     break;
+                }
+                _ = waiting.tick() => {
+                    let mut w = writer.lock().await;
+                    w.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await?;
                 }
                 read = reader.read(&mut discard) => {
                     let n = read?;
@@ -1118,24 +1297,19 @@ where
             let mut w = writer.lock().await;
             w.write_all(&encode_hello_bin(&hello)).await?;
         }
-        let _ = inbound.send(InboundEvent::Hello(announced)).await;
+        remember(&announced);
+        let _ = inbound.events.send(InboundEvent::Hello(announced)).await;
     } else {
-        let (remote, early) = match tokio::time::timeout(
-            Duration::from_secs(120),
-            read_until_hello(&mut reader, &mut buf),
-        )
-        .await
-        {
-            Ok(Ok(found)) => found,
-            Ok(Err(e)) => {
-                info!("client {peer} closed before accepting control: {e:#}");
-                return Ok(());
-            }
-            Err(_) => {
-                info!("client {peer} did not accept control");
+        // The controlled computer sends heartbeats while its user decides, so
+        // silence means the connection is dead, not that someone is thinking.
+        let (remote, early) = match read_until_hello_idle(&mut reader, &mut buf, HELLO_IDLE).await {
+            Ok(found) => found,
+            Err(e) => {
+                info!("client {peer} did not accept control: {e:#}");
                 return Ok(());
             }
         };
+        remember(&remote);
         let name = if remote.host_name.is_empty() {
             peer.clone()
         } else {
@@ -1154,7 +1328,7 @@ where
         for frame in early {
             dispatch_frame(frame, &peer, status, &mut inbound).await?;
         }
-        let _ = inbound.send(InboundEvent::Hello(remote)).await;
+        let _ = inbound.events.send(InboundEvent::Hello(remote)).await;
     }
 
     if let Some(link) = link {
@@ -1233,9 +1407,36 @@ where
     Ok(())
 }
 
+/// What this build can do here. Virtual drags need a desktop that supports them.
+fn local_capabilities() -> u32 {
+    let mut caps = csc_proto::CAPABILITIES;
+    if !csc_platform::vdrag::supported() {
+        caps &= !csc_proto::CAP_VIRTUAL_DRAG;
+    }
+    caps
+}
+
+/// Controlled computer: heartbeat interval while its trust prompt is open.
+const HELLO_KEEPALIVE: Duration = Duration::from_secs(2);
+/// Keyboard host: give up on a controlled computer silent this long before its HELLO.
+const HELLO_IDLE: Duration = Duration::from_secs(10);
+
 async fn read_until_hello<R>(
     reader: &mut R,
     buf: &mut BytesMut,
+) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)>
+where
+    R: AsyncRead + Unpin,
+{
+    read_until_hello_idle(reader, buf, Duration::MAX).await
+}
+
+/// Read up to HELLO, failing when nothing at all arrives for `idle`.
+/// Heartbeats before HELLO only prove the other side is alive.
+async fn read_until_hello_idle<R>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    idle: Duration,
 ) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)>
 where
     R: AsyncRead + Unpin,
@@ -1251,10 +1452,17 @@ where
                         .ok_or_else(|| anyhow::anyhow!("bad hello"))?;
                     return Ok((hello, early));
                 }
+                Some(frame) if frame.msg_type == MsgType::Heartbeat => {}
                 Some(frame) => early.push(frame),
             }
         }
-        let n = reader.read(&mut tmp).await?;
+        let n = if idle == Duration::MAX {
+            reader.read(&mut tmp).await?
+        } else {
+            tokio::time::timeout(idle, reader.read(&mut tmp))
+                .await
+                .map_err(|_| anyhow::anyhow!("no data for {}s", idle.as_secs()))??
+        };
         if n == 0 {
             anyhow::bail!("closed before hello");
         }
@@ -1320,9 +1528,12 @@ async fn dispatch_frame(
     frame: csc_proto::Frame,
     peer: &str,
     status: &Arc<RwLock<NetStatus>>,
-    inbound: &mut mpsc::Sender<InboundEvent>,
+    wires: &mut Wires,
 ) -> anyhow::Result<()> {
+    let inbound = &wires.events;
     match frame.msg_type {
+        // File frames go straight to the transfer engine, so a busy transfer
+        // never queues up behind pointer input or the other way round.
         MsgType::FileOffer
         | MsgType::FileRequest
         | MsgType::FileBegin
@@ -1330,9 +1541,17 @@ async fn dispatch_frame(
         | MsgType::FileEnd
         | MsgType::FileDone
         | MsgType::FileError
-        | MsgType::FileCancel => {
+        | MsgType::FileCancel
+        | MsgType::FileAck
+        | MsgType::DragCancel => {
+            wires
+                .transfer
+                .frame(peer.to_string(), frame.msg_type, frame.payload)
+                .await;
+        }
+        MsgType::ClipOffer | MsgType::EdgeHit | MsgType::PasteRequest | MsgType::DragBegin => {
             let _ = inbound
-                .send(InboundEvent::File {
+                .send(InboundEvent::From {
                     peer: peer.to_string(),
                     msg: frame.msg_type,
                     payload: frame.payload,
@@ -1410,11 +1629,6 @@ async fn dispatch_frame(
                 let _ = inbound.send(InboundEvent::Key { hid, down }).await;
             }
         }
-        MsgType::ClipOffer => {
-            if let Ok(v) = serde_json::from_slice(&frame.payload) {
-                let _ = inbound.send(InboundEvent::ClipOffer(v)).await;
-            }
-        }
         other => {
             let _ = inbound.send(InboundEvent::Raw(other, frame.payload)).await;
         }
@@ -1425,4 +1639,65 @@ async fn dispatch_frame(
 #[allow(dead_code)]
 pub fn encode_clip_offer(v: &impl serde::Serialize) -> Result<Vec<u8>, serde_json::Error> {
     encode_json_frame(MsgType::ClipOffer, v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redial_backs_off_to_ten_seconds() {
+        let mut r = Redial::default();
+        let t0 = Instant::now();
+        assert!(r.due("B", t0));
+        assert!(!r.due("b", t0 + Duration::from_secs(1)));
+        assert!(r.due("B", t0 + Duration::from_secs(2)));
+        // Next wait is 4 s, then 8 s, then capped at 10 s.
+        assert!(!r.due("B", t0 + Duration::from_secs(5)));
+        assert!(r.due("B", t0 + Duration::from_secs(6)));
+        assert!(r.due("B", t0 + Duration::from_secs(14)));
+        assert!(!r.due("B", t0 + Duration::from_secs(23)));
+        assert!(r.due("B", t0 + Duration::from_secs(24)));
+        r.reset("B");
+        assert!(r.due("B", t0 + Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn three_silent_rounds_restart_discovery() {
+        let n = count_udp_failure(0, false).unwrap();
+        let n = count_udp_failure(n, false).unwrap();
+        assert_eq!(count_udp_failure(n, true).unwrap(), 0);
+        assert!(count_udp_failure(n, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn hello_wait_gives_up_after_silence_only() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let mut buf = BytesMut::new();
+        let res = read_until_hello_idle(&mut b, &mut buf, Duration::from_millis(50)).await;
+        assert!(res.is_err());
+
+        let writer = tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                a.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await.unwrap();
+            }
+            let hello = HelloPayload {
+                protocol_version: 1,
+                host_name: "B".into(),
+                screen_width: 10,
+                screen_height: 10,
+                capabilities: csc_proto::CAPABILITIES,
+            };
+            a.write_all(&encode_hello_bin(&hello)).await.unwrap();
+            a
+        });
+        let mut buf = BytesMut::new();
+        let (hello, early) = read_until_hello_idle(&mut b, &mut buf, Duration::from_millis(80))
+            .await
+            .expect("heartbeats keep it waiting");
+        assert_eq!(hello.host_name, "B");
+        assert!(early.is_empty());
+        let _ = writer.await;
+    }
 }

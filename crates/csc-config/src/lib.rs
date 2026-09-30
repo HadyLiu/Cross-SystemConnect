@@ -37,8 +37,15 @@ pub struct SwitchConfig {
     /// neighbor. A single corner pixel is too hard to hit.
     #[serde(default = "default_diagonal_zone")]
     pub diagonal_zone_px: i32,
+    /// After the pointer reaches an edge, how far it must keep pushing outward
+    /// before it switches. 0 switches on contact.
+    #[serde(default = "default_edge_push")]
+    pub edge_push_px: i32,
 }
 
+fn default_edge_push() -> i32 {
+    8
+}
 fn default_double_tap_window() -> i32 {
     250
 }
@@ -58,9 +65,14 @@ impl Default for SwitchConfig {
             corner_dead_zone_px: 10,
             relative_mouse_moves: false,
             diagonal_zone_px: default_diagonal_zone(),
+            edge_push_px: default_edge_push(),
         }
     }
 }
+
+/// Largest copied text sent to other computers. One frame holds at most 16 MiB,
+/// and JSON escaping makes text longer, so 15 MB is the ceiling.
+pub const MAX_INLINE_MB: i32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardConfig {
@@ -70,22 +82,19 @@ pub struct ClipboardConfig {
     pub text: bool,
     #[serde(default = "default_true")]
     pub image: bool,
+    /// Copied files can be pasted on another computer. Nothing is sent until
+    /// Ctrl+V there; the files then go to its receive folder.
     #[serde(default = "default_true")]
     pub files: bool,
     #[serde(default = "default_inline")]
     pub max_inline_mb: i32,
-    #[serde(default = "default_total")]
-    pub max_total_mb: i32,
 }
 
 fn default_true() -> bool {
     true
 }
 fn default_inline() -> i32 {
-    1
-}
-fn default_total() -> i32 {
-    64
+    MAX_INLINE_MB
 }
 
 impl Default for ClipboardConfig {
@@ -95,9 +104,15 @@ impl Default for ClipboardConfig {
             text: true,
             image: true,
             files: true,
-            max_inline_mb: 1,
-            max_total_mb: 64,
+            max_inline_mb: MAX_INLINE_MB,
         }
+    }
+}
+
+impl ClipboardConfig {
+    /// Text limit in bytes, within 1..=MAX_INLINE_MB.
+    pub fn max_inline_bytes(&self) -> usize {
+        self.max_inline_mb.clamp(1, MAX_INLINE_MB) as usize * 1024 * 1024
     }
 }
 
@@ -252,8 +267,17 @@ pub struct ScreenPlace {
     pub y: i32,
 }
 
+/// Version written by this build. Files without the field are version 1.
+pub const CONFIG_VERSION: u32 = 2;
+
+fn default_config_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
     #[serde(default)]
     pub role: Role,
     #[serde(default)]
@@ -322,6 +346,7 @@ fn default_data_port() -> u16 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            config_version: CONFIG_VERSION,
             role: Role::Client,
             name: local_computer_name(),
             bind_address: default_bind(),
@@ -531,7 +556,32 @@ impl Config {
         if cfg.log.level.is_empty() {
             cfg.log.level = cfg.log_level.clone();
         }
+        if cfg.upgrade() {
+            info!("Upgraded config to version {CONFIG_VERSION}");
+            if let Err(e) = cfg.save(path) {
+                warn!("Failed to persist upgraded config: {e}");
+            }
+        }
+        cfg.clamp_limits();
         Ok(cfg)
+    }
+
+    /// One-time changes for files written by older builds. True when something changed.
+    fn upgrade(&mut self) -> bool {
+        if self.config_version >= CONFIG_VERSION {
+            return false;
+        }
+        if self.config_version < 2 {
+            // Version 2 raised the copied-text limit to the maximum for everyone.
+            self.clipboard.max_inline_mb = MAX_INLINE_MB;
+        }
+        self.config_version = CONFIG_VERSION;
+        true
+    }
+
+    fn clamp_limits(&mut self) {
+        self.clipboard.max_inline_mb = self.clipboard.max_inline_mb.clamp(1, MAX_INLINE_MB);
+        self.switch_cfg.edge_push_px = self.switch_cfg.edge_push_px.clamp(0, 200);
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -549,7 +599,7 @@ impl Config {
         let mut current = serde_json::to_value(&*self)?;
         if let (Some(base), Some(patch)) = (current.as_object_mut(), v.as_object()) {
             for (k, val) in patch {
-                if k == "trusted_peers" || k == "peer_fingerprints" {
+                if k == "trusted_peers" || k == "peer_fingerprints" || k == "config_version" {
                     continue;
                 }
                 base.insert(k.clone(), val.clone());
@@ -559,6 +609,7 @@ impl Config {
         if self.name.is_empty() {
             self.name = local_computer_name();
         }
+        self.clamp_limits();
         Ok(())
     }
 
@@ -685,6 +736,40 @@ mod tests {
         assert!(cfg.pin_peer("Other", "cc").is_ok());
         assert!(cfg.pin_peer("other", "cc").is_ok());
         assert!(cfg.pin_peer("Other", "dd").is_err());
+    }
+
+    #[test]
+    fn upgrade_raises_text_limit_once() {
+        let dir = std::env::temp_dir().join(format!("csc-cfg-up-{}", std::process::id()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"name":"Desk","clipboard":{"max_inline_mb":1,"max_total_mb":64}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::load_or_create(&path).unwrap();
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+        assert_eq!(cfg.clipboard.max_inline_mb, MAX_INLINE_MB);
+
+        cfg.clipboard.max_inline_mb = 3;
+        cfg.save(&path).unwrap();
+        let again = Config::load_or_create(&path).unwrap();
+        assert_eq!(again.clipboard.max_inline_mb, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_clamps_text_limit_and_keeps_version() {
+        let mut cfg = Config::default();
+        cfg.merge_from_value(serde_json::json!({
+            "clipboard": {"max_inline_mb": 999},
+            "config_version": 1
+        }))
+        .unwrap();
+        assert_eq!(cfg.clipboard.max_inline_mb, MAX_INLINE_MB);
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+        assert_eq!(cfg.clipboard.max_inline_bytes(), 15 * 1024 * 1024);
     }
 
     #[test]

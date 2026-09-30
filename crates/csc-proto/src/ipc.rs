@@ -72,6 +72,71 @@ pub struct AppStatus {
     /// Shown while files are dragged against an edge that leads to a peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_zone: Option<DropZone>,
+    /// Batches this computer is receiving or has just received.
+    #[serde(default)]
+    pub transfers: Vec<TransferProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    #[default]
+    Waiting,
+    /// Names already exist in the target folder; waiting for the user to choose.
+    Conflict,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl TransferState {
+    pub fn finished(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One top-level name that already exists where a batch is going.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferConflict {
+    /// Entry index of the top-level item in the offer.
+    pub index: u32,
+    pub name: String,
+    pub is_directory: bool,
+    pub new_size: u64,
+    pub old_size: u64,
+    pub old_mtime_unix: i64,
+}
+
+/// Progress of one incoming batch, shown in the receiver's transfer window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub id: u64,
+    /// Computer the files come from.
+    pub peer: String,
+    /// Keyboard host that relays them, when not direct.
+    #[serde(default)]
+    pub via: String,
+    pub title: String,
+    pub files_done: u32,
+    pub files_total: u32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub bytes_per_sec: u64,
+    pub state: TransferState,
+    /// Failure reason, or where the files were saved.
+    #[serde(default)]
+    pub message: String,
+    /// Folder the batch goes into.
+    #[serde(default)]
+    pub dest: String,
+    /// The received item to open when there is exactly one.
+    #[serde(default)]
+    pub open_path: String,
+    #[serde(default)]
+    pub conflicts: Vec<TransferConflict>,
 }
 
 /// Screen area (absolute desktop pixels) where a drop sends files to `peer`.
@@ -83,6 +148,10 @@ pub struct DropZone {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Files entering the window start a drag onto the other screen (`drag_enter`).
+    /// Otherwise they are sent when dropped on the window (`send_files`).
+    #[serde(default)]
+    pub virtual_drag: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

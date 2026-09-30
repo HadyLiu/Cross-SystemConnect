@@ -221,6 +221,28 @@ pub fn send_files(peer: &str, paths: &[String]) -> anyhow::Result<Value> {
     call("send_files", json!({"peer": peer, "paths": paths}))
 }
 
+pub fn drag_enter(peer: &str, paths: &[String]) -> anyhow::Result<Value> {
+    call("drag_enter", json!({"peer": peer, "paths": paths}))
+}
+
+pub fn cancel_transfer(id: u64) -> anyhow::Result<Value> {
+    call("cancel_transfer", json!({"id": id}))
+}
+
+pub fn dismiss_transfer(id: u64) -> anyhow::Result<Value> {
+    call("dismiss_transfer", json!({"id": id}))
+}
+
+pub fn resolve_conflict(id: u64, decisions: Value) -> anyhow::Result<Value> {
+    call("resolve_conflict", json!({"transferId": id, "decisions": decisions}))
+}
+
+/// Folder incoming files go to when no drop target named one.
+pub fn receive_dir() -> anyhow::Result<String> {
+    let v = call("receive_dir", json!({}))?;
+    Ok(v.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string())
+}
+
 pub fn rescan() -> anyhow::Result<Value> {
     call("rescan", json!({}))
 }

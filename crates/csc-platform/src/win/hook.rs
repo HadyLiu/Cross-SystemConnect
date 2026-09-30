@@ -4,19 +4,123 @@
 //! so it reaches only the remote computer. The cursor stays on the park point;
 //! each move is reported as the distance from that point.
 //! Windows drops a hook whose callback is slow, so callbacks only queue.
+//!
+//! The same thread reads raw mouse input (movement before the cursor is held
+//! at the screen edge) and, when asked, swallows Ctrl+V so a paste of files
+//! copied on another computer can start a transfer instead.
 
 use crate::keymap::hid_from_scan;
 use crate::traits::Captured;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use tracing::{info, warn};
+use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, SetCursorPos, SetWindowsHookExW, HHOOK, KBDLLHOOKSTRUCT,
-    MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT};
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
+    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, GetMessageW, RegisterClassW, SetCursorPos,
+    SetWindowsHookExW, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+};
+
+const WM_INPUT: u32 = 0x00FF;
+const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
+const VK_V: u32 = 0x56;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+
+static RAW_OK: AtomicBool = AtomicBool::new(false);
+static RAW_DX: AtomicI32 = AtomicI32::new(0);
+static RAW_DY: AtomicI32 = AtomicI32::new(0);
+static PASTE_WANT: AtomicBool = AtomicBool::new(false);
+static PASTE_HITS: AtomicU32 = AtomicU32::new(0);
+
+pub fn take_raw_motion() -> Option<(i32, i32)> {
+    if !RAW_OK.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some((RAW_DX.swap(0, Ordering::AcqRel), RAW_DY.swap(0, Ordering::AcqRel)))
+}
+
+pub fn paste_watch(enable: bool) {
+    PASTE_WANT.store(enable, Ordering::Release);
+    PASTE_HITS.store(0, Ordering::Release);
+}
+
+pub fn paste_hits() -> u32 {
+    PASTE_HITS.swap(0, Ordering::AcqRel)
+}
+
+/// Message-only window receiving WM_INPUT for the mouse even without focus.
+unsafe fn open_raw_input(module: HINSTANCE) -> bool {
+    let class = w!("CscRawInput");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(raw_proc),
+        hInstance: module,
+        lpszClassName: class,
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+    let Ok(hwnd) = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        class,
+        w!(""),
+        WINDOW_STYLE(0),
+        0,
+        0,
+        0,
+        0,
+        HWND_MESSAGE,
+        None,
+        module,
+        None,
+    ) else {
+        return false;
+    };
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
+}
+
+unsafe extern "system" fn raw_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_INPUT {
+        let mut raw = RAWINPUT::default();
+        let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+        let got = GetRawInputData(
+            HRAWINPUT(lparam.0 as _),
+            RID_INPUT,
+            Some(&mut raw as *mut RAWINPUT as *mut _),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        );
+        // Injected input has no device; only a hand on the mouse counts.
+        if got != u32::MAX
+            && raw.header.dwType == RIM_TYPEMOUSE.0
+            && !raw.header.hDevice.is_invalid()
+        {
+            let mouse = raw.data.mouse;
+            if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE == 0 {
+                RAW_DX.fetch_add(mouse.lLastX, Ordering::AcqRel);
+                RAW_DY.fetch_add(mouse.lLastY, Ordering::AcqRel);
+            }
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn key_held(vk: u16) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
 
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -83,6 +187,11 @@ fn hook_thread(ready: std::sync::mpsc::Sender<bool>) {
                 let _ = ready.send(false);
                 return;
             }
+        }
+        let raw = open_raw_input(module);
+        RAW_OK.store(raw, Ordering::Release);
+        if !raw {
+            info!("raw mouse input unavailable; screen edges switch on contact");
         }
         let _ = ready.send(true);
         let mut msg = MSG::default();
@@ -191,6 +300,23 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     hid,
                     down: flags & LLKHF_UP == 0,
                 });
+            }
+            return LRESULT(1);
+        }
+    }
+    if code >= 0 && PASTE_WANT.load(Ordering::Relaxed) && !GRAB.load(Ordering::Relaxed) {
+        let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if info.vkCode == VK_V
+            && info.flags.0 & LLKHF_INJECTED == 0
+            && key_held(VK_CONTROL.0)
+            && !key_held(VK_SHIFT.0)
+            && !key_held(VK_MENU.0)
+            && !key_held(VK_LWIN.0)
+            && !key_held(VK_RWIN.0)
+        {
+            if down {
+                PASTE_HITS.fetch_add(1, Ordering::AcqRel);
             }
             return LRESULT(1);
         }

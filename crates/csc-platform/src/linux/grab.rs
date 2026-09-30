@@ -1,13 +1,141 @@
 //! Local input capture on X11 while the pointer is on a remote computer.
 //! A dedicated thread with its own display connection grabs the pointer and
 //! keyboard, turns events into `Captured`, and holds the cursor at a park point.
+//! The same thread measures raw mouse motion (XInput2), for pushing through a
+//! screen edge, and catches Ctrl+V while files copied elsewhere wait to be pasted.
 
-use super::xdo::{dlopen, sym};
+use super::xdo::{dlopen, dlopen_quiet, sym};
 use crate::traits::Captured;
 use libc::{c_int, c_long, c_uint, c_ulong, c_void};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+type ErrorHandler = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type SetErrorHandler = unsafe extern "C" fn(Option<ErrorHandler>) -> Option<ErrorHandler>;
+type KeysymToKeycode = unsafe extern "C" fn(*mut c_void, c_ulong) -> u8;
+type GrabKey = unsafe extern "C" fn(*mut c_void, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
+type UngrabKey = unsafe extern "C" fn(*mut c_void, c_int, c_uint, c_ulong) -> c_int;
+type QueryExtension =
+    unsafe extern "C" fn(*mut c_void, *const libc::c_char, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+type GetEventData = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type FreeEventData = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type XiSelectEvents = unsafe extern "C" fn(*mut c_void, c_ulong, *mut XiEventMask, c_int) -> c_int;
+type XiQueryVersion = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
+
+#[repr(C)]
+struct XiEventMask {
+    deviceid: c_int,
+    mask_len: c_int,
+    mask: *mut u8,
+}
+
+#[repr(C)]
+struct GenericCookie {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    extension: c_int,
+    evtype: c_int,
+    cookie: c_uint,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct XiRawEvent {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    extension: c_int,
+    evtype: c_int,
+    time: c_ulong,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    flags: c_int,
+    mask_len: c_int,
+    mask: *const u8,
+    values: *const f64,
+    raw_values: *const f64,
+}
+
+const GENERIC_EVENT: c_int = 35;
+const XI_RAW_MOTION: c_int = 17;
+const XI_ALL_MASTER_DEVICES: c_int = 1;
+const XK_V: c_ulong = 0x76;
+const CONTROL_MASK: c_uint = 1 << 2;
+const LOCK_MASK: c_uint = 1 << 1;
+const MOD2_MASK: c_uint = 1 << 4;
+
+static RAW_OK: AtomicBool = AtomicBool::new(false);
+static RAW_DX: AtomicI32 = AtomicI32::new(0);
+static RAW_DY: AtomicI32 = AtomicI32::new(0);
+static PASTE_WANT: AtomicBool = AtomicBool::new(false);
+static PASTE_HITS: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn ignore_x_error(_dpy: *mut c_void, _ev: *mut c_void) -> c_int {
+    0
+}
+
+pub fn take_raw_motion() -> Option<(i32, i32)> {
+    if !RAW_OK.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some((RAW_DX.swap(0, Ordering::AcqRel), RAW_DY.swap(0, Ordering::AcqRel)))
+}
+
+pub fn paste_watch(enable: bool) {
+    if PASTE_WANT.swap(enable, Ordering::AcqRel) != enable {
+        debug!("Ctrl+V watch {}", if enable { "on" } else { "off" });
+    }
+    PASTE_HITS.store(0, Ordering::Release);
+}
+
+pub fn paste_hits() -> u32 {
+    PASTE_HITS.swap(0, Ordering::AcqRel)
+}
+
+/// XInput2 pieces for raw motion; absent on servers without XI 2.
+struct Xi {
+    opcode: c_int,
+    get_data: GetEventData,
+    free_data: FreeEventData,
+}
+
+/// Passive grab of Ctrl+V on the root window.
+struct PasteKey {
+    keycode: c_int,
+    grab: GrabKey,
+    ungrab: UngrabKey,
+    active: bool,
+}
+
+impl PasteKey {
+    const MODS: [c_uint; 4] = [
+        CONTROL_MASK,
+        CONTROL_MASK | LOCK_MASK,
+        CONTROL_MASK | MOD2_MASK,
+        CONTROL_MASK | LOCK_MASK | MOD2_MASK,
+    ];
+
+    unsafe fn set(&mut self, dpy: *mut c_void, root: c_ulong, flush: Flush, on: bool) {
+        if on == self.active || self.keycode == 0 {
+            return;
+        }
+        for m in Self::MODS {
+            if on {
+                (self.grab)(dpy, self.keycode, m, root, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC);
+            } else {
+                (self.ungrab)(dpy, self.keycode, m, root);
+            }
+        }
+        flush(dpy);
+        self.active = on;
+    }
+}
 
 type OpenDisplay = unsafe extern "C" fn(*const libc::c_char) -> *mut c_void;
 type InitThreads = unsafe extern "C" fn() -> c_int;
@@ -84,6 +212,8 @@ struct Api {
     ungrab_pointer: Ungrab,
     ungrab_keyboard: Ungrab,
     warp: WarpPointer,
+    xi: Option<Xi>,
+    paste: PasteKey,
 }
 
 struct Shared {
@@ -171,9 +301,20 @@ unsafe fn open() -> Option<Api> {
     if dpy.is_null() {
         return None;
     }
+    // A refused key grab must not end the process (Xlib's default handler exits).
+    if let Some(set_handler) = sym::<SetErrorHandler>(x11, "XSetErrorHandler") {
+        set_handler(Some(ignore_x_error));
+    }
+    let root = default_root(dpy);
+    let keysym_to_keycode: KeysymToKeycode = sym(x11, "XKeysymToKeycode")?;
+    let xi = open_xi(x11, dpy, root);
+    RAW_OK.store(xi.is_some(), Ordering::Release);
+    if xi.is_none() {
+        info!("XInput2 raw motion unavailable; screen edges switch on contact");
+    }
     Some(Api {
         dpy,
-        root: default_root(dpy),
+        root,
         fd: connection_number(dpy),
         flush: sym(x11, "XFlush")?,
         pending: sym(x11, "XPending")?,
@@ -183,7 +324,71 @@ unsafe fn open() -> Option<Api> {
         ungrab_pointer: sym(x11, "XUngrabPointer")?,
         ungrab_keyboard: sym(x11, "XUngrabKeyboard")?,
         warp: sym(x11, "XWarpPointer")?,
+        xi,
+        paste: PasteKey {
+            keycode: keysym_to_keycode(dpy, XK_V) as c_int,
+            grab: sym(x11, "XGrabKey")?,
+            ungrab: sym(x11, "XUngrabKey")?,
+            active: false,
+        },
     })
+}
+
+/// Select raw motion from all master devices on the root window.
+unsafe fn open_xi(x11: *mut c_void, dpy: *mut c_void, root: c_ulong) -> Option<Xi> {
+    let query_ext: QueryExtension = sym(x11, "XQueryExtension")?;
+    let (mut opcode, mut event, mut error) = (0, 0, 0);
+    let name = b"XInputExtension\0";
+    if query_ext(dpy, name.as_ptr() as *const libc::c_char, &mut opcode, &mut event, &mut error) == 0 {
+        return None;
+    }
+    let xi = dlopen_quiet(b"libXi.so.6\0")?;
+    let query_version: XiQueryVersion = sym(xi, "XIQueryVersion")?;
+    let select: XiSelectEvents = sym(xi, "XISelectEvents")?;
+    let (mut major, mut minor) = (2, 0);
+    if query_version(dpy, &mut major, &mut minor) != 0 || major < 2 {
+        return None;
+    }
+    let mut bits = [0u8; 3];
+    bits[(XI_RAW_MOTION >> 3) as usize] |= 1 << (XI_RAW_MOTION & 7);
+    let mut mask = XiEventMask {
+        deviceid: XI_ALL_MASTER_DEVICES,
+        mask_len: bits.len() as c_int,
+        mask: bits.as_mut_ptr(),
+    };
+    if select(dpy, root, &mut mask, 1) != 0 {
+        return None;
+    }
+    Some(Xi {
+        opcode,
+        get_data: sym(x11, "XGetEventData")?,
+        free_data: sym(x11, "XFreeEventData")?,
+    })
+}
+
+/// Movement of x and y (valuators 0 and 1) in one raw motion event.
+unsafe fn raw_delta(ev: &XiRawEvent) -> (f64, f64) {
+    let (mut dx, mut dy) = (0.0, 0.0);
+    if ev.mask.is_null() || ev.values.is_null() {
+        return (dx, dy);
+    }
+    let mut value = 0usize;
+    for bit in 0..(ev.mask_len.max(0) as usize * 8) {
+        if *ev.mask.add(bit / 8) & (1 << (bit % 8)) == 0 {
+            continue;
+        }
+        let v = *ev.values.add(value);
+        match bit {
+            0 => dx = v,
+            1 => dy = v,
+            _ => {}
+        }
+        value += 1;
+        if bit >= 1 {
+            break;
+        }
+    }
+    (dx, dy)
 }
 
 fn button_event(detail: c_uint, down: bool) -> Option<Captured> {
@@ -214,12 +419,15 @@ struct GrabState {
     warned: bool,
 }
 
-fn run(api: Api) {
+fn run(mut api: Api) {
     let mut grabbed: Option<GrabState> = None;
     let mut buf = [0 as c_long; 24];
+    let mut frac = (0.0f64, 0.0f64);
     loop {
         let want = SHARED.lock().map(|s| s.want).unwrap_or(None);
         unsafe {
+            let catch_paste = want.is_none() && PASTE_WANT.load(Ordering::Acquire);
+            api.paste.set(api.dpy, api.root, api.flush, catch_paste);
             match (want, grabbed.as_mut()) {
                 (Some(park), None) => grabbed = Some(try_grab(&api, park, None)),
                 (Some(park), Some(g)) if g.last_attempt.is_some() => {
@@ -246,6 +454,34 @@ fn run(api: Api) {
 
             while (api.pending)(api.dpy) > 0 {
                 (api.next_event)(api.dpy, buf.as_mut_ptr());
+                let kind = *(buf.as_ptr() as *const c_int);
+                if kind == GENERIC_EVENT {
+                    if let Some(xi) = api.xi.as_ref() {
+                        let cookie = buf.as_mut_ptr() as *mut GenericCookie;
+                        if (*cookie).extension == xi.opcode
+                            && (xi.get_data)(api.dpy, cookie as *mut c_void) != 0
+                        {
+                            if (*cookie).evtype == XI_RAW_MOTION && !(*cookie).data.is_null() {
+                                let (dx, dy) = raw_delta(&*((*cookie).data as *const XiRawEvent));
+                                frac.0 += dx;
+                                frac.1 += dy;
+                                let (ix, iy) = (frac.0.trunc(), frac.1.trunc());
+                                frac = (frac.0 - ix, frac.1 - iy);
+                                RAW_DX.fetch_add(ix as i32, Ordering::AcqRel);
+                                RAW_DY.fetch_add(iy as i32, Ordering::AcqRel);
+                            }
+                            (xi.free_data)(api.dpy, cookie as *mut c_void);
+                        }
+                    }
+                    continue;
+                }
+                if grabbed.is_none() && kind == KEY_PRESS {
+                    let ev = &*(buf.as_ptr() as *const XInputEvent);
+                    if api.paste.active && ev.detail as c_int == api.paste.keycode {
+                        PASTE_HITS.fetch_add(1, Ordering::AcqRel);
+                    }
+                    continue;
+                }
                 let Some(g) = grabbed.as_mut().filter(|g| g.last_attempt.is_none()) else {
                     continue;
                 };
