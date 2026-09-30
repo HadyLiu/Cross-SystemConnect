@@ -12,7 +12,7 @@ mod switch;
 
 use crate::clipboard::ClipboardSync;
 use crate::file_transfer::FileTransfer;
-use crate::ipc::{run_ipc, AppState};
+use crate::ipc::{claim_ipc, serve_ipc, AppState, IpcBusy};
 use crate::layout::ScreenLayout;
 use crate::net::{spawn_network, InboundEvent};
 use crate::prompt::PeerPrompt;
@@ -23,6 +23,7 @@ use csc_platform::{
     create_clipboard, create_input_injector, create_screen_info, query_host_net_info,
 };
 use csc_proto::{encode_switch_leave_bin, AppStatus, ClipOfferPayload, LocalNic, SwitchPayload};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +31,54 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+fn peer_size(
+    sizes: &HashMap<String, csc_platform::ScreenSize>,
+    name: &str,
+    fallback: csc_platform::ScreenSize,
+) -> csc_platform::ScreenSize {
+    sizes
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, size)| *size)
+        .filter(|size| size.width > 1 && size.height > 1)
+        .unwrap_or(fallback)
+}
+
+/// Where the local pointer reappears after it leaves a remote screen.
+/// `leave` is the edge of the remote screen that was crossed.
+fn reentry_point(leave: csc_proto::Edge, screen: csc_platform::ScreenSize) -> (i32, i32) {
+    let w = screen.width.max(2);
+    let h = screen.height.max(2);
+    let inset = 12;
+    match leave.opposite() {
+        csc_proto::Edge::Left => (inset, h / 2),
+        csc_proto::Edge::Right => (w - 1 - inset, h / 2),
+        csc_proto::Edge::Top => (w / 2, inset),
+        csc_proto::Edge::Bottom => (w / 2, h - 1 - inset),
+        csc_proto::Edge::TopLeft => (inset, inset),
+        csc_proto::Edge::TopRight => (w - 1 - inset, inset),
+        csc_proto::Edge::BottomLeft => (inset, h - 1 - inset),
+        csc_proto::Edge::BottomRight => (w - 1 - inset, h - 1 - inset),
+    }
+}
+
+fn release_pointer(
+    grab: &mut bool,
+    leave: Option<csc_proto::Edge>,
+    screen: csc_platform::ScreenSize,
+) {
+    if !*grab {
+        return;
+    }
+    *grab = false;
+    if let Some(edge) = leave {
+        let (x, y) = reentry_point(edge, screen);
+        let (ox, oy) = csc_platform::virtual_origin();
+        csc_platform::warp_cursor(ox + x, oy + y);
+    }
+    csc_platform::set_cursor_visible(true);
+}
 
 fn log_path_of(cfg: &Config) -> PathBuf {
     if !cfg.log.file.is_empty() {
@@ -192,10 +241,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
-    // run_ipc accepts forever. Awaiting it here never reaches NIC discovery or search.
+    // Bind IPC before discovery. A second core must exit so it does not also take port 24900.
+    let ipc_bound = match claim_ipc() {
+        Ok(bound) => bound,
+        Err(err) if err.downcast_ref::<IpcBusy>().is_some() => {
+            info!("core already running, exiting");
+            std::process::exit(0);
+        }
+        Err(err) => return Err(err),
+    };
     let ipc_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_ipc(ipc_state).await {
+        if let Err(e) = serve_ipc(ipc_bound, ipc_state).await {
             warn!("IPC server stopped: {e:#}");
         }
     });
@@ -267,6 +324,12 @@ async fn main() -> anyhow::Result<()> {
     let _file_xfer = FileTransfer::new(receive_root);
     let mut remote_x = 0i32;
     let mut remote_y = 0i32;
+    let mut peer_screens: HashMap<String, csc_platform::ScreenSize> = HashMap::new();
+    let mut grab = false;
+    let mut grab_armed = false;
+    let mut park_x = 0i32;
+    let mut park_y = 0i32;
+    let mut last_miss = Instant::now() - Duration::from_secs(5);
     let mut tick = tokio::time::interval(Duration::from_millis(8));
     let mut next_nic = Instant::now();
 
@@ -275,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
             _ = quit_rx.changed() => {
                 if *quit_rx.borrow_and_update() {
                     info!("quit requested");
+                    release_pointer(&mut grab, None, screen);
                     break;
                 }
             }
@@ -315,27 +379,124 @@ async fn main() -> anyhow::Result<()> {
                     switch.set_enabled(s.sharing_enabled);
                 }
 
-                #[cfg(windows)]
-                {
-                    if switch.enabled() && switch.state() == crate::switch::SwitchState::Local {
-                        let (x, y) = csc_platform::win::cursor_pos();
-                        if let Some(dec) = switch.on_local_cursor(x, y, Instant::now()) {
-                            let payload = SwitchPayload {
-                                edge: dec.edge,
-                                position_pct: dec.position_pct,
-                            };
-                            net.send_to(&dec.neighbor, csc_proto::encode_switch_bin(&payload)).await;
-                            switch.confirm_entered(
-                                dec.edge,
-                                dec.position_pct,
-                                screen,
-                                &mut remote_x,
-                                &mut remote_y,
-                                &dec.neighbor,
-                            );
-                            let mut s = status.write().await;
-                            s.active_screen = dec.neighbor;
-                            info!("switch enter -> {}", s.active_screen);
+                if screen.width > 1 && screen.height > 1 {
+                    if grab && switch.state() == crate::switch::SwitchState::Remote {
+                        if let Some((ax, ay)) = csc_platform::cursor_pos() {
+                            let (ox, oy) = csc_platform::virtual_origin();
+                            let x = ax - ox;
+                            let y = ay - oy;
+                            if !grab_armed {
+                                if (x - park_x).abs() <= 40 && (y - park_y).abs() <= 40 {
+                                    grab_armed = true;
+                                } else {
+                                    csc_platform::warp_cursor(ox + park_x, oy + park_y);
+                                }
+                            } else {
+                                let dx = (x - park_x).clamp(-300, 300);
+                                let dy = (y - park_y).clamp(-300, 300);
+                                if dx != 0 || dy != 0 {
+                                    csc_platform::warp_cursor(ox + park_x, oy + park_y);
+                                    let current = switch.active_remote().to_string();
+                                    let remote = peer_size(&peer_screens, &current, screen);
+                                    if let Some(leave) = switch.on_remote_relative(
+                                        dx,
+                                        dy,
+                                        &mut remote_x,
+                                        &mut remote_y,
+                                        remote,
+                                    ) {
+                                        let local_name = status.read().await.local_name.clone();
+                                        let next = switch.neighbor_from_active(leave.edge);
+                                        let hop = next.as_ref().filter(|name| {
+                                            !name.eq_ignore_ascii_case(&local_name)
+                                                && !name.eq_ignore_ascii_case(&current)
+                                        });
+                                        if let Some(next) = hop {
+                                            let leave_msg = SwitchPayload {
+                                                edge: leave.edge,
+                                                position_pct: leave.position_pct,
+                                            };
+                                            net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                                            let enter = SwitchPayload {
+                                                edge: leave.edge.opposite(),
+                                                position_pct: leave.position_pct,
+                                            };
+                                            net.send_to(&next, csc_proto::encode_switch_bin(&enter)).await;
+                                            let remote = peer_size(&peer_screens, next, screen);
+                                            switch.confirm_entered(
+                                                enter.edge,
+                                                enter.position_pct,
+                                                remote,
+                                                &mut remote_x,
+                                                &mut remote_y,
+                                                next,
+                                            );
+                                            status.write().await.active_screen = next.clone();
+                                            info!("switch hop -> {next}");
+                                        } else {
+                                            let leave_msg = SwitchPayload {
+                                                edge: leave.edge,
+                                                position_pct: leave.position_pct,
+                                            };
+                                            if current.is_empty() {
+                                                net.send_raw(encode_switch_leave_bin(&leave_msg)).await;
+                                            } else {
+                                                net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                                            }
+                                            switch.confirm_returned();
+                                            release_pointer(&mut grab, Some(leave.edge), screen);
+                                            grab_armed = false;
+                                            let mut s = status.write().await;
+                                            s.active_screen = s.local_name.clone();
+                                            info!("switch return");
+                                        }
+                                    } else {
+                                        net.send_mouse_move(dx, dy).await;
+                                    }
+                                }
+                            }
+                        }
+                    } else if grab {
+                        release_pointer(&mut grab, None, screen);
+                        grab_armed = false;
+                    } else if switch.enabled() && switch.state() == crate::switch::SwitchState::Local {
+                        if let Some((ax, ay)) = csc_platform::cursor_pos() {
+                            let (ox, oy) = csc_platform::virtual_origin();
+                            let x = ax - ox;
+                            let y = ay - oy;
+                            if let Some(dec) = switch.on_local_cursor(x, y, Instant::now()) {
+                                if net.has_peer(&dec.neighbor).await {
+                                    let payload = SwitchPayload {
+                                        edge: dec.edge,
+                                        position_pct: dec.position_pct,
+                                    };
+                                    net.send_to(&dec.neighbor, csc_proto::encode_switch_bin(&payload)).await;
+                                    let remote = peer_size(&peer_screens, &dec.neighbor, screen);
+                                    switch.confirm_entered(
+                                        dec.edge,
+                                        dec.position_pct,
+                                        remote,
+                                        &mut remote_x,
+                                        &mut remote_y,
+                                        &dec.neighbor,
+                                    );
+                                    park_x = screen.width / 2;
+                                    park_y = screen.height / 2;
+                                    csc_platform::warp_cursor(ox + park_x, oy + park_y);
+                                    csc_platform::set_cursor_visible(false);
+                                    grab = true;
+                                    grab_armed = false;
+                                    let mut s = status.write().await;
+                                    s.active_screen = dec.neighbor;
+                                    info!("switch enter -> {}", s.active_screen);
+                                } else if last_miss.elapsed() > Duration::from_secs(2) {
+                                    last_miss = Instant::now();
+                                    warn!(
+                                        "pointer hit {:?} but {} has no session; place that computer on an edge in the layout",
+                                        dec.edge, dec.neighbor
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -347,6 +508,8 @@ async fn main() -> anyhow::Result<()> {
                         let mut s = status.write().await;
                         if s.active_screen.eq_ignore_ascii_case(&peer) || s.peer_name.eq_ignore_ascii_case(&peer) {
                             switch.unlock_to_local();
+                            release_pointer(&mut grab, None, screen);
+                            grab_armed = false;
                             s.active_screen = s.local_name.clone();
                         }
                         if !s.peer_name.split(',').any(|n| n.trim().eq_ignore_ascii_case(&peer)) {
@@ -357,7 +520,16 @@ async fn main() -> anyhow::Result<()> {
                         s.connected = !s.peer_name.is_empty();
                     }
                     Some(InboundEvent::Hello(h)) => {
-                        info!("HELLO from {}", h.host_name);
+                        info!("HELLO from {} ({}x{})", h.host_name, h.screen_width, h.screen_height);
+                        if h.screen_width > 1 && h.screen_height > 1 {
+                            peer_screens.insert(
+                                h.host_name,
+                                csc_platform::ScreenSize {
+                                    width: h.screen_width,
+                                    height: h.screen_height,
+                                },
+                            );
+                        }
                     }
                     Some(InboundEvent::Heartbeat) => {}
                     Some(InboundEvent::SwitchEnter(p)) => {
@@ -390,26 +562,18 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         switch.confirm_returned();
+                        release_pointer(&mut grab, Some(p.edge), screen);
+                        grab_armed = false;
                         let mut s = status.write().await;
                         s.active_screen = s.local_name.clone();
                     }
                     Some(InboundEvent::MouseMove { dx, dy }) => {
-                        if switch.state() == crate::switch::SwitchState::Remote {
-                            if let Some(leave) =
-                                switch.on_remote_relative(dx, dy, &mut remote_x, &mut remote_y, screen)
-                            {
-                                let payload = SwitchPayload {
-                                    edge: leave.edge,
-                                    position_pct: leave.position_pct,
-                                };
-                                net.send_raw(encode_switch_leave_bin(&payload)).await;
-                                switch.confirm_returned();
-                            } else {
-                                injector.mouse_move_abs(remote_x, remote_y);
-                            }
-                        } else {
-                            net.send_mouse_move(dx, dy).await;
-                            injector.mouse_move_rel(dx, dy);
+                        if !grab {
+                            let w = screen.width.max(1);
+                            let h = screen.height.max(1);
+                            remote_x = remote_x.saturating_add(dx).clamp(0, w - 1);
+                            remote_y = remote_y.saturating_add(dy).clamp(0, h - 1);
+                            injector.mouse_move_abs(remote_x, remote_y);
                         }
                     }
                     Some(InboundEvent::Key { hid, down }) => {

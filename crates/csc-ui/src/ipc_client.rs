@@ -105,9 +105,8 @@ pub fn call(method: &str, params: Value) -> anyhow::Result<Value> {
     match call_raw(method, &params) {
         Ok(resp) => decode_response(resp),
         Err(err) if core_is_down(&err) => {
-            ensure_core_running().map_err(|start| {
-                anyhow::anyhow!("{start}（套接字 {}）", ipc_endpoint())
-            })?;
+            ensure_core_running()
+                .map_err(|start| anyhow::anyhow!("{start}（套接字 {}）", ipc_endpoint()))?;
             decode_response(call_raw(method, &params)?)
         }
         Err(err) => Err(err),
@@ -194,6 +193,9 @@ fn spawn_core() -> anyhow::Result<()> {
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
+            if try_connect() {
+                return Ok(());
+            }
             anyhow::bail!(
                 "内核已退出 ({status})，无法读取配置、日志和计算机名。端点 {}",
                 ipc_endpoint()

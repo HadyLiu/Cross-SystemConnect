@@ -29,35 +29,80 @@ pub struct AppState {
 ///
 /// Returns once the endpoint exists. Callers can talk to the core immediately;
 /// the accept loop keeps running on a spawned task.
-pub async fn run_ipc(state: Arc<AppState>) -> anyhow::Result<()> {
+/// The IPC endpoint is already owned by a running core.
+#[derive(Debug)]
+pub struct IpcBusy;
+
+impl std::fmt::Display for IpcBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IPC endpoint already served")
+    }
+}
+
+impl std::error::Error for IpcBusy {}
+
+pub enum IpcBound {
+    #[cfg(windows)]
+    Pipe(tokio::net::windows::named_pipe::NamedPipeServer),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+/// Bind the pipe or socket before discovery starts. A second process gets [`IpcBusy`]
+/// and must exit instead of binding the control port as well.
+pub fn claim_ipc() -> anyhow::Result<IpcBound> {
     #[cfg(windows)]
     {
-        run_ipc_windows(state).await
+        claim_pipe()
     }
     #[cfg(unix)]
     {
-        let listener = bind_unix_listener()?;
-        tokio::spawn(async move {
-            if let Err(e) = serve_unix(listener, state).await {
-                warn!("IPC server stopped: {e:#}");
-            }
-        });
-        Ok(())
+        bind_unix_listener().map(IpcBound::Unix)
+    }
+}
+
+pub async fn serve_ipc(bound: IpcBound, state: Arc<AppState>) -> anyhow::Result<()> {
+    match bound {
+        #[cfg(windows)]
+        IpcBound::Pipe(first) => serve_pipe(first, state).await,
+        #[cfg(unix)]
+        IpcBound::Unix(listener) => serve_unix(listener, state).await,
     }
 }
 
 #[cfg(windows)]
-async fn run_ipc_windows(state: Arc<AppState>) -> anyhow::Result<()> {
+fn claim_pipe() -> anyhow::Result<IpcBound> {
     use tokio::net::windows::named_pipe::ServerOptions;
     const PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
-    info!("IPC listening on {PIPE}");
-    let mut first = true;
+    match ServerOptions::new().first_pipe_instance(true).create(PIPE) {
+        Ok(server) => {
+            info!("IPC listening on {PIPE}");
+            Ok(IpcBound::Pipe(server))
+        }
+        Err(err) if pipe_busy(&err) => Err(IpcBusy.into()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(windows)]
+fn pipe_busy(err: &std::io::Error) -> bool {
+    // 5 access denied, 231 pipe busy, 183 already exists: another core owns the pipe.
+    matches!(err.raw_os_error(), Some(5 | 183 | 231))
+        || err.kind() == std::io::ErrorKind::AddrInUse
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(windows)]
+async fn serve_pipe(
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    const PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
+    let mut pending = Some(first);
     loop {
-        let server = if first {
-            first = false;
-            ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(PIPE)?
+        let server = if let Some(server) = pending.take() {
+            server
         } else {
             ServerOptions::new().create(PIPE)?
         };
@@ -109,7 +154,8 @@ fn bind_unix_listener() -> anyhow::Result<tokio::net::UnixListener> {
         match UnixStream::connect(&path) {
             Ok(stream) => {
                 drop(stream);
-                anyhow::bail!("IPC socket already served at {}", path.display());
+                info!("IPC socket already served at {}", path.display());
+                return Err(IpcBusy.into());
             }
             Err(_) => {
                 let _ = fs::remove_file(&path);
@@ -226,9 +272,8 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .unwrap_or("");
             let choice = match decision {
                 "trust" => Choice::Trust,
-                "once" => Choice::Once,
-                "reject" => Choice::Reject,
-                _ => return IpcResponse::err(req.id, "decision must be trust, once, or reject"),
+                "reject" | "cancel" | "once" => Choice::Reject,
+                _ => return IpcResponse::err(req.id, "decision must be trust or reject"),
             };
             match state.prompt.resolve(&state.status, host, choice).await {
                 Ok(()) => IpcResponse::ok(req.id, json!({"ok": true})),

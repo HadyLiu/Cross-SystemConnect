@@ -121,6 +121,10 @@ impl NetHub {
         self.peers.send_to(peer, frame).await;
     }
 
+    pub async fn has_peer(&self, name: &str) -> bool {
+        self.peers.contains(name).await
+    }
+
     pub async fn send_mouse_move(&self, dx: i32, dy: i32) {
         self.send_raw(encode_mouse_move_bin(&MouseMovePayload { dx, dy }))
             .await;
@@ -238,7 +242,21 @@ async fn run_role(
             )
             .await
         }
-        Role::Client => run_client(snapshot, local_host, local_ips, status, peers, inbound).await,
+        Role::Client => {
+            run_client(
+                snapshot,
+                cfg,
+                config_path,
+                app_status,
+                prompt,
+                local_host,
+                local_ips,
+                status,
+                peers,
+                inbound,
+            )
+            .await
+        }
     }
 }
 
@@ -257,10 +275,10 @@ pub enum InboundEvent {
 
 async fn run_server(
     cfg: &Config,
-    live: &Arc<RwLock<Config>>,
-    config_path: &PathBuf,
+    _live: &Arc<RwLock<Config>>,
+    _config_path: &PathBuf,
     app_status: &Arc<RwLock<AppStatus>>,
-    prompt: &Arc<PeerPrompt>,
+    _prompt: &Arc<PeerPrompt>,
     local_host: &str,
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
@@ -278,7 +296,6 @@ async fn run_server(
     let mut buf = [0u8; 2048];
     let (stop_tx, stop_rx) = watch::channel(false);
     let _stop = StopOnDrop(stop_tx);
-    let rejected: Arc<Mutex<HashMap<String, RejectMark>>> = Arc::new(Mutex::new(HashMap::new()));
     let inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut seen: HashMap<String, (DiscoveredPeer, Instant)> = HashMap::new();
 
@@ -318,36 +335,18 @@ async fn run_server(
                 if peers.contains(&key).await || inflight.lock().await.contains(&key) {
                     continue;
                 }
-                {
-                    let mut rej = rejected.lock().await;
-                    if let Some(mark) = rej.get_mut(&key) {
-                        if suppress_repeat(mark, Instant::now()) {
-                            continue;
-                        }
-                        rej.remove(&key);
-                    }
-                }
                 let tcp_port = if ann.tcp_port == 0 { port } else { ann.tcp_port };
                 let peer_addr = SocketAddr::new(src.ip(), tcp_port);
                 inflight.lock().await.insert(key.clone());
-                let trusted = live.read().await.is_trusted_peer(&ann.host_name)
-                    || live.read().await.is_trusted_peer(&key);
                 spawn_server_link(
                     cfg.clone(),
-                    live.clone(),
-                    config_path.clone(),
-                    app_status.clone(),
-                    prompt.clone(),
                     peers.clone(),
                     inbound.clone(),
                     status.clone(),
-                    rejected.clone(),
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
-                    display,
                     peer_addr,
-                    trusted,
                 );
             }
         }
@@ -356,71 +355,33 @@ async fn run_server(
 
 fn spawn_server_link(
     cfg: Config,
-    live: Arc<RwLock<Config>>,
-    config_path: PathBuf,
-    app_status: Arc<RwLock<AppStatus>>,
-    prompt: Arc<PeerPrompt>,
     peers: PeerTable,
     inbound: mpsc::Sender<InboundEvent>,
     status: Arc<RwLock<NetStatus>>,
-    rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
     inflight: Arc<Mutex<HashSet<String>>>,
     mut stop: watch::Receiver<bool>,
     key: String,
-    display: String,
     peer_addr: SocketAddr,
-    trusted: bool,
 ) {
     tokio::spawn(async move {
-        let choice = if trusted {
-            info!("trusted client {key} at {peer_addr}, connecting");
-            Choice::Trust
-        } else {
-            info!("client connection request from {key} at {peer_addr}");
-            prompt
-                .ask(&app_status, &display, &key, &peer_addr.to_string())
-                .await
-        };
-        let connect = match choice {
-            Choice::Trust => {
-                let mut c = live.write().await;
-                if c.trust_peer(&key) {
-                    if let Err(e) = c.save(&config_path) {
-                        warn!("save trusted peer: {e:#}");
-                    }
-                }
-                true
-            }
-            Choice::Once => true,
-            Choice::Reject => {
-                info!("client {key} rejected");
-                rejected
-                    .lock()
-                    .await
-                    .insert(key.clone(), reject_mark(Instant::now()));
-                false
-            }
-        };
-        if connect {
-            match connect_peer(peer_addr).await {
-                Ok(stream) => {
-                    info!("connected to client {peer_addr}");
-                    let (tx, rx) = mpsc::channel(64);
-                    peers.insert(&key, tx).await;
-                    refresh_link_status(&status, &peers).await;
-                    tokio::select! {
-                        result = session(&cfg, stream, &status, key.clone(), rx, inbound) => {
-                            if let Err(e) = result {
-                                warn!("session {key} ended: {e:#}");
-                            }
+        match connect_peer(peer_addr).await {
+            Ok(stream) => {
+                info!("connected to client {key} at {peer_addr}");
+                let (tx, rx) = mpsc::channel(64);
+                peers.insert(&key, tx).await;
+                refresh_link_status(&status, &peers).await;
+                tokio::select! {
+                    result = session(&cfg, stream, &status, key.clone(), rx, inbound, None, None) => {
+                        if let Err(e) = result {
+                            warn!("session {key} ended: {e:#}");
                         }
-                        _ = stop.changed() => {}
                     }
-                    peers.remove(&key).await;
-                    refresh_link_status(&status, &peers).await;
+                    _ = stop.changed() => {}
                 }
-                Err(e) => warn!("connect {peer_addr}: {e:#}"),
+                peers.remove(&key).await;
+                refresh_link_status(&status, &peers).await;
             }
+            Err(e) => warn!("connect {peer_addr}: {e:#}"),
         }
         inflight.lock().await.remove(&key);
     });
@@ -428,6 +389,10 @@ fn spawn_server_link(
 
 async fn run_client(
     cfg: &Config,
+    live: &Arc<RwLock<Config>>,
+    config_path: &PathBuf,
+    app_status: &Arc<RwLock<AppStatus>>,
+    prompt: &Arc<PeerPrompt>,
     local_host: &str,
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
@@ -456,6 +421,7 @@ async fn run_client(
     });
     let (stop_tx, stop_rx) = watch::channel(false);
     let _stop = StopOnDrop(stop_tx);
+    let rejected: Arc<Mutex<HashMap<String, RejectMark>>> = Arc::new(Mutex::new(HashMap::new()));
     let targets = scan_targets(cfg, port, local_ips);
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "本机网段".into());
     info!("announcing on UDP port {port} toward {subnet}");
@@ -483,19 +449,31 @@ async fn run_client(
             acc = listener.accept() => {
                 let (stream, peer) = acc?;
                 let _ = stream.set_nodelay(true);
-                info!("server connected from {peer}");
+                info!("keyboard host connected from {peer}");
                 let key = peer.ip().to_string();
                 let (tx, rx) = mpsc::channel(64);
-                peers.insert(&key, tx).await;
-                refresh_link_status(status, peers).await;
                 let cfg = cfg.clone();
                 let status = status.clone();
                 let peers = peers.clone();
                 let inbound = inbound.clone();
                 let mut stop = stop_rx.clone();
+                let link = ClientLink {
+                    peers: peers.clone(),
+                    status: status.clone(),
+                    key: key.clone(),
+                    tx,
+                };
+                let admit = Admit {
+                    app_status: app_status.clone(),
+                    prompt: prompt.clone(),
+                    live: live.clone(),
+                    config_path: config_path.clone(),
+                    rejected: rejected.clone(),
+                    address: peer.to_string(),
+                };
                 tokio::spawn(async move {
                     tokio::select! {
-                        result = session(&cfg, stream, &status, key.clone(), rx, inbound) => {
+                        result = session(&cfg, stream, &status, key.clone(), rx, inbound, Some(link), Some(admit)) => {
                             if let Err(e) = result {
                                 warn!("client session {key} ended: {e:#}");
                             }
@@ -613,6 +591,22 @@ async fn connect_peer(addr: SocketAddr) -> anyhow::Result<TcpStream> {
     Ok(stream)
 }
 
+struct ClientLink {
+    peers: PeerTable,
+    status: Arc<RwLock<NetStatus>>,
+    key: String,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+struct Admit {
+    app_status: Arc<RwLock<AppStatus>>,
+    prompt: Arc<PeerPrompt>,
+    live: Arc<RwLock<Config>>,
+    config_path: PathBuf,
+    rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
+    address: String,
+}
+
 async fn session(
     cfg: &Config,
     stream: TcpStream,
@@ -620,20 +614,72 @@ async fn session(
     peer: String,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     mut inbound: mpsc::Sender<InboundEvent>,
+    link: Option<ClientLink>,
+    admit: Option<Admit>,
 ) -> anyhow::Result<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
 
+    let size = csc_platform::create_screen_info().virtual_size();
     let hello = HelloPayload {
         protocol_version: 1,
         host_name: cfg.name.clone(),
-        screen_width: 0,
-        screen_height: 0,
+        screen_width: size.width,
+        screen_height: size.height,
         capabilities: 0,
     };
     {
         let mut w = writer.lock().await;
         w.write_all(&encode_hello_bin(&hello)).await?;
+    }
+
+    let mut buf = BytesMut::with_capacity(64 * 1024);
+    if let Some(admit) = admit {
+        let (remote, _early) = match tokio::time::timeout(
+            Duration::from_secs(5),
+            read_until_hello(&mut reader, &mut buf),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
+                warn!("control request from {}: {e:#}", admit.address);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!("control request from {} timed out", admit.address);
+                return Ok(());
+            }
+        };
+        // Keep reading while the user decides, so the host's send buffer cannot fill.
+        let announced = remote.clone();
+        let mut decision = std::pin::pin!(allow_control(&admit, &remote));
+        let mut discard = [0u8; 4096];
+        loop {
+            while try_decode_frame(&mut buf)?.is_some() {}
+            tokio::select! {
+                allowed = &mut decision => {
+                    if !allowed {
+                        return Ok(());
+                    }
+                    break;
+                }
+                read = reader.read(&mut discard) => {
+                    let n = read?;
+                    if n == 0 {
+                        info!("keyboard host {} closed while waiting", admit.address);
+                        return Ok(());
+                    }
+                    buf.extend_from_slice(&discard[..n]);
+                }
+            }
+        }
+        let _ = inbound.send(InboundEvent::Hello(announced)).await;
+    }
+
+    if let Some(link) = link {
+        link.peers.insert(&link.key, link.tx).await;
+        refresh_link_status(&link.status, &link.peers).await;
     }
 
     let hb_writer = writer.clone();
@@ -654,7 +700,6 @@ async fn session(
         }
     });
 
-    let mut buf = BytesMut::with_capacity(64 * 1024);
     let mut tmp = [0u8; 16 * 1024];
     loop {
         tokio::select! {
@@ -691,6 +736,83 @@ async fn session(
 
     heartbeat.abort();
     Ok(())
+}
+
+async fn read_until_hello(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    buf: &mut BytesMut,
+) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)> {
+    let mut early = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        loop {
+            match try_decode_frame(buf)? {
+                None => break,
+                Some(frame) if frame.msg_type == MsgType::Hello => {
+                    let hello = decode_hello_bin(&frame.payload)
+                        .ok_or_else(|| anyhow::anyhow!("bad hello"))?;
+                    return Ok((hello, early));
+                }
+                Some(frame) => early.push(frame),
+            }
+        }
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            anyhow::bail!("closed before hello");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn allow_control(admit: &Admit, hello: &HelloPayload) -> bool {
+    let name = if hello.host_name.is_empty() {
+        admit.address.clone()
+    } else {
+        hello.host_name.clone()
+    };
+    {
+        let mut rejected = admit.rejected.lock().await;
+        if let Some(mark) = rejected.get_mut(&name) {
+            if suppress_repeat(mark, Instant::now()) {
+                info!("ignoring {name} after cancel");
+                return false;
+            }
+            rejected.remove(&name);
+        }
+    }
+    let trusted = {
+        let cfg = admit.live.read().await;
+        cfg.is_trusted_peer(&name) || cfg.is_trusted_peer(&hello.host_name)
+    };
+    if trusted {
+        info!("trusted keyboard host {name}");
+        return true;
+    }
+    info!("keyboard host {name} requested control");
+    let choice = admit
+        .prompt
+        .ask(&admit.app_status, &name, &name, &admit.address)
+        .await;
+    match choice {
+        Choice::Trust => {
+            let mut cfg = admit.live.write().await;
+            if cfg.trust_peer(&name) {
+                if let Err(e) = cfg.save(&admit.config_path) {
+                    warn!("save trusted peer: {e:#}");
+                }
+            }
+            true
+        }
+        Choice::Reject => {
+            info!("control from {name} cancelled");
+            admit
+                .rejected
+                .lock()
+                .await
+                .insert(name, reject_mark(Instant::now()));
+            false
+        }
+    }
 }
 
 async fn dispatch_frame(

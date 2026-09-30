@@ -55,11 +55,62 @@ pub fn create_screen_info() -> Box<dyn ScreenInfo> {
     {
         Box::new(win::WinScreenInfo)
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Box::new(linux::LinuxScreenInfo)
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
         Box::new(stub::StubScreenInfo)
     }
 }
+
+/// Cursor position in virtual-desktop pixels. `None` when this platform cannot read it.
+#[cfg(windows)]
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    Some(win::cursor_pos())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    linux::pointer_pos()
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    None
+}
+
+#[cfg(windows)]
+pub fn virtual_origin() -> (i32, i32) {
+    win::virtual_origin()
+}
+
+#[cfg(not(windows))]
+pub fn virtual_origin() -> (i32, i32) {
+    (0, 0)
+}
+
+#[cfg(windows)]
+pub fn warp_cursor(x: i32, y: i32) {
+    win::warp_cursor(x, y);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn warp_cursor(x: i32, y: i32) {
+    linux::warp_cursor(x, y);
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+pub fn warp_cursor(_x: i32, _y: i32) {}
+
+#[cfg(windows)]
+pub fn set_cursor_visible(visible: bool) {
+    win::set_cursor_visible(visible);
+}
+
+#[cfg(not(windows))]
+pub fn set_cursor_visible(_visible: bool) {}
 
 pub fn create_auto_start() -> Box<dyn AutoStart> {
     Box::new(stub::StubAutoStart::default())

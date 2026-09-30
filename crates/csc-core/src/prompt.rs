@@ -1,4 +1,4 @@
-//! Queued client connection prompts (trust / this time / reject).
+//! Queued control prompts shown on the controlled computer (trust / cancel).
 //!
 //! A later request does not cancel an earlier one. The UI shows the front of the queue.
 
@@ -10,7 +10,6 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Trust,
-    Once,
     Reject,
 }
 

@@ -1,4 +1,6 @@
-use crate::stub::{StubInputCapture, StubInputInjector};
+mod xdo;
+
+use crate::stub::StubInputCapture;
 use crate::traits::*;
 use tracing::info;
 
@@ -34,32 +36,55 @@ impl InputCapture for LinuxInputCapture {
     }
 }
 
-pub struct LinuxInputInjector {
-    inner: StubInputInjector,
-}
+pub struct LinuxInputInjector;
 
 impl LinuxInputInjector {
     pub fn new() -> Self {
-        Self {
-            inner: StubInputInjector,
-        }
+        Self
     }
 }
 
 impl InputInjector for LinuxInputInjector {
     fn mouse_move_abs(&mut self, x: i32, y: i32) {
-        self.inner.mouse_move_abs(x, y);
+        xdo::move_abs(x, y);
     }
     fn mouse_move_rel(&mut self, dx: i32, dy: i32) {
-        self.inner.mouse_move_rel(dx, dy);
+        xdo::move_rel(dx, dy);
     }
     fn mouse_button(&mut self, button: u32, down: bool) {
-        self.inner.mouse_button(button, down);
+        xdo::button(button, down);
     }
-    fn mouse_wheel(&mut self, v: i32, h: i32) {
-        self.inner.mouse_wheel(v, h);
+    fn mouse_wheel(&mut self, v: i32, _h: i32) {
+        let xbtn = if v > 0 {
+            4
+        } else if v < 0 {
+            5
+        } else {
+            return;
+        };
+        xdo::x_button(xbtn, true);
+        xdo::x_button(xbtn, false);
     }
-    fn key(&mut self, hid_usage: u32, down: bool) {
-        self.inner.key(hid_usage, down);
+    fn key(&mut self, _hid_usage: u32, _down: bool) {}
+}
+
+pub struct LinuxScreenInfo;
+
+impl ScreenInfo for LinuxScreenInfo {
+    fn virtual_size(&self) -> ScreenSize {
+        xdo::screen_size()
+            .map(|(width, height)| ScreenSize { width, height })
+            .unwrap_or(ScreenSize {
+                width: 1920,
+                height: 1080,
+            })
     }
+}
+
+pub(crate) fn pointer_pos() -> Option<(i32, i32)> {
+    xdo::pointer()
+}
+
+pub(crate) fn warp_cursor(x: i32, y: i32) {
+    xdo::warp(x, y);
 }

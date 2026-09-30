@@ -17,9 +17,9 @@ impl WinInputInjector {
 
 impl InputInjector for WinInputInjector {
     fn mouse_move_abs(&mut self, x: i32, y: i32) {
-        // Use absolute virtual-desktop coords via SetCursorPos for simplicity.
+        let (ox, oy) = super::virtual_origin();
         unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(ox + x, oy + y);
         }
     }
 

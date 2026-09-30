@@ -67,7 +67,7 @@ body{
 .ip-chip.on{border-color:var(--accent);background:rgba(59,130,246,.22);color:#fff}
 .screen-card{margin-top:14px}
 .desk{
-  position:relative;height:420px;margin-top:10px;border-radius:12px;overflow:hidden;
+  position:relative;width:440px;height:296px;margin:10px auto 0;border-radius:12px;overflow:hidden;
   background:#101218;border:1px solid var(--line);touch-action:none;
 }
 .mon{
@@ -279,7 +279,7 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <ul>
             <li>两台电脑选同一网段的网卡。以太网和 Wi-Fi 都会列出，有以太网时默认用以太网。</li>
             <li>端口在「设置」里，不改则是 24900。两边必须相同，并在防火墙上放行该端口的 UDP 和 TCP。</li>
-            <li>主机搜索时可以同时连多台。新电脑会排队询问：信任（下次不再问）、仅本次、或拒绝。</li>
+            <li>主机搜索时可以同时连多台。被控端会询问是否允许这台键鼠主机控制：信任后不再询问，取消则拒绝。</li>
             <li>计算机名只在本软件里使用，不会修改 Windows 或 Linux 的计算机名。布局里的名字要和对方的计算机名一致。</li>
           </ul>
         </div>
@@ -301,14 +301,13 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
   </div>
   <div class="modal" id="peerModal">
     <div class="modal-card">
-      <h2>客户端连接请求</h2>
+      <h2>键鼠主机请求控制</h2>
       <p id="peerText"></p>
       <div class="modal-actions">
-        <button type="button" class="btn" id="peerTrust">信任</button>
-        <button type="button" class="btn primary on" id="peerOnce">✓ 仅本次</button>
-        <button type="button" class="btn" id="peerReject">拒绝</button>
+        <button type="button" class="btn primary" id="peerTrust">信任</button>
+        <button type="button" class="btn" id="peerReject">取消</button>
       </div>
-      <p class="hint">默认勾选「仅本次」。信任后下次不再询问；拒绝或仅本次，下次连接仍会询问。搜索不会停，后面的电脑会排队询问。</p>
+      <p class="hint">信任后这台键鼠主机下次不再询问。取消则拒绝本次控制。后面的主机仍会排队询问。</p>
     </div>
   </div>
 </div>
@@ -345,7 +344,9 @@ let livePeers=[];
 let liveSig='';
 let drag=null;
 let placesDirty=false;
-const SLOTS=[[210,0],[-210,0],[0,150],[0,-150],[210,150],[-210,150],[210,-150],[-210,-150]];
+const MON_W=132, MON_H=84, GAP=5;
+const STEP_X=MON_W+GAP, STEP_Y=MON_H+GAP;
+const SLOTS=[[STEP_X,0],[-STEP_X,0],[0,STEP_Y],[0,-STEP_Y],[STEP_X,STEP_Y],[-STEP_X,STEP_Y],[STEP_X,-STEP_Y],[-STEP_X,-STEP_Y]];
 
 function computerName(){
   return ($('name').value||'').trim();
@@ -408,20 +409,62 @@ function portValue(){
   if(!Number.isInteger(n)||n<1||n>65535) return 24900;
   return n;
 }
+function fromSaved(x, y){
+  if(Math.abs(x)<=4&&Math.abs(y)<=4) return {x:x*STEP_X, y:y*STEP_Y};
+  for(const [sx,sy] of [[210,150],[142,94]]){
+    const ix=Math.round(x/sx), iy=Math.round(y/sy);
+    if(Math.abs(x-ix*sx)<=2&&Math.abs(y-iy*sy)<=2&&Math.abs(ix)<=8&&Math.abs(iy)<=8){
+      return {x:ix*STEP_X, y:iy*STEP_Y};
+    }
+  }
+  return {x, y};
+}
+function onRing(x, y){
+  if(x===0&&y===0) return false;
+  const ix=Math.round(x/STEP_X), iy=Math.round(y/STEP_Y);
+  return Math.abs(x-ix*STEP_X)<=1&&Math.abs(y-iy*STEP_Y)<=1;
+}
 function loadPlaces(list, self){
   const raw=(list||[]).filter(s=>s&&s.name&&s.name!==self).map(s=>({
     name:String(s.name), x:Number(s.x)||0, y:Number(s.y)||0
   }));
-  const grid=raw.length>0&&raw.every(s=>Math.abs(s.x)<=4&&Math.abs(s.y)<=4);
-  places=raw.map(s=>grid?{name:s.name, x:s.x*210, y:s.y*150}:s);
+  places=[];
+  let moved=false;
+  raw.forEach(s=>{
+    const mapped=fromSaved(s.x, s.y);
+    const pos=onRing(mapped.x, mapped.y)?mapped:nearestSlot(mapped.x, mapped.y, s.name);
+    if(pos.x!==s.x||pos.y!==s.y) moved=true;
+    places.push({name:s.name, x:pos.x, y:pos.y});
+  });
+  if(moved) placesDirty=true;
+}
+function nearestSlot(x, y, name){
+  const taken=new Set(places.filter(p=>p.name!==name).map(p=>p.x+','+p.y));
+  let best=null, bestD=1e18;
+  for(const s of SLOTS){
+    if(taken.has(s[0]+','+s[1])) continue;
+    const d=(s[0]-x)*(s[0]-x)+(s[1]-y)*(s[1]-y);
+    if(d<bestD){ bestD=d; best=s; }
+  }
+  if(best) return {x:best[0], y:best[1]};
+  let near=SLOTS[0], nd=1e18;
+  for(const s of SLOTS){
+    const d=(s[0]-x)*(s[0]-x)+(s[1]-y)*(s[1]-y);
+    if(d<nd){ nd=d; near=s; }
+  }
+  const side=sectorOf(near[0], near[1]);
+  const n=places.filter(p=>p.name!==name && sectorOf(p.x, p.y)===side).length;
+  return {x:near[0]*(n+1), y:near[1]*(n+1)};
 }
 function slotForNew(){
   const used=new Set(places.map(s=>s.x+','+s.y));
   for(const s of SLOTS){
     if(!used.has(s[0]+','+s[1])) return {x:s[0], y:s[1]};
   }
-  const i=places.length;
-  return {x:210+((i%3)*40), y:((i%2)?150:-150)};
+  const i=places.length-SLOTS.length;
+  const s=SLOTS[Math.max(0,i)%SLOTS.length];
+  const ring=2+Math.floor(Math.max(0,i)/SLOTS.length);
+  return {x:s[0]*ring, y:s[1]*ring};
 }
 function ensurePlace(name){
   let pos=places.find(s=>s.name===name);
@@ -527,19 +570,12 @@ document.addEventListener('pointerup', e=>{
   const name=drag.name;
   drag=null;
   const r=$('desk').getBoundingClientRect();
-  let x=Math.round(e.clientX-(r.left+r.width/2));
-  let y=Math.round(e.clientY-(r.top+r.height/2));
-  const limX=Math.max(80, r.width/2-80);
-  const limY=Math.max(60, r.height/2-50);
-  x=Math.max(-limX, Math.min(limX, x));
-  y=Math.max(-limY, Math.min(limY, y));
-  if(Math.abs(x)<80&&Math.abs(y)<56){
-    if(Math.abs(x)>=Math.abs(y)) x=x<0?-80:80;
-    else y=y<0?-56:56;
-  }
+  const x=e.clientX-(r.left+r.width/2);
+  const y=e.clientY-(r.top+r.height/2);
+  const snap=nearestSlot(x, y, name);
   let pos=places.find(s=>s.name===name);
-  if(!pos){ pos={name,x,y}; places.push(pos); }
-  else { pos.x=x; pos.y=y; }
+  if(!pos){ pos={name, x:snap.x, y:snap.y}; places.push(pos); }
+  else { pos.x=snap.x; pos.y=snap.y; }
   renderDesk();
   scheduleSave();
 });
@@ -752,9 +788,9 @@ function showPeer(p){
   if(peerShown===p.hostName && modal.classList.contains('show')) return;
   peerShown=p.hostName;
   const who=(p.name&&p.name!==p.hostName)?(p.name+'（'+p.hostName+'）'):(p.name||p.hostName);
-  $('peerText').textContent=who+' 请求连接，来自 '+(p.address||'未知地址')+'。';
+  $('peerText').textContent=who+' 请求控制这台电脑，来自 '+(p.address||'未知地址')+'。';
   modal.classList.add('show');
-  $('peerOnce').focus();
+  $('peerReject').focus();
 }
 async function decidePeer(decision){
   if(deciding||!peerShown) return;
@@ -771,7 +807,7 @@ async function decidePeer(decision){
     $('peerModal').classList.remove('show');
     const msg=$('msg');
     msg.className='ok';
-    msg.textContent=decision==='trust'?'已信任，下次不再询问':(decision==='once'?'已允许本次连接':'已拒绝');
+    msg.textContent=decision==='trust'?'已信任，下次不再询问':'已取消';
   }catch(e){
     const msg=$('msg');
     msg.className='err';
@@ -781,7 +817,6 @@ async function decidePeer(decision){
   }
 }
 $('peerTrust').onclick=()=>decidePeer('trust');
-$('peerOnce').onclick=()=>decidePeer('once');
 $('peerReject').onclick=()=>decidePeer('reject');
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);

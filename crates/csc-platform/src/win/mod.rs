@@ -7,6 +7,9 @@ pub use capture::WinInputCapture;
 pub use host_net::fill_host_net;
 pub use injector::WinInputInjector;
 pub use screen::cursor_pos;
+pub use screen::set_cursor_visible;
+pub use screen::virtual_origin;
+pub use screen::warp_cursor;
 pub use screen::WinScreenInfo;
 
 pub fn disable_udp_connreset(raw: std::os::windows::io::RawSocket) {
