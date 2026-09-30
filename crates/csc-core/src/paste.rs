@@ -60,7 +60,11 @@ impl SharedClip {
             return None;
         }
         if let Some((seq, from, to, at)) = &self.last {
-            if *seq == owner.seq && same(from, &owner.peer) && same(to, target) && now.duration_since(*at) < REPEAT {
+            if *seq == owner.seq
+                && same(from, &owner.peer)
+                && same(to, target)
+                && now.duration_since(*at) < REPEAT
+            {
                 return Some(PasteAction::Repeat);
             }
         }
@@ -101,17 +105,28 @@ mod tests {
         c.copied("", 1, true);
         assert!(!c.remote_files());
         assert_eq!(c.paste("", t), None, "local paste of local files");
-        assert_eq!(c.paste("B", t), Some(PasteAction::SendOwn { to: "B".into() }));
+        assert_eq!(
+            c.paste("B", t),
+            Some(PasteAction::SendOwn { to: "B".into() })
+        );
 
         c.copied("B", 7, true);
         assert!(c.remote_files());
         assert_eq!(
             c.paste("", t),
-            Some(PasteAction::Request { from: "B".into(), seq: 7, to: String::new() })
+            Some(PasteAction::Request {
+                from: "B".into(),
+                seq: 7,
+                to: String::new()
+            })
         );
         assert_eq!(
             c.paste("C", t),
-            Some(PasteAction::Request { from: "B".into(), seq: 7, to: "C".into() })
+            Some(PasteAction::Request {
+                from: "B".into(),
+                seq: 7,
+                to: "C".into()
+            })
         );
         assert_eq!(c.paste("b", t), None, "B pastes its own files");
     }
@@ -135,8 +150,17 @@ mod tests {
         let mut c = SharedClip::default();
         c.copied("B", 1, true);
         assert!(matches!(c.paste("", t), Some(PasteAction::Request { .. })));
-        assert_eq!(c.paste("", t + Duration::from_secs(1)), Some(PasteAction::Repeat));
-        assert!(matches!(c.paste("C", t + Duration::from_secs(1)), Some(PasteAction::Request { .. })));
-        assert!(matches!(c.paste("", t + Duration::from_secs(5)), Some(PasteAction::Request { .. })));
+        assert_eq!(
+            c.paste("", t + Duration::from_secs(1)),
+            Some(PasteAction::Repeat)
+        );
+        assert!(matches!(
+            c.paste("C", t + Duration::from_secs(1)),
+            Some(PasteAction::Request { .. })
+        ));
+        assert!(matches!(
+            c.paste("", t + Duration::from_secs(5)),
+            Some(PasteAction::Request { .. })
+        ));
     }
 }

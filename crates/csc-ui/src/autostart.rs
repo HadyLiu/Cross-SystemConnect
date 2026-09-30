@@ -68,7 +68,9 @@ mod imp {
     pub fn apply(enabled: bool, exe: &Path) -> anyhow::Result<()> {
         if enabled {
             let value = format!("\"{}\"", exe.display());
-            let status = reg(&["add", RUN_KEY, "/v", ENTRY, "/t", "REG_SZ", "/d", &value, "/f"])?;
+            let status = reg(&[
+                "add", RUN_KEY, "/v", ENTRY, "/t", "REG_SZ", "/d", &value, "/f",
+            ])?;
             anyhow::ensure!(status.success(), "reg add failed: {status}");
         } else if reg(&["query", RUN_KEY, "/v", ENTRY])?.success() {
             let status = reg(&["delete", RUN_KEY, "/v", ENTRY, "/f"])?;

@@ -29,7 +29,11 @@ impl SystemClipboard {
     /// Files take precedence: a file copy often also carries the paths as text.
     pub fn read(&mut self) -> ClipContent {
         if let Ok(files) = self.inner.get().file_list() {
-            let files: Vec<PathBuf> = files.into_iter().map(tidy_path).filter(|p| !p.as_os_str().is_empty()).collect();
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .map(tidy_path)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
             if !files.is_empty() {
                 return ClipContent::Files(files);
             }

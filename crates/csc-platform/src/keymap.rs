@@ -90,18 +90,12 @@ pub fn scan_from_hid(hid: u32) -> Option<(u16, bool)> {
 
 /// Linux evdev key code for a HID usage.
 pub fn evdev_from_hid(hid: u32) -> Option<u16> {
-    TABLE
-        .iter()
-        .find(|r| r.hid as u32 == hid)
-        .map(|r| r.evdev)
+    TABLE.iter().find(|r| r.hid as u32 == hid).map(|r| r.evdev)
 }
 
 /// HID usage for a Linux evdev key code.
 pub fn hid_from_evdev(code: u16) -> Option<u32> {
-    TABLE
-        .iter()
-        .find(|r| r.evdev == code)
-        .map(|r| r.hid as u32)
+    TABLE.iter().find(|r| r.evdev == code).map(|r| r.hid as u32)
 }
 
 pub const HID_LEFT_CTRL: u32 = 0xE0;

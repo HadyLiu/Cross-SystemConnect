@@ -2,8 +2,8 @@
 //! Polls fast: the edge window only matters while a drag is held against the edge.
 
 use crate::drop_zone::{zone_from_status, Zone};
-use crate::UserEvent;
 use crate::ipc_client;
+use crate::UserEvent;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use tao::event_loop::EventLoopProxy;

@@ -12,7 +12,10 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 enum DragCmd {
-    Begin { peer: String, begin: DragBeginPayload },
+    Begin {
+        peer: String,
+        begin: DragBeginPayload,
+    },
     PointerLeft,
 }
 
@@ -56,7 +59,11 @@ fn items_of(begin: &DragBeginPayload) -> Vec<DragItem> {
         .collect()
 }
 
-async fn run(mut rx: mpsc::Receiver<DragCmd>, transfer: TransferHandle, config: Arc<RwLock<Config>>) {
+async fn run(
+    mut rx: mpsc::Receiver<DragCmd>,
+    transfer: TransferHandle,
+    config: Arc<RwLock<Config>>,
+) {
     let (ev_tx, mut ev_rx) = mpsc::channel::<DragEvent>(16);
     let (std_tx, std_rx) = std::sync::mpsc::channel::<DragEvent>();
     // Platform drags report on a std channel from their own threads.

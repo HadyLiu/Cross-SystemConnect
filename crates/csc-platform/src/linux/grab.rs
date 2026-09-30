@@ -18,10 +18,16 @@ use tracing::{debug, info, warn};
 type ErrorHandler = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type SetErrorHandler = unsafe extern "C" fn(Option<ErrorHandler>) -> Option<ErrorHandler>;
 type KeysymToKeycode = unsafe extern "C" fn(*mut c_void, c_ulong) -> u8;
-type GrabKey = unsafe extern "C" fn(*mut c_void, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
+type GrabKey =
+    unsafe extern "C" fn(*mut c_void, c_int, c_uint, c_ulong, c_int, c_int, c_int) -> c_int;
 type UngrabKey = unsafe extern "C" fn(*mut c_void, c_int, c_uint, c_ulong) -> c_int;
-type QueryExtension =
-    unsafe extern "C" fn(*mut c_void, *const libc::c_char, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+type QueryExtension = unsafe extern "C" fn(
+    *mut c_void,
+    *const libc::c_char,
+    *mut c_int,
+    *mut c_int,
+    *mut c_int,
+) -> c_int;
 type GetEventData = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FreeEventData = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type XiSelectEvents = unsafe extern "C" fn(*mut c_void, c_ulong, *mut XiEventMask, c_int) -> c_int;
@@ -89,7 +95,10 @@ pub fn take_raw_motion() -> Option<(i32, i32)> {
     if !RAW_OK.load(Ordering::Relaxed) {
         return None;
     }
-    Some((RAW_DX.swap(0, Ordering::AcqRel), RAW_DY.swap(0, Ordering::AcqRel)))
+    Some((
+        RAW_DX.swap(0, Ordering::AcqRel),
+        RAW_DY.swap(0, Ordering::AcqRel),
+    ))
 }
 
 pub fn paste_watch(enable: bool) {
@@ -132,7 +141,15 @@ impl PasteKey {
         }
         for m in Self::MODS {
             if on {
-                (self.grab)(dpy, self.keycode, m, root, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC);
+                (self.grab)(
+                    dpy,
+                    self.keycode,
+                    m,
+                    root,
+                    0,
+                    GRAB_MODE_ASYNC,
+                    GRAB_MODE_ASYNC,
+                );
             } else {
                 (self.ungrab)(dpy, self.keycode, m, root);
             }
@@ -283,7 +300,11 @@ pub fn start() -> bool {
 
 pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     if let Ok(mut s) = SHARED.lock() {
-        s.want = if grab { Some(park.unwrap_or((0, 0))) } else { None };
+        s.want = if grab {
+            Some(park.unwrap_or((0, 0)))
+        } else {
+            None
+        };
         s.queue.clear();
     }
 }
@@ -344,7 +365,14 @@ unsafe fn open_xi(x11: *mut c_void, dpy: *mut c_void, root: c_ulong) -> Option<X
     let query_ext: QueryExtension = sym(x11, "XQueryExtension")?;
     let (mut opcode, mut event, mut error) = (0, 0, 0);
     let name = b"XInputExtension\0";
-    if query_ext(dpy, name.as_ptr() as *const libc::c_char, &mut opcode, &mut event, &mut error) == 0 {
+    if query_ext(
+        dpy,
+        name.as_ptr() as *const libc::c_char,
+        &mut opcode,
+        &mut event,
+        &mut error,
+    ) == 0
+    {
         return None;
     }
     let xi = dlopen_quiet(b"libXi.so.6\0")?;
@@ -464,7 +492,9 @@ fn run(mut api: Api) {
             match (want, grabbed.as_mut()) {
                 (Some(park), None) => grabbed = Some(try_grab(&api, park, None)),
                 (Some(park), Some(g)) if g.last_attempt.is_some() => {
-                    let retry = g.last_attempt.is_some_and(|t| t.elapsed() > Duration::from_millis(200));
+                    let retry = g
+                        .last_attempt
+                        .is_some_and(|t| t.elapsed() > Duration::from_millis(200));
                     if retry {
                         let warned = g.warned;
                         grabbed = Some(try_grab(&api, park, Some(warned)));

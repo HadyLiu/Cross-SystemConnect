@@ -108,7 +108,11 @@ fn handle(msg: &str) {
         return;
     };
     let id = v.get("id").and_then(|n| n.as_u64());
-    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+    let action = v
+        .get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or("")
+        .to_string();
     let path = v.get("path").and_then(|p| p.as_str()).map(str::to_string);
     let decisions = v.get("decisions").cloned();
     std::thread::spawn(move || {
@@ -187,11 +191,18 @@ impl TransferWindow {
             self.window.set_visible(false);
             return;
         }
-        let state = |t: &Value| t.get("state").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let state = |t: &Value| {
+            t.get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         let mut raise = false;
         let mut open_new = false;
         for t in list {
-            let Some(id) = t.get("id").and_then(|n| n.as_u64()) else { continue };
+            let Some(id) = t.get("id").and_then(|n| n.as_u64()) else {
+                continue;
+            };
             let st = state(t);
             if st == "conflict" && self.asked.insert(id) {
                 self.hidden.remove(&id);

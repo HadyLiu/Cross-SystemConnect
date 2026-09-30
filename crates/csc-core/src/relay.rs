@@ -72,8 +72,11 @@ impl Relay {
     pub fn allow(&mut self, src: &str, dst: &str) {
         self.allowed
             .retain(|(_, _, at)| at.elapsed() < Duration::from_secs(120));
-        self.allowed
-            .push((src.to_ascii_lowercase(), dst.to_ascii_lowercase(), Instant::now()));
+        self.allowed.push((
+            src.to_ascii_lowercase(),
+            dst.to_ascii_lowercase(),
+            Instant::now(),
+        ));
     }
 
     /// Take a permission granted by `allow`.

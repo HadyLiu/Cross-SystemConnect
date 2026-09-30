@@ -21,8 +21,8 @@ pub struct AppState {
     pub net_reload: watch::Sender<u64>,
     /// Bumped when the screen arrangement changes. Does not drop connections.
     pub layout_reload: watch::Sender<u64>,
-    /// File the core logger is appending to.
-    pub log_path: PathBuf,
+    /// Core logger; follows the log settings when they are saved.
+    pub log: crate::logging::LogControl,
     pub transfer: crate::transfer::TransferHandle,
     /// Progress of incoming batches, merged into `get_status`.
     pub board: crate::progress::TransferBoard,
@@ -41,7 +41,12 @@ fn param_paths(params: &serde_json::Value) -> Vec<PathBuf> {
     params
         .get("paths")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|p| p.as_str()).map(PathBuf::from).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.as_str())
+                .map(PathBuf::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -260,9 +265,13 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             let before_search = cfg.search_address.clone();
             let before_layout = cfg.layout.clone();
             let before_screens = cfg.screens.clone();
+            let before_log = cfg.log.clone();
             match cfg.merge_from_value(req.params) {
                 Ok(()) => match cfg.save(&state.config_path) {
                     Ok(()) => {
+                        if before_log != cfg.log {
+                            state.log.apply(&cfg.log);
+                        }
                         let restart = before_role != cfg.role
                             || before_port != cfg.control_port
                             || before_bind != cfg.bind_address
@@ -395,13 +404,16 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "get_logs" | "getLogs" => {
-            let path = state.log_path.clone();
+            let Some(path) = state.log.path() else {
+                return IpcResponse::ok(req.id, json!({"text": "", "path": "", "to_file": false}));
+            };
+            let shown = path.display().to_string();
             let text = tokio::task::spawn_blocking(move || read_log_tail(&path, 48 * 1024))
                 .await
                 .unwrap_or_default();
             IpcResponse::ok(
                 req.id,
-                json!({"text": text, "path": state.log_path.display().to_string()}),
+                json!({"text": text, "path": shown, "to_file": true}),
             )
         }
         "quit" => {

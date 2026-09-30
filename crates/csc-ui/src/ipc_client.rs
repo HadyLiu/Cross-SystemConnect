@@ -234,7 +234,10 @@ pub fn dismiss_transfer(id: u64) -> anyhow::Result<Value> {
 }
 
 pub fn resolve_conflict(id: u64, decisions: Value) -> anyhow::Result<Value> {
-    call("resolve_conflict", json!({"transferId": id, "decisions": decisions}))
+    call(
+        "resolve_conflict",
+        json!({"transferId": id, "decisions": decisions}),
+    )
 }
 
 pub fn rescan() -> anyhow::Result<Value> {

@@ -221,7 +221,8 @@ struct XineramaScreenInfo {
 }
 
 type XineramaIsActive = unsafe extern "C" fn(*mut c_void) -> c_int;
-type XineramaQueryScreens = unsafe extern "C" fn(*mut c_void, *mut c_int) -> *mut XineramaScreenInfo;
+type XineramaQueryScreens =
+    unsafe extern "C" fn(*mut c_void, *mut c_int) -> *mut XineramaScreenInfo;
 type XFree = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 /// Physical monitors as `(x, y, width, height)`, from Xinerama. Empty when
@@ -253,7 +254,12 @@ pub fn monitors() -> Vec<(i32, i32, i32, i32)> {
         for i in 0..n.max(0) as usize {
             let s = &*list.add(i);
             if s.width > 0 && s.height > 0 {
-                out.push((s.x_org as i32, s.y_org as i32, s.width as i32, s.height as i32));
+                out.push((
+                    s.x_org as i32,
+                    s.y_org as i32,
+                    s.width as i32,
+                    s.height as i32,
+                ));
             }
         }
         free(list as *mut c_void);

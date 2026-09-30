@@ -17,9 +17,9 @@ use csc_config::{default_config_path, Config};
 use csc_platform::vdrag::StagedFeed;
 use csc_proto::{
     decode_file_data, encode_file_data, encode_json_frame, DragBeginPayload, DragCancelPayload,
-    FileAckPayload, FileBeginPayload, FileDonePayload, FileEndPayload, FileEntry,
-    FileErrorPayload, FileOfferPayload, FileRequestPayload, MsgType, TransferConflict,
-    TransferProgress, TransferPurpose, TransferState, CAP_FILE_ACK,
+    FileAckPayload, FileBeginPayload, FileDonePayload, FileEndPayload, FileEntry, FileErrorPayload,
+    FileOfferPayload, FileRequestPayload, MsgType, TransferConflict, TransferProgress,
+    TransferPurpose, TransferState, CAP_FILE_ACK,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -185,7 +185,8 @@ impl TransferHandle {
     }
 
     pub async fn relay_drag(&self, from: String, begin: DragBeginPayload, to: String) {
-        self.cmd(TransferCmd::RelayDragBegin { from, begin, to }).await;
+        self.cmd(TransferCmd::RelayDragBegin { from, begin, to })
+            .await;
     }
 
     pub async fn allow_relay(&self, from: String, to: String) {
@@ -293,14 +294,23 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn walk(path: &Path, rel: String, plan: &mut Plan, problems: &mut Vec<String>) -> Result<(), String> {
+fn walk(
+    path: &Path,
+    rel: String,
+    plan: &mut Plan,
+    problems: &mut Vec<String>,
+) -> Result<(), String> {
     if plan.entries.len() >= MAX_ENTRIES {
         return Err(format!("文件数量超过 {MAX_ENTRIES} 个，请压缩后再发送"));
     }
     let leaf = rel.rsplit('/').next().unwrap_or(&rel);
     if let Some(why) = name_problem(leaf) {
         // Control characters are invisible in a notification; show them escaped.
-        let shown = if rel.chars().any(char::is_control) { rel.escape_debug().to_string() } else { rel.clone() };
+        let shown = if rel.chars().any(char::is_control) {
+            rel.escape_debug().to_string()
+        } else {
+            rel.clone()
+        };
         problems.push(format!("{shown}：{why}"));
         return Ok(());
     }
@@ -577,8 +587,7 @@ impl Engine {
         while let Some(cmd) = rx.recv().await {
             self.outgoing.retain(|_, o| o.created.elapsed() < OFFER_TTL);
             self.parked.retain(|_, p| p.at.elapsed() < OFFER_TTL);
-            self.sending
-                .retain(|_, s| Arc::strong_count(&s.cancel) > 1);
+            self.sending.retain(|_, s| Arc::strong_count(&s.cancel) > 1);
             match cmd {
                 TransferCmd::Send {
                     peer,
@@ -659,7 +668,12 @@ impl Engine {
         Ok(plan)
     }
 
-    fn register(&mut self, peer: String, purpose: TransferPurpose, plan: Plan) -> (u64, Vec<FileEntry>, u64) {
+    fn register(
+        &mut self,
+        peer: String,
+        purpose: TransferPurpose,
+        plan: Plan,
+    ) -> (u64, Vec<FileEntry>, u64) {
         let id = self.new_id();
         let entries = plan.entries.clone();
         let total = plan.total;
@@ -678,7 +692,13 @@ impl Engine {
         (id, entries, total)
     }
 
-    async fn offer(&mut self, peer: String, paths: Vec<PathBuf>, purpose: TransferPurpose, relay_to: String) {
+    async fn offer(
+        &mut self,
+        peer: String,
+        paths: Vec<PathBuf>,
+        purpose: TransferPurpose,
+        relay_to: String,
+    ) {
         let plan = match self.planned(paths).await {
             Ok(p) => p,
             Err(msg) => {
@@ -691,7 +711,11 @@ impl Engine {
             plan.entries.len(),
             mib(plan.total),
             purpose,
-            if relay_to.is_empty() { String::new() } else { format!(" via host to {relay_to}") }
+            if relay_to.is_empty() {
+                String::new()
+            } else {
+                format!(" via host to {relay_to}")
+            }
         );
         let (id, entries, total) = self.register(peer.clone(), purpose, plan);
         let offer = FileOfferPayload {
@@ -705,7 +729,12 @@ impl Engine {
         self.send_json(&peer, MsgType::FileOffer, &offer).await;
     }
 
-    async fn prepare_drag(&mut self, peer: String, paths: Vec<PathBuf>, to: String) -> Result<DragBeginPayload, String> {
+    async fn prepare_drag(
+        &mut self,
+        peer: String,
+        paths: Vec<PathBuf>,
+        to: String,
+    ) -> Result<DragBeginPayload, String> {
         let plan = self.planned(paths).await?;
         let (id, entries, total) = self.register(peer, TransferPurpose::DragDrop, plan);
         Ok(DragBeginPayload {
@@ -759,14 +788,18 @@ impl Engine {
                     debug!("{peer} withdrew drag {id}");
                 } else if let Some(inc) = self.incoming.remove(&id) {
                     discard(inc);
-                    self.board.finish(id, TransferState::Cancelled, "对方已取消");
+                    self.board
+                        .finish(id, TransferState::Cancelled, "对方已取消");
                 }
             }
             MsgType::FileError => {
                 let err: FileErrorPayload =
                     parse(&payload).ok_or_else(|| anyhow::anyhow!("bad error"))?;
                 if self.cancel_send(err.transfer_id) {
-                    popup(format!("{} 未能接收文件：{}", self.label(peer).await, err.message), true);
+                    popup(
+                        format!("{} 未能接收文件：{}", self.label(peer).await, err.message),
+                        true,
+                    );
                 } else if let Some(inc) = self.incoming.remove(&err.transfer_id) {
                     discard(inc);
                     self.board
@@ -875,7 +908,10 @@ impl Engine {
                 if let Some(frame) = relay::rewrite(msg, payload, src_id) {
                     self.net.send_control(&src, frame).await;
                 }
-                if matches!(msg, MsgType::FileError | MsgType::FileCancel | MsgType::DragCancel) {
+                if matches!(
+                    msg,
+                    MsgType::FileError | MsgType::FileCancel | MsgType::DragCancel
+                ) {
                     if let Some(Hop::ToTarget { rid, .. }) = self.relay.hop(&src, src_id) {
                         self.relay.close(rid);
                     }
@@ -1071,9 +1107,17 @@ impl Engine {
         let dest = inc.dest();
         if all_skipped {
             self.incoming.remove(&id);
-            self.board.finish(id, TransferState::Cancelled, "已全部跳过");
-            self.send_json(&peer, MsgType::FileCancel, &FileRequestPayload { transfer_id: id, skip: Vec::new() })
-                .await;
+            self.board
+                .finish(id, TransferState::Cancelled, "已全部跳过");
+            self.send_json(
+                &peer,
+                MsgType::FileCancel,
+                &FileRequestPayload {
+                    transfer_id: id,
+                    skip: Vec::new(),
+                },
+            )
+            .await;
             return;
         }
         self.board.update(id, |p| {
@@ -1083,8 +1127,15 @@ impl Engine {
             p.files_total = files;
             p.dest = dest;
         });
-        self.send_json(&peer, MsgType::FileRequest, &FileRequestPayload { transfer_id: id, skip })
-            .await;
+        self.send_json(
+            &peer,
+            MsgType::FileRequest,
+            &FileRequestPayload {
+                transfer_id: id,
+                skip,
+            },
+        )
+        .await;
     }
 
     fn incoming_of(&mut self, peer: &str, id: u64) -> Result<&mut Incoming, String> {
@@ -1139,7 +1190,13 @@ impl Engine {
     }
 
     /// Write a chunk. Returns an acknowledgement to send when one is due.
-    fn write_data(&mut self, peer: &str, id: u64, index: u32, data: &[u8]) -> Result<Option<FileAckPayload>, String> {
+    fn write_data(
+        &mut self,
+        peer: &str,
+        id: u64,
+        index: u32,
+        data: &[u8],
+    ) -> Result<Option<FileAckPayload>, String> {
         let board = self.board.clone();
         let inc = self.incoming_of(peer, id)?;
         let size = inc.entries.get(index as usize).map(|e| e.size).unwrap_or(0);
@@ -1206,7 +1263,8 @@ impl Engine {
         if inc.temps[i].is_some() {
             let target = &inc.targets[i];
             if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
-                std::fs::remove_dir_all(target).map_err(|e| format!("{}：{e}", target.display()))?;
+                std::fs::remove_dir_all(target)
+                    .map_err(|e| format!("{}：{e}", target.display()))?;
             }
             std::fs::rename(&cur.path, target)
                 .map_err(|e| format!("替换 {}：{e}", target.display()))?;
@@ -1275,8 +1333,15 @@ impl Engine {
         let peer = inc.peer.clone();
         discard(inc);
         self.board.finish(id, TransferState::Cancelled, "已取消");
-        self.send_json(&peer, MsgType::FileCancel, &FileRequestPayload { transfer_id: id, skip: Vec::new() })
-            .await;
+        self.send_json(
+            &peer,
+            MsgType::FileCancel,
+            &FileRequestPayload {
+                transfer_id: id,
+                skip: Vec::new(),
+            },
+        )
+        .await;
     }
 
     async fn peer_gone(&mut self, peer: &str) {
@@ -1293,7 +1358,8 @@ impl Engine {
                     .finish(id, TransferState::Failed, "连接断开，文件未接收完");
             }
         }
-        self.parked.retain(|_, p| !p.peer.eq_ignore_ascii_case(peer));
+        self.parked
+            .retain(|_, p| !p.peer.eq_ignore_ascii_case(peer));
         self.outgoing
             .retain(|_, o| !o.peer.eq_ignore_ascii_case(peer));
         self.sending.retain(|_, s| {
@@ -1443,7 +1509,10 @@ fn place(inc: &mut Incoming, choices: &HashMap<usize, Choice>) -> Result<(), Str
             Target::Staged(feed) => feed.path(i).map(Path::to_path_buf).unwrap_or_default(),
             _ => below(&top_path[&t], &inc.shape.rest[i]),
         };
-        if replacing.contains(&t) && !inc.entries[i].is_directory && std::fs::symlink_metadata(&path).is_ok() {
+        if replacing.contains(&t)
+            && !inc.entries[i].is_directory
+            && std::fs::symlink_metadata(&path).is_ok()
+        {
             inc.temps[i] = Some(part_path(&path));
         }
         targets.push(path);
@@ -1623,7 +1692,10 @@ async fn stream(
 ) -> Result<(), String> {
     let (limit, rate) = {
         let c = config.read().await;
-        (c.file_transfer.limit_speed, c.file_transfer.max_speed_mibs.max(1) as f64)
+        (
+            c.file_transfer.limit_speed,
+            c.file_transfer.max_speed_mibs.max(1) as f64,
+        )
     };
     let bytes_per_sec = rate * 1024.0 * 1024.0;
     let started = Instant::now();
@@ -1637,8 +1709,16 @@ async fn stream(
         if skip.contains(&index) {
             continue;
         }
-        bulk_json(net, &out.peer, MsgType::FileBegin, &FileBeginPayload { transfer_id: id, index })
-            .await?;
+        bulk_json(
+            net,
+            &out.peer,
+            MsgType::FileBegin,
+            &FileBeginPayload {
+                transfer_id: id,
+                index,
+            },
+        )
+        .await?;
         let Some(src) = &out.sources[i] else {
             continue;
         };
@@ -1658,7 +1738,10 @@ async fn stream(
                 return Err(format!("{} 在发送时变小了", src.display()));
             }
             hasher.update(&buf[..n]);
-            if !net.send_bulk(&out.peer, encode_file_data(id, index, &buf[..n])).await {
+            if !net
+                .send_bulk(&out.peer, encode_file_data(id, index, &buf[..n]))
+                .await
+            {
                 return Err("连接已断开".into());
             }
             left -= n as u64;
@@ -1686,7 +1769,13 @@ async fn stream(
         .await?;
     }
     info!("sent {} to {}", mib(out.total), out.peer);
-    bulk_json(net, &out.peer, MsgType::FileDone, &FileDonePayload { transfer_id: id }).await
+    bulk_json(
+        net,
+        &out.peer,
+        MsgType::FileDone,
+        &FileDonePayload { transfer_id: id },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1764,7 +1853,11 @@ mod tests {
                 entry("new.txt", 1, false),
             ],
         );
-        let names: Vec<_> = inc.conflicts.iter().map(|c| (c.index, c.name.as_str())).collect();
+        let names: Vec<_> = inc
+            .conflicts
+            .iter()
+            .map(|c| (c.index, c.name.as_str()))
+            .collect();
         assert_eq!(names, vec![(0, "a.txt"), (1, "pics")]);
         assert_eq!(inc.conflicts[1].new_size, 4);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1787,8 +1880,12 @@ mod tests {
                 entry("b.txt", 1, false),
             ],
         );
-        let choices: HashMap<usize, Choice> =
-            [(0, Choice::KeepBoth), (1, Choice::Replace), (4, Choice::Skip)].into();
+        let choices: HashMap<usize, Choice> = [
+            (0, Choice::KeepBoth),
+            (1, Choice::Replace),
+            (4, Choice::Skip),
+        ]
+        .into();
         place(&mut inc, &choices).unwrap();
         assert_eq!(inc.targets[0], dir.join("a (1).txt"));
         assert_eq!(inc.temps[0], None);
@@ -1820,7 +1917,11 @@ mod tests {
     fn in_place_uses_the_found_placeholders() {
         let dir = temp("inplace");
         let found = dir.join("报告 (1).docx");
-        let entries = vec![entry("报告.docx", 2, false), entry("照片", 0, true), entry("照片/a.jpg", 1, false)];
+        let entries = vec![
+            entry("报告.docx", 2, false),
+            entry("照片", 0, true),
+            entry("照片/a.jpg", 1, false),
+        ];
         let mut inc = prepare_incoming(
             "peer",
             TransferPurpose::DragDrop,
@@ -1838,7 +1939,10 @@ mod tests {
 
     #[test]
     fn older_purposes_map_to_paste() {
-        assert_eq!(TransferPurpose::Clipboard.normalized(), TransferPurpose::Paste);
+        assert_eq!(
+            TransferPurpose::Clipboard.normalized(),
+            TransferPurpose::Paste
+        );
         assert_eq!(TransferPurpose::Drag.normalized(), TransferPurpose::Drag);
     }
 }

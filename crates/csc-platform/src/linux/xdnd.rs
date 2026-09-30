@@ -60,41 +60,49 @@ pub fn start(desc: DragDesc, events: Sender<DragEvent>) -> bool {
     CANCEL.store(0, Ordering::Release);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let id = desc.id;
-    let spawned = std::thread::Builder::new().name("csc-xdnd".into()).spawn(move || {
-        let atoms = match x11rb::connect(None)
-            .map_err(|e| e.to_string())
-            .and_then(|(c, screen)| Atoms::new(&c).map(|a| (c, screen, a)))
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("drag: X11 connection: {e}");
-                let _ = ready_tx.send(false);
-                return;
+    let spawned = std::thread::Builder::new()
+        .name("csc-xdnd".into())
+        .spawn(move || {
+            let atoms = match x11rb::connect(None)
+                .map_err(|e| e.to_string())
+                .and_then(|(c, screen)| Atoms::new(&c).map(|a| (c, screen, a)))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("drag: X11 connection: {e}");
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            let (conn, screen, atoms) = atoms;
+            let root = conn.setup().roots[screen].root;
+            let mut drag = match Drag::open(conn, root, atoms, id, tops) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("drag: {e}");
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            let _ = ready_tx.send(true);
+            let ev = drag.run().unwrap_or_else(|e| {
+                warn!("drag {id}: {e}");
+                DragEvent::Cancelled {
+                    id,
+                    reason: "error",
+                }
+            });
+            drag.close();
+            let cleanup = !matches!(ev, DragEvent::Cancelled { .. } | DragEvent::Lost { .. });
+            let _ = events.send(ev);
+            if cleanup {
+                let _ = std::fs::remove_dir_all(&dir);
             }
-        };
-        let (conn, screen, atoms) = atoms;
-        let root = conn.setup().roots[screen].root;
-        let mut drag = match Drag::open(conn, root, atoms, id, tops) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("drag: {e}");
-                let _ = ready_tx.send(false);
-                return;
-            }
-        };
-        let _ = ready_tx.send(true);
-        let ev = drag.run().unwrap_or_else(|e| {
-            warn!("drag {id}: {e}");
-            DragEvent::Cancelled { id, reason: "error" }
         });
-        drag.close();
-        let cleanup = !matches!(ev, DragEvent::Cancelled { .. } | DragEvent::Lost { .. });
-        let _ = events.send(ev);
-        if cleanup {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    });
-    spawned.is_ok() && ready_rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false)
+    spawned.is_ok()
+        && ready_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(false)
 }
 
 /// One placeholder per top-level item, named like the real one.
@@ -216,7 +224,13 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 impl Drag {
-    fn open(conn: RustConnection, root: Window, atoms: Atoms, id: u64, tops: Vec<Top>) -> Res<Self> {
+    fn open(
+        conn: RustConnection,
+        root: Window,
+        atoms: Atoms,
+        id: u64,
+        tops: Vec<Top>,
+    ) -> Res<Self> {
         let window = conn.generate_id().map_err(err)?;
         conn.create_window(
             0,
@@ -419,7 +433,10 @@ impl Drag {
                 self.leave()?;
                 self.conn.flush().map_err(err)?;
                 super::xdo::x_button(1, false);
-                return Ok(DragEvent::Cancelled { id, reason: "left screen" });
+                return Ok(DragEvent::Cancelled {
+                    id,
+                    reason: "left screen",
+                });
             }
             if let Some(at) = dropped {
                 if at.elapsed() > DROP_TIMEOUT {
@@ -450,7 +467,10 @@ impl Drag {
                         _ => {
                             self.leave()?;
                             self.conn.flush().map_err(err)?;
-                            return Ok(DragEvent::Cancelled { id, reason: "no target" });
+                            return Ok(DragEvent::Cancelled {
+                                id,
+                                reason: "no target",
+                            });
                         }
                     }
                 }
@@ -467,8 +487,15 @@ impl Drag {
                 Event::ClientMessage(c) if c.type_ == self.atoms.finished => {
                     let d = c.data.as_data32();
                     let version = self.target.map(|t| t.version).unwrap_or(0);
-                    if version >= 5 && d[1] & 1 == 0 && self.taken.folder.is_none() && !self.taken.uri_list {
-                        return Ok(DragEvent::Cancelled { id, reason: "refused" });
+                    if version >= 5
+                        && d[1] & 1 == 0
+                        && self.taken.folder.is_none()
+                        && !self.taken.uri_list
+                    {
+                        return Ok(DragEvent::Cancelled {
+                            id,
+                            reason: "refused",
+                        });
                     }
                     return Ok(self.after_drop());
                 }
@@ -507,7 +534,11 @@ impl Drag {
 
     fn answer(&mut self, r: x11rb::protocol::xproto::SelectionRequestEvent) -> Res<()> {
         let a = &self.atoms;
-        let property = if r.property == x11rb::NONE { r.target } else { r.property };
+        let property = if r.property == x11rb::NONE {
+            r.target
+        } else {
+            r.property
+        };
         let mut ok = true;
         if r.selection != a.selection {
             ok = false;
@@ -528,7 +559,13 @@ impl Drag {
                 .map(|t| format!("{}\r\n", file_uri(&t.path)))
                 .collect();
             self.conn
-                .change_property8(PropMode::REPLACE, r.requestor, property, a.uri_list, list.as_bytes())
+                .change_property8(
+                    PropMode::REPLACE,
+                    r.requestor,
+                    property,
+                    a.uri_list,
+                    list.as_bytes(),
+                )
                 .map_err(err)?;
             self.taken.uri_list = true;
         } else if r.target == a.direct_save {
@@ -549,7 +586,13 @@ impl Drag {
                 self.taken.folder = Some(dir);
             }
             self.conn
-                .change_property8(PropMode::REPLACE, r.requestor, property, AtomEnum::STRING, answer)
+                .change_property8(
+                    PropMode::REPLACE,
+                    r.requestor,
+                    property,
+                    AtomEnum::STRING,
+                    answer,
+                )
                 .map_err(err)?;
         } else {
             ok = false;
@@ -585,7 +628,9 @@ fn file_uri(path: &Path) -> String {
 
 fn path_of_uri(uri: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
-    let rest = uri.trim_end_matches(['\0', '\r', '\n']).strip_prefix("file://")?;
+    let rest = uri
+        .trim_end_matches(['\0', '\r', '\n'])
+        .strip_prefix("file://")?;
     let path = &rest[rest.find('/')?..];
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -623,7 +668,9 @@ fn find_copies(id: u64, tops: &[Top], since: SystemTime) -> Option<Vec<PathBuf>>
     let mut found: Vec<Option<PathBuf>> = vec![None; tops.len()];
     loop {
         for dir in search_dirs(&staging, since_secs) {
-            let Ok(list) = std::fs::read_dir(&dir) else { continue };
+            let Ok(list) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in list.flatten() {
                 let Ok(meta) = entry.metadata() else { continue };
                 if meta.ctime() < since_secs {
@@ -674,7 +721,12 @@ fn same_style_name(path: PathBuf, name: &str, is_dir: bool) -> PathBuf {
     let ours = path
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix(stem)?.strip_prefix(" (")?.strip_suffix(ext)?.strip_suffix(')'))
+        .and_then(|n| {
+            n.strip_prefix(stem)?
+                .strip_prefix(" (")?
+                .strip_suffix(ext)?
+                .strip_suffix(')')
+        })
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     if ours {
         return path;
@@ -709,8 +761,11 @@ fn search_dirs(staging: &Path, since_secs: i64) -> Vec<PathBuf> {
     roots.push(PathBuf::from("/mnt"));
     roots.push(std::env::temp_dir());
     let mut out = Vec::new();
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-        roots.into_iter().filter(|r| r.is_dir()).map(|r| (r, 0)).collect();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = roots
+        .into_iter()
+        .filter(|r| r.is_dir())
+        .map(|r| (r, 0))
+        .collect();
     let mut seen = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
         seen += 1;
@@ -726,7 +781,9 @@ fn search_dirs(staging: &Path, since_secs: i64) -> Vec<PathBuf> {
         if depth >= MAX_DEPTH {
             continue;
         }
-        let Ok(list) = std::fs::read_dir(&dir) else { continue };
+        let Ok(list) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in list.flatten() {
             let hidden = entry.file_name().to_string_lossy().starts_with('.');
             if !hidden && entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -776,7 +833,11 @@ mod tests {
         let dest = base.join("dest");
         std::fs::create_dir_all(dest.join("d")).unwrap();
         std::fs::copy(base.join("stage/a.txt"), dest.join("a (1).txt")).unwrap();
-        std::fs::copy(base.join("stage/d").join(FOLDER_MARKER), dest.join("d").join(FOLDER_MARKER)).unwrap();
+        std::fs::copy(
+            base.join("stage/d").join(FOLDER_MARKER),
+            dest.join("d").join(FOLDER_MARKER),
+        )
+        .unwrap();
         let since_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -788,7 +849,11 @@ mod tests {
 
         std::fs::write(dest.join("a.txt"), "old").unwrap();
         let renamed = same_style_name(dest.join("a (1).txt"), "a.txt", false);
-        assert_eq!(renamed, dest.join("a (1).txt"), "already in our style, (1) is taken by itself");
+        assert_eq!(
+            renamed,
+            dest.join("a (1).txt"),
+            "already in our style, (1) is taken by itself"
+        );
         std::fs::rename(dest.join("a (1).txt"), dest.join("a (副本).txt")).unwrap();
         let renamed = same_style_name(dest.join("a (副本).txt"), "a.txt", false);
         assert_eq!(renamed, dest.join("a (1).txt"));

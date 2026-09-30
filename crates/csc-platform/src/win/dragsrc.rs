@@ -106,7 +106,10 @@ unsafe fn run(desc: DragDesc, feed: Arc<StagedFeed>, events: Sender<DragEvent>) 
     let id = desc.id;
     if let Err(e) = OleInitialize(None) {
         warn!("drag {id}: OleInitialize: {e}");
-        let _ = events.send(DragEvent::Cancelled { id, reason: "error" });
+        let _ = events.send(DragEvent::Cancelled {
+            id,
+            reason: "error",
+        });
         return;
     }
     let shared = Arc::new(Shared {
@@ -129,13 +132,16 @@ unsafe fn run(desc: DragDesc, feed: Arc<StagedFeed>, events: Sender<DragEvent>) 
     let mut effect = DROPEFFECT_NONE;
     let hr = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
     debug!("drag {id}: DoDragDrop {hr:?}, effect {}", effect.0);
-    if hr == DRAGDROP_S_DROP && (effect != DROPEFFECT_NONE || shared.announced.load(Ordering::Acquire)) {
+    if hr == DRAGDROP_S_DROP
+        && (effect != DROPEFFECT_NONE || shared.announced.load(Ordering::Acquire))
+    {
         shared.announce();
         // Explorer calls back into this apartment while it copies.
         let started = Instant::now();
         loop {
             pump();
-            let extracting = shared.in_operation.load(Ordering::Acquire) && !shared.ended.load(Ordering::Acquire);
+            let extracting = shared.in_operation.load(Ordering::Acquire)
+                && !shared.ended.load(Ordering::Acquire);
             let feeding = !feed.all_done() && !feed.is_failed();
             if (!extracting && !feeding) || started.elapsed() > EXTRACT_LIMIT {
                 break;
@@ -219,7 +225,11 @@ fn filetime(unix: i64) -> FILETIME {
 
 fn descriptor(item: &DragItem) -> FILEDESCRIPTORW {
     let mut file_name = [0u16; 260];
-    let name: Vec<u16> = item.relative_path.replace('/', "\\").encode_utf16().collect();
+    let name: Vec<u16> = item
+        .relative_path
+        .replace('/', "\\")
+        .encode_utf16()
+        .collect();
     let n = name.len().min(file_name.len() - 1);
     file_name[..n].copy_from_slice(&name[..n]);
     FILEDESCRIPTORW {
@@ -276,7 +286,10 @@ impl IDataObject_Impl for DataObject_Impl {
         }
         if fmt.cfFormat == self.formats.contents && fmt.tymed & TYMED_ISTREAM.0 as u32 != 0 {
             let index = usize::try_from(fmt.lindex).map_err(|_| Error::from(DV_E_FORMATETC))?;
-            let item = self.items.get(index).ok_or_else(|| Error::from(DV_E_FORMATETC))?;
+            let item = self
+                .items
+                .get(index)
+                .ok_or_else(|| Error::from(DV_E_FORMATETC))?;
             if item.is_directory {
                 return Err(DV_E_FORMATETC.into());
             }
@@ -319,14 +332,23 @@ impl IDataObject_Impl for DataObject_Impl {
         }
     }
 
-    fn GetCanonicalFormatEtc(&self, _in: *const FORMATETC, pformatetcout: *mut FORMATETC) -> HRESULT {
+    fn GetCanonicalFormatEtc(
+        &self,
+        _in: *const FORMATETC,
+        pformatetcout: *mut FORMATETC,
+    ) -> HRESULT {
         if let Some(out) = unsafe { pformatetcout.as_mut() } {
             out.ptd = std::ptr::null_mut();
         }
         E_NOTIMPL
     }
 
-    fn SetData(&self, _pformatetc: *const FORMATETC, pmedium: *const STGMEDIUM, frelease: BOOL) -> Result<()> {
+    fn SetData(
+        &self,
+        _pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
+    ) -> Result<()> {
         // Explorer reports drop effects and drag images here; none are needed.
         if frelease.as_bool() && !pmedium.is_null() {
             unsafe { ReleaseStgMedium(pmedium as *mut STGMEDIUM) };
@@ -341,7 +363,12 @@ impl IDataObject_Impl for DataObject_Impl {
         unsafe { SHCreateStdEnumFmtEtc(&self.formats.list()) }
     }
 
-    fn DAdvise(&self, _f: *const FORMATETC, _advf: u32, _sink: Option<&IAdviseSink>) -> Result<u32> {
+    fn DAdvise(
+        &self,
+        _f: *const FORMATETC,
+        _advf: u32,
+        _sink: Option<&IAdviseSink>,
+    ) -> Result<u32> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
     }
 
@@ -356,7 +383,9 @@ impl IDataObject_Impl for DataObject_Impl {
 
 impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
     fn SetAsyncMode(&self, fdoopasync: BOOL) -> Result<()> {
-        self.shared.async_mode.store(fdoopasync.as_bool(), Ordering::Release);
+        self.shared
+            .async_mode
+            .store(fdoopasync.as_bool(), Ordering::Release);
         Ok(())
     }
 
@@ -374,8 +403,16 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
         Ok(self.shared.in_operation.load(Ordering::Acquire).into())
     }
 
-    fn EndOperation(&self, hresult: HRESULT, _pbcreserved: Option<&IBindCtx>, _dweffects: u32) -> Result<()> {
-        debug!("drag {}: Explorer finished copying ({hresult:?})", self.shared.id);
+    fn EndOperation(
+        &self,
+        hresult: HRESULT,
+        _pbcreserved: Option<&IBindCtx>,
+        _dweffects: u32,
+    ) -> Result<()> {
+        debug!(
+            "drag {}: Explorer finished copying ({hresult:?})",
+            self.shared.id
+        );
         self.shared.ended.store(true, Ordering::Release);
         Ok(())
     }
@@ -413,7 +450,10 @@ struct FeedStream {
 
 impl FeedStream {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        let path = self.feed.path(self.index).ok_or(std::io::ErrorKind::NotFound)?;
+        let path = self
+            .feed
+            .path(self.index)
+            .ok_or(std::io::ErrorKind::NotFound)?;
         let mut f = std::fs::File::open(path)?;
         f.seek(SeekFrom::Start(pos))?;
         f.read(buf)
@@ -467,7 +507,10 @@ impl IStream_Impl for FeedStream_Impl {
             STREAM_SEEK_END => self.feed.size(self.index) as i64,
             _ => return Err(E_UNEXPECTED.into()),
         };
-        let to = base.checked_add(dlibmove).filter(|p| *p >= 0).ok_or_else(|| Error::from(E_UNEXPECTED))? as u64;
+        let to = base
+            .checked_add(dlibmove)
+            .filter(|p| *p >= 0)
+            .ok_or_else(|| Error::from(E_UNEXPECTED))? as u64;
         self.pos.store(to, Ordering::Release);
         if let Some(out) = unsafe { plibnewposition.as_mut() } {
             *out = to;
@@ -479,7 +522,13 @@ impl IStream_Impl for FeedStream_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn CopyTo(&self, _pstm: Option<&IStream>, _cb: u64, _pcbread: *mut u64, _pcbwritten: *mut u64) -> Result<()> {
+    fn CopyTo(
+        &self,
+        _pstm: Option<&IStream>,
+        _cb: u64,
+        _pcbread: *mut u64,
+        _pcbwritten: *mut u64,
+    ) -> Result<()> {
         Err(E_NOTIMPL.into())
     }
 

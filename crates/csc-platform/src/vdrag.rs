@@ -41,14 +41,27 @@ pub struct DragDesc {
 #[derive(Debug)]
 pub enum DragEvent {
     /// Explorer wants the data now (it asked for file contents or accepted the drop).
-    Staged { id: u64 },
+    Staged {
+        id: u64,
+    },
     /// The drop target named a folder (Linux XDS). Conflicts are ours to ask.
-    Folder { id: u64, dir: PathBuf },
+    Folder {
+        id: u64,
+        dir: PathBuf,
+    },
     /// The file manager copied the placeholder files; write into them where they are.
-    InPlace { id: u64, tops: Vec<PathBuf> },
+    InPlace {
+        id: u64,
+        tops: Vec<PathBuf>,
+    },
     /// Dropped, but where the files went could not be found.
-    Lost { id: u64 },
-    Cancelled { id: u64, reason: &'static str },
+    Lost {
+        id: u64,
+    },
+    Cancelled {
+        id: u64,
+        reason: &'static str,
+    },
 }
 
 impl DragEvent {
@@ -281,7 +294,11 @@ mod tests {
     fn readers_wait_for_bytes_in_any_order() {
         let feed = Arc::new(StagedFeed::new(
             PathBuf::from("/tmp/x"),
-            &[item("d", 0, true), item("d/a", 10, false), item("d/b", 5, false)],
+            &[
+                item("d", 0, true),
+                item("d/a", 10, false),
+                item("d/b", 5, false),
+            ],
         ));
         assert!(matches!(feed.wait(0, 0, Duration::ZERO), Wait::Ready(0)));
         assert!(matches!(feed.wait(2, 0, Duration::ZERO), Wait::TimedOut));

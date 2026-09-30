@@ -6,6 +6,7 @@ mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod log_picker;
 mod status_poller;
 mod transfer_window;
 
@@ -37,6 +38,8 @@ pub(crate) enum UserEvent {
     DropZone(Option<drop_zone::Zone>),
     /// Incoming batches from the core status.
     Transfers(Vec<serde_json::Value>),
+    /// Settings page asked for the log file dialog, starting from this path.
+    PickLogFile(String),
 }
 
 pub(crate) fn app_title() -> String {
@@ -219,8 +222,16 @@ fn start_url() -> &'static str {
     }
 }
 
-fn build_webview(window: &tao::window::Window) -> wry::Result<wry::WebView> {
+fn build_webview(
+    window: &tao::window::Window,
+    proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+) -> wry::Result<wry::WebView> {
     let builder = WebViewBuilder::new()
+        .with_ipc_handler(move |req| {
+            if let Some(current) = req.body().strip_prefix("pick-log-file:") {
+                let _ = proxy.send_event(UserEvent::PickLogFile(current.to_string()));
+            }
+        })
         .with_custom_protocol(
             "csc".into(),
             move |_webview_id, request| match handle_http(request) {
@@ -273,30 +284,19 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("GTK_THEME", "Adwaita:dark");
     }
 
-    // Log to file so GUI subsystem still has diagnostics
+    // Log to file so GUI subsystem still has diagnostics; capped like the core log.
     {
-        use tracing_subscriber::fmt;
+        use csc_config::logfile::{CappedLog, SharedLog};
         let filter = tracing_subscriber::EnvFilter::try_new("info").unwrap_or_default();
+        let file = SharedLog::default();
         if let Some(dir) = dirs::config_dir() {
-            let log_dir = dir.join("Cross-SystemConnect");
-            let _ = std::fs::create_dir_all(&log_dir);
-            let path = log_dir.join("ui.log");
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                fmt()
-                    .with_env_filter(filter)
-                    .with_writer(file)
-                    .with_ansi(false)
-                    .init();
-            } else {
-                fmt().with_env_filter(filter).with_ansi(false).init();
-            }
-        } else {
-            fmt().with_env_filter(filter).with_ansi(false).init();
+            file.set(CappedLog::open(&dir.join("Cross-SystemConnect").join("ui.log")).ok());
         }
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || file.clone())
+            .with_ansi(false)
+            .init();
     }
 
     let open_settings = std::env::args().any(|a| a == "--open-settings");
@@ -422,7 +422,7 @@ fn main() -> anyhow::Result<()> {
                         wb = wb.with_window_icon(Some(ic));
                     }
                     let w = wb.build(event_loop).expect("window");
-                    match build_webview(&w) {
+                    match build_webview(&w, proxy.clone()) {
                         Ok(wv) => {
                             webview = Some(wv);
                             window = Some(w);
@@ -441,7 +441,7 @@ fn main() -> anyhow::Result<()> {
                         wb = wb.with_window_icon(Some(ic));
                     }
                     let w = wb.build(event_loop).expect("window");
-                    match build_webview(&w) {
+                    match build_webview(&w, proxy.clone()) {
                         Ok(wv) => {
                             webview = Some(wv);
                             window = Some(w);
@@ -478,6 +478,19 @@ fn main() -> anyhow::Result<()> {
                     tw.update(&list);
                 }
                 transfers = list;
+            }
+            Event::UserEvent(UserEvent::PickLogFile(current)) => {
+                if let (Some(w), Some(wv)) = (window.as_ref(), webview.as_ref()) {
+                    let start = if current.trim().is_empty() {
+                        csc_config::default_log_path()
+                    } else {
+                        std::path::PathBuf::from(current.trim())
+                    };
+                    if let Some(path) = log_picker::pick(w, &start) {
+                        let js = json!(path.display().to_string());
+                        let _ = wv.evaluate_script(&format!("window.onLogFilePicked({js});"));
+                    }
+                }
             }
             Event::UserEvent(UserEvent::Quit) => {
                 let _ = ipc_client::quit_core();

@@ -480,10 +480,22 @@ pub enum InboundEvent {
     Heartbeat,
     SwitchEnter(SwitchPayload),
     SwitchLeave(SwitchPayload),
-    MouseMove { dx: i32, dy: i32 },
-    MouseButton { button: u32, down: bool },
-    MouseWheel { v: i32, h: i32 },
-    Key { hid: u32, down: bool },
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        button: u32,
+        down: bool,
+    },
+    MouseWheel {
+        v: i32,
+        h: i32,
+    },
+    Key {
+        hid: u32,
+        down: bool,
+    },
     /// JSON message whose sender matters: ClipOffer, EdgeHit, PasteRequest, DragBegin.
     From {
         peer: String,
@@ -491,7 +503,9 @@ pub enum InboundEvent {
         payload: Vec<u8>,
     },
     Raw(MsgType, Vec<u8>),
-    Disconnected { peer: String },
+    Disconnected {
+        peer: String,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1192,7 +1206,10 @@ where
         admit,
     )
     .await;
-    let _ = inbound.events.send(InboundEvent::Disconnected { peer }).await;
+    let _ = inbound
+        .events
+        .send(InboundEvent::Disconnected { peer })
+        .await;
     result
 }
 
@@ -1684,7 +1701,9 @@ mod tests {
         let writer = tokio::spawn(async move {
             for _ in 0..4 {
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                a.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await.unwrap();
+                a.write_all(&encode_frame(MsgType::Heartbeat, &[], 0))
+                    .await
+                    .unwrap();
             }
             let hello = HelloPayload {
                 protocol_version: 1,

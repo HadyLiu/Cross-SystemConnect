@@ -89,22 +89,31 @@ impl Rect {
     }
 
     pub fn center(&self) -> (i32, i32) {
-        (
-            self.left + self.width() / 2,
-            self.top + self.height() / 2,
-        )
+        (self.left + self.width() / 2, self.top + self.height() / 2)
     }
 }
 
 /// Input read from the local devices while the pointer is on a remote screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Captured {
-    Move { dx: i32, dy: i32 },
+    Move {
+        dx: i32,
+        dy: i32,
+    },
     /// 0 left, 1 right, 2 middle, 3 back, 4 forward.
-    Button { button: u32, down: bool },
+    Button {
+        button: u32,
+        down: bool,
+    },
     /// Whole notches. Positive `v` scrolls up, positive `h` scrolls right.
-    Wheel { v: i32, h: i32 },
-    Key { hid: u32, down: bool },
+    Wheel {
+        v: i32,
+        h: i32,
+    },
+    Key {
+        hid: u32,
+        down: bool,
+    },
 }
 
 pub trait ScreenInfo: Send {

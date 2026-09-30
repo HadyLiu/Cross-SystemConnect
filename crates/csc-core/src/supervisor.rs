@@ -50,7 +50,8 @@ impl Supervisor {
             self.present = Some(present);
             back.then(|| format!("{search} is available again"))
         } else {
-            let changed = !self.addresses.is_empty() && !now_list.is_empty() && now_list != self.addresses;
+            let changed =
+                !self.addresses.is_empty() && !now_list.is_empty() && now_list != self.addresses;
             changed.then(|| "network adapters changed".to_string())
         };
         if !now_list.is_empty() {
@@ -96,7 +97,9 @@ mod tests {
         assert!(s.on_adapters("10.0.0.2", &list(&["10.0.0.2"])).is_none());
         assert!(s.on_adapters("10.0.0.2", &list(&["10.0.0.2"])).is_none());
         assert!(s.on_adapters("10.0.0.2", &list(&["192.168.1.5"])).is_none());
-        assert!(s.on_adapters("10.0.0.2", &list(&["192.168.1.5", "10.0.0.2"])).is_some());
+        assert!(s
+            .on_adapters("10.0.0.2", &list(&["192.168.1.5", "10.0.0.2"]))
+            .is_some());
         assert!(s.on_adapters("10.0.0.2", &list(&["10.0.0.2"])).is_none());
     }
 
@@ -114,7 +117,10 @@ mod tests {
     fn client_retries_back_off() {
         let mut s = Supervisor::default();
         let t = Instant::now();
-        assert!(s.on_link(false, t).is_none(), "never linked: nothing to restore");
+        assert!(
+            s.on_link(false, t).is_none(),
+            "never linked: nothing to restore"
+        );
         assert!(s.on_link(true, t).is_none());
         assert!(s.on_link(false, t).is_none());
         assert!(s.on_link(false, t + Duration::from_secs(9)).is_none());

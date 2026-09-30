@@ -169,7 +169,11 @@ mod tests {
         board.upsert(batch(2, 10));
         board.finish(1, TransferState::Failed, "x");
         board.dismiss(2);
-        assert_eq!(board.snapshot().len(), 2, "running batch cannot be dismissed");
+        assert_eq!(
+            board.snapshot().len(),
+            2,
+            "running batch cannot be dismissed"
+        );
         board.dismiss(1);
         assert_eq!(board.snapshot().len(), 1);
         board.finish(2, TransferState::Cancelled, "");

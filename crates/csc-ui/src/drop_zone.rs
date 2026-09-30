@@ -26,7 +26,10 @@ pub struct Zone {
 pub fn zone_from_status(v: &serde_json::Value) -> Option<Zone> {
     let z = v.get("dropZone")?;
     let int = |k: &str| z.get(k).and_then(|n| n.as_i64()).map(|n| n as i32);
-    let virtual_drag = z.get("virtualDrag").and_then(|b| b.as_bool()).unwrap_or(false);
+    let virtual_drag = z
+        .get("virtualDrag")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     let min = if virtual_drag { 4 } else { 40 };
     Some(Zone {
         peer: z.get("peer")?.as_str()?.to_string(),

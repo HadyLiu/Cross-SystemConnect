@@ -5,6 +5,7 @@ mod discover;
 mod drag;
 mod ipc;
 mod layout;
+mod logging;
 mod net;
 mod paste;
 mod path_safe;
@@ -20,14 +21,14 @@ use crate::clipboard::{ClipEvent, ClipHandle};
 use crate::drag::DragHandle;
 use crate::ipc::{claim_ipc, serve_ipc, AppState, IpcBusy};
 use crate::layout::ScreenLayout;
+use crate::logging::LogControl;
 use crate::net::{spawn_network, InboundEvent, NetHub};
 use crate::paste::{PasteAction, SharedClip};
 use crate::prompt::PeerPrompt;
 use crate::supervisor::Supervisor;
 use crate::switch::{EdgePush, EdgeReport, EnterDecision, SwitchController, SwitchState};
 use crate::transfer::TransferHandle;
-use anyhow::Context;
-use csc_config::{default_config_path, default_log_path, Config};
+use csc_config::{default_config_path, Config};
 use csc_platform::{create_input_injector, create_screen_info, query_host_net_info, Captured};
 use csc_proto::{
     encode_json_frame, encode_switch_leave_bin, AppStatus, ClipOfferPayload, DragBeginPayload,
@@ -41,7 +42,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
 
 const HID_V: u32 = 0x19;
 const HID_ESC: u32 = 0x29;
@@ -122,7 +122,10 @@ impl HeldInput {
             Captured::Button { button, down: true } => {
                 self.buttons.insert(button);
             }
-            Captured::Button { button, down: false } => {
+            Captured::Button {
+                button,
+                down: false,
+            } => {
                 self.buttons.remove(&button);
             }
             _ => {}
@@ -139,7 +142,11 @@ impl HeldInput {
             net.send_captured(Captured::Key { hid, down: false }).await;
         }
         for button in self.buttons.drain() {
-            net.send_captured(Captured::Button { button, down: false }).await;
+            net.send_captured(Captured::Button {
+                button,
+                down: false,
+            })
+            .await;
         }
     }
 
@@ -246,59 +253,6 @@ fn park_inside(
         csc_proto::Edge::BottomLeft => (inset, h - 1 - inset),
         csc_proto::Edge::BottomRight => (w - 1 - inset, h - 1 - inset),
     }
-}
-
-fn log_path_of(cfg: &Config) -> PathBuf {
-    if !cfg.log.file.is_empty() {
-        PathBuf::from(&cfg.log.file)
-    } else {
-        default_log_path()
-    }
-}
-
-fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create log dir {}", parent.display()))?;
-        }
-    }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open log {}", path.display()))
-}
-
-/// Open the configured log, or the default path when that file cannot be created.
-/// A missing directory must not stop the process before IPC is listening.
-fn init_logging(cfg: &Config) -> anyhow::Result<PathBuf> {
-    let level = if !cfg.log.level.is_empty() {
-        cfg.log.level.as_str()
-    } else {
-        cfg.log_level.as_str()
-    };
-    let filter = EnvFilter::try_new(format!(
-        "info,Cross_SystemConnect_core={level},csc_platform={level}"
-    ))
-    .unwrap_or_default();
-    let preferred = log_path_of(cfg);
-    let fallback = default_log_path();
-    let (path, file) = match open_log_file(&preferred) {
-        Ok(file) => (preferred, file),
-        Err(err) if preferred != fallback => {
-            eprintln!("log path {} unavailable: {err:#}", preferred.display());
-            (fallback.clone(), open_log_file(&fallback)?)
-        }
-        Err(err) => return Err(err),
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(file)
-        .with_ansi(false)
-        .init();
-    info!("logging to {}", path.display());
-    Ok(path)
 }
 
 fn single_instance_lock() -> anyhow::Result<std::fs::File> {
@@ -430,7 +384,10 @@ fn hotkeys_of(cfg: &Config) -> (Option<Hotkey>, Option<Hotkey>) {
     let lock = hotkey_of(&cfg.hotkeys.lock_screen, "lock");
     match &lock {
         Some(k) if !csc_platform::lock_watch(&k.mods, k.key) => {
-            warn!("lock hotkey {:?} is only noticed while controlling another computer", cfg.hotkeys.lock_screen);
+            warn!(
+                "lock hotkey {:?} is only noticed while controlling another computer",
+                cfg.hotkeys.lock_screen
+            );
         }
         Some(_) => {}
         None => {
@@ -530,7 +487,8 @@ impl Core {
         if self.screen.width <= 1 || self.screen.height <= 1 {
             return;
         }
-        let local = !self.grab && self.switch.enabled() && self.switch.state() == SwitchState::Local;
+        let local =
+            !self.grab && self.switch.enabled() && self.switch.state() == SwitchState::Local;
         if !local {
             // Raw motion only measures pushes at local edges; what piles up while
             // the pointer is elsewhere would count as a push right after returning.
@@ -599,7 +557,10 @@ impl Core {
             return;
         }
         let near = csc_platform::cursor_pos().is_some_and(|(x, y)| {
-            x >= zone.x - 48 && x < zone.x + zone.width + 48 && y >= zone.y - 48 && y < zone.y + zone.height + 48
+            x >= zone.x - 48
+                && x < zone.x + zone.width + 48
+                && y >= zone.y - 48
+                && y < zone.y + zone.height + 48
         });
         if !dragging || !near {
             self.clear_zone().await;
@@ -644,7 +605,10 @@ impl Core {
     /// One captured event while grabbed. True once input is back on this computer.
     async fn grab_input(&mut self, step: Captured) -> bool {
         if let Captured::Key { hid, down: true } = step {
-            let hit = |k: &Option<Hotkey>| k.as_ref().is_some_and(|k| k.completes(hid, &self.held.keys));
+            let hit = |k: &Option<Hotkey>| {
+                k.as_ref()
+                    .is_some_and(|k| k.completes(hid, &self.held.keys))
+            };
             let (lock, back) = (hit(&self.lock_hotkey), hit(&self.return_hotkey));
             if lock {
                 self.lock_all(None).await;
@@ -677,13 +641,10 @@ impl Core {
         let dy = dy.clamp(-300, 300);
         let current = self.switch.active_remote().to_string();
         let remote = peer_size(&self.peer_screens, &current, self.screen);
-        let Some(leave) = self.switch.on_remote_relative(
-            dx,
-            dy,
-            &mut self.remote_x,
-            &mut self.remote_y,
-            remote,
-        ) else {
+        let Some(leave) =
+            self.switch
+                .on_remote_relative(dx, dy, &mut self.remote_x, &mut self.remote_y, remote)
+        else {
             self.net.send_mouse_move(dx, dy).await;
             return false;
         };
@@ -698,7 +659,9 @@ impl Core {
             edge: csc_proto::Edge::Left,
             position_pct: 0.5,
         };
-        self.net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+        self.net
+            .send_to(&current, encode_switch_leave_bin(&leave_msg))
+            .await;
         self.switch.unlock_to_local();
         release_pointer(&mut self.grab, Some(self.home_point));
         self.grab_armed = false;
@@ -724,10 +687,15 @@ impl Core {
                 if from.is_some_and(|f| f.eq_ignore_ascii_case(&peer)) {
                     continue;
                 }
-                self.net.send_control(&peer, csc_proto::encode_lock_screen_bin()).await;
+                self.net
+                    .send_control(&peer, csc_proto::encode_lock_screen_bin())
+                    .await;
             }
         }
-        info!("locking the screen (asked by {})", from.unwrap_or("this computer"));
+        info!(
+            "locking the screen (asked by {})",
+            from.unwrap_or("this computer")
+        );
         csc_platform::lock_screen();
     }
 
@@ -747,12 +715,16 @@ impl Core {
             position_pct: leave.position_pct,
         };
         if let Some(next) = hop.cloned() {
-            self.net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+            self.net
+                .send_to(&current, encode_switch_leave_bin(&leave_msg))
+                .await;
             let enter = SwitchPayload {
                 edge: leave.edge.opposite(),
                 position_pct: leave.position_pct,
             };
-            self.net.send_to(&next, csc_proto::encode_switch_bin(&enter)).await;
+            self.net
+                .send_to(&next, csc_proto::encode_switch_bin(&enter))
+                .await;
             let remote = peer_size(&self.peer_screens, &next, self.screen);
             self.switch.confirm_entered(
                 enter.edge,
@@ -781,10 +753,14 @@ impl Core {
             if current.is_empty() {
                 self.net.send_raw(encode_switch_leave_bin(&leave_msg)).await;
             } else {
-                self.net.send_to(&current, encode_switch_leave_bin(&leave_msg)).await;
+                self.net
+                    .send_to(&current, encode_switch_leave_bin(&leave_msg))
+                    .await;
             }
             self.switch.confirm_returned();
-            let m = self.switch.monitor_at(self.enter_point.0, self.enter_point.1);
+            let m = self
+                .switch
+                .monitor_at(self.enter_point.0, self.enter_point.1);
             let back = reentry_point(leave.edge, leave.position_pct, m);
             release_pointer(&mut self.grab, Some(back));
             self.grab_armed = false;
@@ -923,7 +899,11 @@ impl Core {
             dec.position_pct,
             m,
             self.switch.edge_push_px(),
-            if reports { "; remote reports its edges" } else { "" }
+            if reports {
+                "; remote reports its edges"
+            } else {
+                ""
+            }
         );
     }
 
@@ -995,7 +975,12 @@ impl Core {
         }
     }
 
-    async fn send_clip_offer(&self, offer: &ClipOfferPayload, peers: &[String], except: Option<&str>) {
+    async fn send_clip_offer(
+        &self,
+        offer: &ClipOfferPayload,
+        peers: &[String],
+        except: Option<&str>,
+    ) {
         let Ok(frame) = encode_json_frame(MsgType::ClipOffer, offer) else {
             return;
         };
@@ -1034,7 +1019,10 @@ impl Core {
         }
         if c.enabled && c.text && offer.seq != self.last_remote_clip {
             self.last_remote_clip = offer.seq;
-            debug!("clipboard text from {peer} ({} chars)", text.chars().count());
+            debug!(
+                "clipboard text from {peer} ({} chars)",
+                text.chars().count()
+            );
             self.clip.set_text(text);
         }
     }
@@ -1049,7 +1037,11 @@ impl Core {
             return false;
         };
         let local = self.local_name().await;
-        let shown = if target.is_empty() { local.clone() } else { target.clone() };
+        let shown = if target.is_empty() {
+            local.clone()
+        } else {
+            target.clone()
+        };
         match action {
             PasteAction::Repeat => debug!("repeated paste on {shown} ignored"),
             PasteAction::SendOwn { to } => {
@@ -1091,7 +1083,9 @@ impl Core {
         let transfer = self.transfer.clone();
         let tx = self.drag_ready_tx.clone();
         tokio::spawn(async move {
-            let result = transfer.prepare_drag(peer.clone(), paths, String::new()).await;
+            let result = transfer
+                .prepare_drag(peer.clone(), paths, String::new())
+                .await;
             let _ = tx.send(DragReady { peer, result }).await;
         });
     }
@@ -1125,7 +1119,11 @@ impl Core {
             ZoneOrigin::Local { dec, x, y } => {
                 self.enter_remote(dec, x, y).await;
                 self.net.send_control(&ready.peer, begin_frame).await;
-                info!("dragging {} item(s) onto {}", begin.entries.len(), ready.peer);
+                info!(
+                    "dragging {} item(s) onto {}",
+                    begin.entries.len(),
+                    ready.peer
+                );
             }
             ZoneOrigin::Controlled(report) => {
                 let hit = EdgeHitPayload {
@@ -1164,7 +1162,10 @@ impl Core {
             self.injector.mouse_button(0, true);
         }
         if !self.is_host().await {
-            self.injected.track(Captured::Button { button: 0, down: true });
+            self.injected.track(Captured::Button {
+                button: 0,
+                down: true,
+            });
         }
         self.drag.begin(peer.to_string(), begin).await;
     }
@@ -1174,10 +1175,9 @@ impl Core {
             self.start_drag_here(&peer, begin).await;
             return;
         }
-        let route = self
-            .drag_route
-            .take()
-            .filter(|r| r.from.eq_ignore_ascii_case(&peer) && r.at.elapsed() < Duration::from_secs(5));
+        let route = self.drag_route.take().filter(|r| {
+            r.from.eq_ignore_ascii_case(&peer) && r.at.elapsed() < Duration::from_secs(5)
+        });
         match route {
             Some(DragRoute { to: None, .. }) => self.start_drag_here(&peer, begin).await,
             Some(DragRoute { to: Some(to), .. }) => {
@@ -1219,7 +1219,10 @@ impl Core {
         // Follow the real pointer, which the system keeps on the monitors.
         self.remote_x = real.0;
         self.remote_y = real.1;
-        let Some(report) = self.switch.probe_edge(&mut self.probe, real.0, real.1, (dx, dy), moved) else {
+        let Some(report) = self
+            .switch
+            .probe_edge(&mut self.probe, real.0, real.1, (dx, dy), moved)
+        else {
             return;
         };
         if self.last_edge_sent.elapsed() < Duration::from_millis(250) {
@@ -1231,7 +1234,13 @@ impl Core {
         let dragging = self.injected.buttons.contains(&0);
         let host_reads_edges = self.net.peer_caps(&host).await & CAP_EDGE_REPORT != 0;
         if dragging && host_reads_edges && self.config.read().await.file_transfer.enabled {
-            let r = drop_zone_rect(report.edge, real.0, real.1, self.switch.monitor_at(real.0, real.1), true);
+            let r = drop_zone_rect(
+                report.edge,
+                real.0,
+                real.1,
+                self.switch.monitor_at(real.0, real.1),
+                true,
+            );
             let zone = csc_proto::DropZone {
                 peer: host,
                 x: r.left + ox,
@@ -1284,9 +1293,17 @@ impl Core {
     async fn on_paste_request(&mut self, peer: &str, req: PasteRequestPayload) {
         match self.my_files.clone() {
             Some((seq, paths)) if seq == req.seq => {
-                info!("sending copied files for a paste on {}", if req.to.is_empty() { peer } else { &req.to });
+                info!(
+                    "sending copied files for a paste on {}",
+                    if req.to.is_empty() { peer } else { &req.to }
+                );
                 self.transfer
-                    .send_via(peer.to_string(), paths, csc_proto::TransferPurpose::Paste, req.to)
+                    .send_via(
+                        peer.to_string(),
+                        paths,
+                        csc_proto::TransferPurpose::Paste,
+                        req.to,
+                    )
                     .await;
             }
             _ => info!("paste request {} from {peer} is for an older copy", req.seq),
@@ -1403,7 +1420,9 @@ impl Core {
                             edge: p.edge.opposite(),
                             position_pct: p.position_pct,
                         };
-                        self.net.send_to(&next, csc_proto::encode_switch_bin(&enter)).await;
+                        self.net
+                            .send_to(&next, csc_proto::encode_switch_bin(&enter))
+                            .await;
                         let screen = self.screen;
                         self.switch.confirm_entered(
                             enter.edge,
@@ -1420,8 +1439,13 @@ impl Core {
                 self.switch.confirm_returned();
                 if self.grab {
                     self.held.release_all(&self.net).await;
-                    let m = self.switch.monitor_at(self.enter_point.0, self.enter_point.1);
-                    release_pointer(&mut self.grab, Some(reentry_point(p.edge, p.position_pct, m)));
+                    let m = self
+                        .switch
+                        .monitor_at(self.enter_point.0, self.enter_point.1);
+                    release_pointer(
+                        &mut self.grab,
+                        Some(reentry_point(p.edge, p.position_pct, m)),
+                    );
                 }
                 self.grab_armed = false;
                 self.set_active_screen(None).await;
@@ -1448,7 +1472,9 @@ impl Core {
                     self.injector.key(hid, down);
                 }
             }
-            Some(InboundEvent::From { peer, msg, payload }) => self.on_from(peer, msg, payload).await,
+            Some(InboundEvent::From { peer, msg, payload }) => {
+                self.on_from(peer, msg, payload).await
+            }
             Some(InboundEvent::Raw(ty, payload)) => {
                 debug!(?ty, len = payload.len(), "unhandled frame");
             }
@@ -1469,17 +1495,11 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("config load failed, using defaults: {e:#}");
         Config::default()
     });
-    let log_path = match init_logging(&cfg) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("logging disabled: {e:#}");
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::try_new("info").unwrap_or_default())
-                .with_ansi(false)
-                .try_init();
-            log_path_of(&cfg)
-        }
-    };
+    let log = LogControl::init(&cfg.log);
+    match log.path() {
+        Some(path) => info!("logging to {}", path.display()),
+        None => eprintln!("not writing a log file"),
+    }
     let _lock = match single_instance_lock() {
         Ok(file) => Some(file),
         Err(e) => {
@@ -1556,7 +1576,7 @@ async fn main() -> anyhow::Result<()> {
         prompt: prompt.clone(),
         net_reload: net_reload.clone(),
         layout_reload,
-        log_path,
+        log,
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
@@ -1738,7 +1758,12 @@ mod tests {
 
     #[test]
     fn strip_is_thin_but_old_window_is_not() {
-        let m = csc_platform::Rect { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let m = csc_platform::Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
         let strip = super::drop_zone_rect(csc_proto::Edge::Right, 1919, 500, m, true);
         assert_eq!((strip.left, strip.width(), strip.height()), (1908, 12, 260));
         let wide = super::drop_zone_rect(csc_proto::Edge::Right, 1919, 500, m, false);

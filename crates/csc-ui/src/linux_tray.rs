@@ -57,8 +57,8 @@ fn item(label: &str, event: UserEvent) -> ksni::MenuItem<LinuxTray> {
 fn argb_icon(size: u32) -> Option<(i32, i32, Vec<u8>)> {
     let (rgba, w, h) = load_rgba(size).ok()?;
     let mut argb = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        argb.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
+    for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
+        argb.extend_from_slice(&[a, r, g, b]);
     }
     Some((w as i32, h as i32, argb))
 }

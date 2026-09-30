@@ -259,8 +259,8 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
           <div class="row"><label class="f">级别</label>
             <select id="log_level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
           <label class="check"><input id="log_to_file" type="checkbox"/><span>写入文件</span></label>
-          <div class="row"><label class="f">路径</label><input id="log_file" type="text"/></div>
-          <p class="hint">实时内容在「日志」页。修改路径后，重新启动才会写入新文件。</p>
+          <div class="row"><label class="f">路径</label><input id="log_file" type="text" placeholder="默认：程序目录下的 log.txt"/><button type="button" class="btn hk-reset" id="log_pick">浏览…</button><button type="button" class="btn hk-reset" id="log_default">默认</button></div>
+          <p class="hint">日志超过 100 KB 自动清空重写。修改级别、路径或开关后立即生效，实时内容在「日志」页。<span id="log_now"></span></p>
         </div>
         <div class="card">
           <h2>进入 / 离开命令</h2>
@@ -309,7 +309,7 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
         </div>
         <div class="card">
           <h2>日志</h2>
-          <p>「日志」页显示内核最近写入的内容。Windows 默认在 %APPDATA%\Cross-SystemConnect\Cross-SystemConnect.log。Linux 默认在 ~/.local/state/cross-systemconnect/Cross-SystemConnect.log。改路径后要重新启动才会写入新文件。</p>
+          <p>「日志」页显示内核最近写入的内容。默认写到程序所在目录的 log.txt，级别 info；程序目录不能写入时，Windows 改写到 %APPDATA%\Cross-SystemConnect\Cross-SystemConnect.log，Linux 改写到 ~/.local/state/cross-systemconnect/Cross-SystemConnect.log。日志超过 100 KB 自动清空重写。路径可以用「浏览…」选择，修改后立即生效。</p>
         </div>
       </div>
     </section>
@@ -694,7 +694,12 @@ document.querySelectorAll('input.hotkey').forEach(el=>{
   });
   el.addEventListener('keyup',e=>{ if(el.value===''||el.value.endsWith('…')) hkPartial(el,e); });
 });
-document.querySelectorAll('.hk-reset').forEach(b=>b.onclick=()=>{
+$('log_pick').onclick=()=>{
+  if(window.ipc&&window.ipc.postMessage) window.ipc.postMessage('pick-log-file:'+$('log_file').value);
+};
+$('log_default').onclick=()=>{ $('log_file').value=''; scheduleSave(); };
+window.onLogFilePicked=path=>{ $('log_file').value=path; scheduleSave(); };
+document.querySelectorAll('.hk-reset[data-for]').forEach(b=>b.onclick=()=>{
   const el=$(b.dataset.for); el.value=el.dataset.default; el.dataset.prev=el.value; scheduleSave();
 });
 
@@ -762,7 +767,7 @@ async function saveNow(){
   const msg=$('msg');
   try{
     const j=await saveConfig(saveBody());
-    if(j&&j.ok){ msg.className='ok'; msg.textContent='已保存'; }
+    if(j&&j.ok){ msg.className='ok'; msg.textContent='已保存'; refreshLogs(); }
     else { msg.className='err'; msg.textContent='保存失败: '+((j&&j.error)||'unknown'); }
   }catch(e){
     msg.className='err'; msg.textContent='保存失败: '+(e&&e.message?e.message:e);
@@ -812,7 +817,7 @@ async function load(){
     $('lock_screen').value=hkClean('lock_screen',hk.lock_screen);
     $('return_to_server').value=hkClean('return_to_server',hk.return_to_server);
     $('log_level').value=(l.level||cfg.log_level||'info');
-    $('log_to_file').checked=!!l.to_file; $('log_file').value=l.file||'';
+    $('log_to_file').checked=l.to_file!==false; $('log_file').value=l.file||'';
     $('enable_enter_command').checked=!!cfg.enable_enter_command;
     $('enter_command').value=cfg.enter_command||'';
     $('enable_exit_command').checked=!!cfg.enable_exit_command;
@@ -823,6 +828,7 @@ async function load(){
     const oldKey=$('return_to_server').value!==hk.return_to_server||$('lock_screen').value!==hk.lock_screen;
     if((selectedIp&&selectedIp!==savedIp)||placesDirty||oldKey) scheduleSave();
     msg.className='ok'; msg.textContent='已加载';
+    refreshLogs();
   }catch(e){
     msg.className='err'; msg.textContent='加载失败: '+(e&&e.message?e.message:e);
   }
@@ -869,8 +875,10 @@ async function refreshLogs(){
   try{
     const j=await getLogs();
     const text=(j&&j.text)||'';
-    box.textContent=text||(j&&j.error?'暂无日志: '+j.error:'暂无日志');
-    if($('logMeta')) $('logMeta').textContent=text?('最近 '+text.split('\n').length+' 行'):'实时';
+    const off=j&&j.to_file===false;
+    box.textContent=text||(off?'没有写入日志文件：设置里「写入文件」已关闭。':(j&&j.error?'暂无日志: '+j.error:'暂无日志'));
+    if($('logMeta')) $('logMeta').textContent=(text?('最近 '+text.split('\n').length+' 行'):'实时')+(j&&j.path?' · '+j.path:'');
+    if($('log_now')) $('log_now').textContent=j&&j.path?' 当前写入：'+j.path:'';
     if(nearBottom) box.scrollTop=box.scrollHeight;
   }catch(e){
     box.textContent='读取日志失败: '+(e&&e.message?e.message:e);

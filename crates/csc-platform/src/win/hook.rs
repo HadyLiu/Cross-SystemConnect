@@ -19,10 +19,12 @@ use tracing::{info, warn};
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, GetMessageW, RegisterClassW, SetCursorPos,
@@ -46,7 +48,10 @@ pub fn take_raw_motion() -> Option<(i32, i32)> {
     if !RAW_OK.load(Ordering::Relaxed) {
         return None;
     }
-    Some((RAW_DX.swap(0, Ordering::AcqRel), RAW_DY.swap(0, Ordering::AcqRel)))
+    Some((
+        RAW_DX.swap(0, Ordering::AcqRel),
+        RAW_DY.swap(0, Ordering::AcqRel),
+    ))
 }
 
 pub fn paste_watch(enable: bool) {
@@ -93,7 +98,12 @@ unsafe fn open_raw_input(module: HINSTANCE) -> bool {
     RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
 }
 
-unsafe extern "system" fn raw_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn raw_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_INPUT {
         let mut raw = RAWINPUT::default();
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
@@ -271,12 +281,30 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     let dy = info.pt.y - PARK_Y.load(Ordering::Relaxed);
                     (dx != 0 || dy != 0).then_some(Captured::Move { dx, dy })
                 }
-                WM_LBUTTONDOWN => Some(Captured::Button { button: 0, down: true }),
-                WM_LBUTTONUP => Some(Captured::Button { button: 0, down: false }),
-                WM_RBUTTONDOWN => Some(Captured::Button { button: 1, down: true }),
-                WM_RBUTTONUP => Some(Captured::Button { button: 1, down: false }),
-                WM_MBUTTONDOWN => Some(Captured::Button { button: 2, down: true }),
-                WM_MBUTTONUP => Some(Captured::Button { button: 2, down: false }),
+                WM_LBUTTONDOWN => Some(Captured::Button {
+                    button: 0,
+                    down: true,
+                }),
+                WM_LBUTTONUP => Some(Captured::Button {
+                    button: 0,
+                    down: false,
+                }),
+                WM_RBUTTONDOWN => Some(Captured::Button {
+                    button: 1,
+                    down: true,
+                }),
+                WM_RBUTTONUP => Some(Captured::Button {
+                    button: 1,
+                    down: false,
+                }),
+                WM_MBUTTONDOWN => Some(Captured::Button {
+                    button: 2,
+                    down: true,
+                }),
+                WM_MBUTTONUP => Some(Captured::Button {
+                    button: 2,
+                    down: false,
+                }),
                 WM_XBUTTONDOWN | WM_XBUTTONUP => Some(Captured::Button {
                     button: if high == 1 { 3 } else { 4 },
                     down: wparam.0 as u32 == WM_XBUTTONDOWN,
@@ -319,7 +347,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down && info.flags.0 & LLKHF_INJECTED == 0 {
-            if let Some(hid) = hid_from_scan(info.scanCode as u16, info.flags.0 & LLKHF_EXTENDED != 0) {
+            if let Some(hid) =
+                hid_from_scan(info.scanCode as u16, info.flags.0 & LLKHF_EXTENDED != 0)
+            {
                 lock_key_down(hid, held_modifiers());
             }
         }

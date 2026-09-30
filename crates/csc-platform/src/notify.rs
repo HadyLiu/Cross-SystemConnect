@@ -18,7 +18,11 @@ fn show(title: &str, body: &str, error: bool) {
     };
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let (t, b) = (wide(title), wide(body));
-    let icon = if error { MB_ICONWARNING } else { MB_ICONINFORMATION };
+    let icon = if error {
+        MB_ICONWARNING
+    } else {
+        MB_ICONINFORMATION
+    };
     unsafe {
         MessageBoxW(
             None,
@@ -33,7 +37,9 @@ fn show(title: &str, body: &str, error: bool) {
 fn show(title: &str, body: &str, error: bool) {
     use std::process::{Command, Stdio};
     let quiet = |c: &mut Command| {
-        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
     };
     if error {
         let mut c = Command::new("zenity");

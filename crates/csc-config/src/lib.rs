@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+pub mod logfile;
+
 /// Product data directory name (user-facing).
 pub const APP_DIR_NAME: &str = "Cross-SystemConnect";
 /// Legacy directory used by older builds.
@@ -207,12 +209,13 @@ impl Default for GuiConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub to_file: bool,
+    /// Empty: `log.txt` in the program folder (see `default_log_path`).
     #[serde(default)]
     pub file: String,
 }
@@ -225,8 +228,20 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
-            to_file: false,
+            to_file: true,
             file: String::new(),
+        }
+    }
+}
+
+impl LogConfig {
+    /// File to write: the chosen one, or `log.txt` in the program folder.
+    pub fn path(&self) -> PathBuf {
+        let chosen = self.file.trim();
+        if chosen.is_empty() {
+            default_log_path()
+        } else {
+            PathBuf::from(chosen)
         }
     }
 }
@@ -266,7 +281,7 @@ pub struct ScreenPlace {
 }
 
 /// Version written by this build. Files without the field are version 1.
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 
 fn default_config_version() -> u32 {
     1
@@ -486,7 +501,17 @@ pub fn default_config_path() -> PathBuf {
     modern
 }
 
+/// `log.txt` next to the running program.
 pub fn default_log_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("log.txt")))
+        .unwrap_or_else(fallback_log_path)
+}
+
+/// Used when the program folder cannot be written, for example an installed
+/// program under Program Files or /usr.
+pub fn fallback_log_path() -> PathBuf {
     #[cfg(windows)]
     {
         app_config_dir().join("Cross-SystemConnect.log")
@@ -583,6 +608,12 @@ impl Config {
             // Version 2 raised the copied-text limit to the maximum for everyone.
             self.clipboard.max_inline_mb = MAX_INLINE_MB;
         }
+        if self.config_version < 4 {
+            // Version 4: the log is always written to a file, at level info, unless changed later.
+            self.log.to_file = true;
+            self.log.level = default_log_level();
+            self.log_level = default_log_level();
+        }
         self.config_version = CONFIG_VERSION;
         true
     }
@@ -598,8 +629,16 @@ impl Config {
             }
             stale
         };
-        let back = retire(&mut self.hotkeys.return_to_server, RETIRED_RETURN_KEY, default_return);
-        let lock = retire(&mut self.hotkeys.lock_screen, RETIRED_LOCK_KEY, default_lock);
+        let back = retire(
+            &mut self.hotkeys.return_to_server,
+            RETIRED_RETURN_KEY,
+            default_return,
+        );
+        let lock = retire(
+            &mut self.hotkeys.lock_screen,
+            RETIRED_LOCK_KEY,
+            default_lock,
+        );
         back || lock
     }
 
@@ -785,6 +824,31 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_turns_log_file_on_once() {
+        let dir = std::env::temp_dir().join(format!("csc-cfg-log-{}", std::process::id()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"config_version":3,"name":"Desk","log_level":"debug","log":{"level":"debug","to_file":false,"file":""}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::load_or_create(&path).unwrap();
+        assert!(cfg.log.to_file);
+        assert_eq!(cfg.log.level, "info");
+        assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.log.path(), default_log_path());
+
+        cfg.log.to_file = false;
+        cfg.log.level = "warn".into();
+        cfg.save(&path).unwrap();
+        let again = Config::load_or_create(&path).unwrap();
+        assert!(!again.log.to_file);
+        assert_eq!(again.log.level, "warn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn old_hotkeys_are_replaced() {
         let dir = std::env::temp_dir().join(format!("csc-cfg-hk-{}", std::process::id()));
         let path = dir.join("config.json");
@@ -797,7 +861,9 @@ mod tests {
         let cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
         assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("toggle_enable"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("toggle_enable"));
 
         // A user's own lock key stays; the old return key never survives, even in a current file.
         std::fs::write(
@@ -808,7 +874,9 @@ mod tests {
         let mut cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
         assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+L");
-        assert!(std::fs::read_to_string(&path).unwrap().contains("Ctrl+Alt+/"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("Ctrl+Alt+/"));
 
         cfg.merge_from_value(serde_json::json!({
             "hotkeys": {"lock_screen": "scroll lock", "return_to_server": "Ctrl+Alt+Home"}

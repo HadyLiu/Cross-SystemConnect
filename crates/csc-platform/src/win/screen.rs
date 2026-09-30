@@ -1,6 +1,8 @@
 use crate::traits::{Rect, ScreenInfo, ScreenSize};
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, ShowCursor, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,

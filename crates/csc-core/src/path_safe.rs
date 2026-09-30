@@ -15,13 +15,21 @@ pub fn name_problem(name: &str) -> Option<&'static str> {
     if name.chars().any(|c| (c as u32) < 0x20) {
         return Some("包含控制字符");
     }
-    if name.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')) {
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
         return Some("包含 Windows 不允许的字符 < > : \" / \\ | ? *");
     }
     if name.ends_with('.') || name.ends_with(' ') {
         return Some("以点或空格结尾，Windows 不支持");
     }
-    let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
     let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.len() == 4
