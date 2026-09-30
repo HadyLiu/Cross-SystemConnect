@@ -9,6 +9,7 @@ pub fn app_png_bytes() -> &'static [u8] {
 /// Preferred tray size on Windows (sharp at 100%/125% DPI).
 const TRAY_SIZE: u32 = 32;
 
+#[cfg(not(target_os = "linux"))]
 pub fn app_tray_icon() -> tray_icon::Icon {
     match load_rgba(TRAY_SIZE) {
         Ok((rgba, w, h)) => {
@@ -23,7 +24,7 @@ pub fn app_window_icon() -> Option<tao::window::Icon> {
     tao::window::Icon::from_rgba(rgba, w, h).ok()
 }
 
-fn load_rgba(size: u32) -> Result<(Vec<u8>, u32, u32), ()> {
+pub(crate) fn load_rgba(size: u32) -> Result<(Vec<u8>, u32, u32), ()> {
     let img = image::load_from_memory(ICON_PNG).map_err(|_| ())?;
     let rgba = img
         .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
@@ -32,6 +33,7 @@ fn load_rgba(size: u32) -> Result<(Vec<u8>, u32, u32), ()> {
     Ok((rgba.into_raw(), w, h))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn fallback_icon() -> tray_icon::Icon {
     const W: u32 = 32;
     const H: u32 = 32;

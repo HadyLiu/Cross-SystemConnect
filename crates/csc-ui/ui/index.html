@@ -65,6 +65,7 @@ body{
 }
 .ip-chip:hover{border-color:var(--accent);color:#fff}
 .ip-chip.on{border-color:var(--accent);background:rgba(59,130,246,.22);color:#fff}
+.screen-card{margin-top:14px}
 .desk{
   position:relative;height:420px;margin-top:10px;border-radius:12px;overflow:hidden;
   background:#101218;border:1px solid var(--line);touch-action:none;
@@ -130,6 +131,10 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover{background:var(--accent2)}
 .btn.on{box-shadow:inset 0 0 0 1px #fff}
+.help h2{margin-bottom:8px}
+.help p,.help li{color:var(--text)}
+.help ul{margin:0;padding-left:18px}
+.help li{margin:4px 0}
 </style>
 </head>
 <body>
@@ -137,9 +142,9 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
   <div class="brand"><img class="logo" src="/icon.png" alt=""/><div class="brand-text"><b>Cross-SystemConnect</b><span class="ver">v__CSC_VERSION__</span></div></div>
   <nav class="nav" id="nav">
     <button type="button" class="active" data-page="home"><span class="ico">⌂</span><span>首页</span></button>
-    <button type="button" data-page="layout"><span class="ico">▦</span><span>布局</span></button>
     <button type="button" data-page="settings"><span class="ico">⚙</span><span>设置</span></button>
     <button type="button" data-page="logs"><span class="ico">☰</span><span>日志</span></button>
+    <button type="button" data-page="help"><span class="ico">?</span><span>帮助</span></button>
   </nav>
 </aside>
 <div class="main">
@@ -179,22 +184,10 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
         </div>
       </div>
-    </section>
-    <section class="page" id="page-layout">
-      <div class="stack">
-        <div class="card">
-          <h2>屏幕位置</h2>
-          <p class="hint">键鼠主机固定在中间。连上的电脑出现在周围，拖动方块选择从哪一边穿过去。没有连接时只显示主机。</p>
-          <div class="desk" id="desk"></div>
-        </div>
-        <div class="card">
-          <h2>边缘切换</h2>
-          <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
-          <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
-          <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
-          <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
-          <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
-        </div>
+      <div class="card screen-card" id="screenCard" hidden>
+        <h2>屏幕位置</h2>
+        <p class="hint">仅键鼠主机显示。主机固定在中间。电脑可以放在上、下、左、右，也可以放在四个角。从对应的边或角穿过去。没有连接时只显示主机。</p>
+        <div class="desk" id="desk"></div>
       </div>
     </section>
     <section class="page" id="page-settings">
@@ -204,6 +197,14 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
           <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
           <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
           <label class="check"><input id="prevent_sleep" type="checkbox"/><span>运行时防止休眠</span></label>
+        </div>
+        <div class="card">
+          <h2>边缘切换</h2>
+          <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
+          <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
+          <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
+          <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
+          <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
         </div>
         <div class="card">
           <h2>剪贴板</h2>
@@ -257,6 +258,43 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
         <pre class="logbox" id="logView">等待日志…</pre>
       </div>
     </section>
+    <section class="page" id="page-help">
+      <div class="stack help">
+        <div class="card">
+          <h2>这是什么</h2>
+          <p>用一台电脑的键盘和鼠标控制局域网里的其他 Windows 或 Linux 电脑，并可以同步剪贴板。左上角的版本号来自程序编译时的版本。Windows 双击托盘图标打开这个窗口。Linux 托盘没有双击事件，单击图标打开，右键是菜单。</p>
+        </div>
+        <div class="card">
+          <h2>两种模式</h2>
+          <ul>
+            <li><b>键鼠主机</b>：物理键鼠在这台电脑上。首页会显示屏幕位置，把连上的电脑拖到主机的上下左右或四个角，鼠标移到对应的边或角就会切过去。</li>
+            <li><b>被控端</b>：接受主机的键鼠。不显示屏幕位置。默认就是被控端。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h2>怎么连上</h2>
+          <ul>
+            <li>两台电脑选同一网段的网卡。以太网和 Wi-Fi 都会列出，有以太网时默认用以太网。</li>
+            <li>端口不改则是 24900。两边必须相同，并在防火墙上放行该端口的 UDP 和 TCP。</li>
+            <li>主机搜索时可以同时连多台。新电脑会排队询问：信任（下次不再问）、仅本次、或拒绝。</li>
+            <li>计算机名只在本软件里使用，不会修改 Windows 或 Linux 的计算机名。布局里的名字要和对方的计算机名一致。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h2>快捷键</h2>
+          <ul>
+            <li>锁定屏幕：ScrollLock</li>
+            <li>切回键鼠主机：Ctrl+Alt+Home</li>
+            <li>暂停或恢复共享：Ctrl+Alt+Pause</li>
+          </ul>
+          <p class="hint">可以在「设置」里改。边缘切换的延迟和死区也在设置里。</p>
+        </div>
+        <div class="card">
+          <h2>日志</h2>
+          <p>「日志」页显示内核最近写入的内容。Windows 默认在 %APPDATA%\Cross-SystemConnect\Cross-SystemConnect.log。Linux 默认在 ~/.local/state/cross-systemconnect/Cross-SystemConnect.log。改路径后要重新启动才会写入新文件。</p>
+        </div>
+      </div>
+    </section>
   </div>
   <div class="modal" id="peerModal">
     <div class="modal-card">
@@ -273,19 +311,22 @@ textarea{min-height:120px;resize:vertical;font-family:Consolas,ui-monospace,mono
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const titles={home:'首页',layout:'布局',settings:'设置',logs:'日志'};
+const titles={home:'首页',settings:'设置',logs:'日志',help:'帮助'};
 document.querySelectorAll('#nav button').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b===btn));
     document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+btn.dataset.page));
     $('title').textContent=titles[btn.dataset.page]||'';
-    if(btn.dataset.page==='layout') renderDesk();
+    if(btn.dataset.page==='home') renderDesk();
     if(btn.dataset.page==='logs') refreshLogs();
   };
 });
 function setRole(v){
   $('role').value=v;
   document.querySelectorAll('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  const card=$('screenCard');
+  if(card) card.hidden=v!=='server';
+  if(v==='server') renderDesk();
   scheduleSave();
 }
 document.querySelectorAll('#roleSeg button').forEach(b=>b.onclick=()=>setRole(b.dataset.v));
@@ -388,33 +429,44 @@ function ensurePlace(name){
   placesDirty=true;
   return pos;
 }
+function sectorOf(x, y){
+  const ax=Math.abs(x), ay=Math.abs(y);
+  const horiz=ax>=ay*0.55;
+  const vert=ay>=ax*0.55;
+  if(horiz&&vert){
+    if(y<0) return x>=0?'top_right':'top_left';
+    return x>=0?'bottom_right':'bottom_left';
+  }
+  if(ax>=ay) return x>=0?'right':'left';
+  return y>=0?'bottom':'top';
+}
 function layoutFromPlaces(){
   const host=computerName()||'本机';
   const peers=livePeers.map(p=>places.find(s=>s.name===p.name)).filter(Boolean);
-  const sides={right:[],left:[],top:[],bottom:[]};
+  const opposite={
+    right:'left', left:'right', top:'bottom', bottom:'top',
+    top_right:'bottom_left', top_left:'bottom_right',
+    bottom_right:'top_left', bottom_left:'top_right'
+  };
+  const groups={};
   peers.forEach(p=>{
-    const side=Math.abs(p.x)>=Math.abs(p.y)?(p.x>=0?'right':'left'):(p.y>=0?'bottom':'top');
-    sides[side].push(p);
+    const side=sectorOf(p.x, p.y);
+    (groups[side]||(groups[side]=[])).push(p);
   });
-  sides.right.sort((a,b)=>a.x-b.x);
-  sides.left.sort((a,b)=>b.x-a.x);
-  sides.bottom.sort((a,b)=>a.y-b.y);
-  sides.top.sort((a,b)=>b.y-a.y);
   const out={};
   const link=(a,edge,b)=>{ (out[a]||(out[a]={}))[edge]=b; };
-  const chain=(list,fwd,back)=>{
+  const dist=p=>p.x*p.x+p.y*p.y;
+  Object.keys(groups).forEach(side=>{
+    const list=groups[side].sort((a,b)=>dist(a)-dist(b));
+    const back=opposite[side];
     if(!list.length) return;
-    link(host,fwd,list[0].name);
+    link(host,side,list[0].name);
     link(list[0].name,back,host);
     for(let i=0;i<list.length-1;i++){
-      link(list[i].name,fwd,list[i+1].name);
+      link(list[i].name,side,list[i+1].name);
       link(list[i+1].name,back,list[i].name);
     }
-  };
-  chain(sides.right,'right','left');
-  chain(sides.left,'left','right');
-  chain(sides.bottom,'bottom','top');
-  chain(sides.top,'top','bottom');
+  });
   return out;
 }
 function makeMon(name, sub, local){
@@ -528,8 +580,11 @@ async function getStatus(){
 }
 async function getLogs(){
   const r=await fetch('/logs');
-  if(!r.ok) throw new Error('logs HTTP '+r.status);
-  return r.json();
+  let j=null;
+  try{ j=await r.json(); }catch(_){}
+  if(!r.ok) throw new Error((j&&j.error)||('logs HTTP '+r.status));
+  if(j&&j.error&&!(j.text)) throw new Error(j.error);
+  return j||{};
 }
 function saveBody(){
   const host=computerName();

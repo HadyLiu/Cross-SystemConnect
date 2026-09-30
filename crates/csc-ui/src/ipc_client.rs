@@ -45,18 +45,33 @@ fn call_raw(method: &str, params: Value) -> anyhow::Result<IpcResponse> {
     let mut conn = open_pipe()?;
     conn.write_all(&bytes)?;
     let _ = conn.flush();
-    let mut buf = vec![0u8; 256 * 1024];
+    // Linux: closing the write half lets the core finish the request. A blocking
+    // read can also return EINTR while WebKit is delivering signals; retry that.
+    #[cfg(unix)]
+    {
+        use std::net::Shutdown;
+        let _ = conn.shutdown(Shutdown::Write);
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(3)));
+    }
+    read_ipc_response(&mut conn)
+}
+
+fn read_ipc_response(conn: &mut impl Read) -> anyhow::Result<IpcResponse> {
+    let mut buf = vec![0u8; 64 * 1024];
     let mut got = Vec::new();
-    // Bound wait: pipe may deliver response in one or more reads
-    for _ in 0..64 {
-        let n = conn.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+    for _ in 0..128 {
+        let n = match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                anyhow::bail!("ipc timed out waiting for the core")
+            }
+            Err(e) => return Err(e.into()),
+        };
         got.extend_from_slice(&buf[..n]);
         if let Some((_, value)) = try_decode_ipc_message(&got)? {
-            let resp: IpcResponse = serde_json::from_value(value)?;
-            return Ok(resp);
+            return Ok(serde_json::from_value(value)?);
         }
     }
     anyhow::bail!("ipc closed without response")
@@ -172,6 +187,45 @@ fn kill_core_by_lock() {
             .status();
     }
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_ipc_response;
+    use csc_proto::{encode_ipc_message, IpcResponse};
+    use std::io::{self, Cursor, Read};
+
+    struct InterruptOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: Read> Read for InterruptOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn ipc_read_retries_interrupted_then_decodes() {
+        let raw = encode_ipc_message(&IpcResponse::ok(
+            7,
+            serde_json::json!({"text": "line"}),
+        ))
+        .unwrap();
+        let conn = InterruptOnce {
+            inner: Cursor::new(raw),
+            interrupted: false,
+        };
+        let mut conn = conn;
+        let resp = read_ipc_response(&mut conn).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["text"], "line");
+    }
 }
 
 /// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.

@@ -80,6 +80,7 @@ async fn handle_conn_windows(
             let resp = dispatch(&state, req).await;
             let bytes = encode_ipc_message(&resp)?;
             pipe.write_all(&bytes).await?;
+            pipe.flush().await?;
         }
     }
     Ok(())
@@ -139,6 +140,7 @@ async fn handle_conn_unix(
             let resp = dispatch(&state, req).await;
             let bytes = encode_ipc_message(&resp)?;
             stream.write_all(&bytes).await?;
+            stream.flush().await?;
         }
     }
     Ok(())
@@ -227,8 +229,14 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "get_logs" | "getLogs" => {
-            let text = read_log_tail(&state.log_path, 48 * 1024);
-            IpcResponse::ok(req.id, json!({"text": text}))
+            let path = state.log_path.clone();
+            let text = tokio::task::spawn_blocking(move || read_log_tail(&path, 48 * 1024))
+                .await
+                .unwrap_or_default();
+            IpcResponse::ok(
+                req.id,
+                json!({"text": text, "path": state.log_path.display().to_string()}),
+            )
         }
         "quit" => {
             let quit_tx = state.quit_tx.clone();

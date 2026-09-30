@@ -19,6 +19,11 @@ dirs.workspace = true
 
 tao = "0.30"
 wry = { version = "0.47", features = ["linux-body"] }
-tray-icon = "0.19"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "0.19"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"

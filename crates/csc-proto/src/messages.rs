@@ -3,12 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Edge {
     Left,
     Right,
     Top,
     Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 impl Edge {
@@ -18,6 +22,10 @@ impl Edge {
             Self::Right => Self::Left,
             Self::Top => Self::Bottom,
             Self::Bottom => Self::Top,
+            Self::TopLeft => Self::BottomRight,
+            Self::TopRight => Self::BottomLeft,
+            Self::BottomLeft => Self::TopRight,
+            Self::BottomRight => Self::TopLeft,
         }
     }
 
@@ -27,6 +35,10 @@ impl Edge {
             Self::Right => "right",
             Self::Top => "top",
             Self::Bottom => "bottom",
+            Self::TopLeft => "top_left",
+            Self::TopRight => "top_right",
+            Self::BottomLeft => "bottom_left",
+            Self::BottomRight => "bottom_right",
         }
     }
 
@@ -36,6 +48,10 @@ impl Edge {
             "right" => Some(Self::Right),
             "top" => Some(Self::Top),
             "bottom" => Some(Self::Bottom),
+            "top_left" => Some(Self::TopLeft),
+            "top_right" => Some(Self::TopRight),
+            "bottom_left" => Some(Self::BottomLeft),
+            "bottom_right" => Some(Self::BottomRight),
             _ => None,
         }
     }
@@ -176,6 +192,10 @@ fn encode_switch_msg(msg_type: MsgType, s: &SwitchPayload) -> Vec<u8> {
         Edge::Right => 1,
         Edge::Top => 2,
         Edge::Bottom => 3,
+        Edge::TopLeft => 4,
+        Edge::TopRight => 5,
+        Edge::BottomLeft => 6,
+        Edge::BottomRight => 7,
     };
     let mut body = vec![edge];
     body.extend_from_slice(&s.position_pct.to_le_bytes());

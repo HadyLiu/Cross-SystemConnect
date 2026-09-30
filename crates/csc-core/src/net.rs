@@ -691,7 +691,12 @@ async fn dispatch_frame(
                     0 => csc_proto::Edge::Left,
                     1 => csc_proto::Edge::Right,
                     2 => csc_proto::Edge::Top,
-                    _ => csc_proto::Edge::Bottom,
+                    3 => csc_proto::Edge::Bottom,
+                    4 => csc_proto::Edge::TopLeft,
+                    5 => csc_proto::Edge::TopRight,
+                    6 => csc_proto::Edge::BottomLeft,
+                    7 => csc_proto::Edge::BottomRight,
+                    _ => return Ok(()),
                 };
                 let pct = f32::from_le_bytes(frame.payload[1..5].try_into()?);
                 let p = SwitchPayload {

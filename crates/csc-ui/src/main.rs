@@ -2,6 +2,8 @@
 
 mod icon;
 mod ipc_client;
+#[cfg(target_os = "linux")]
+mod linux_tray;
 
 use anyhow::Context;
 use serde_json::json;
@@ -11,6 +13,7 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder},
     window::WindowBuilder,
 };
+#[cfg(not(target_os = "linux"))]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIconBuilder, TrayIconEvent,
@@ -22,13 +25,14 @@ use wry::{
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-enum UserEvent {
+#[derive(Clone, Copy)]
+pub(crate) enum UserEvent {
     ShowSettings,
     Quit,
     ToggleShare,
 }
 
-fn app_title() -> String {
+pub(crate) fn app_title() -> String {
     format!("Cross-SystemConnect v{APP_VERSION}")
 }
 
@@ -104,9 +108,10 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
                     .body(Cow::Owned(body))?);
             }
             Err(e) => {
+                // Keep HTTP 200 so the log page can show the IPC reason. A 503
+                // was only the status code and hid why the read failed.
                 let body = serde_json::to_vec(&json!({"text": "", "error": e.to_string()}))?;
                 return Ok(cors_headers(Response::builder())
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Cow::Owned(body))?);
             }
@@ -267,49 +272,59 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let tray_menu = Menu::new();
-    let item_settings = MenuItem::new("打开设置", true, None);
-    let item_share = MenuItem::new("暂停/启用共享", true, None);
-    let item_quit = MenuItem::new("退出", true, None);
-    tray_menu.append(&item_settings)?;
-    tray_menu.append(&item_share)?;
-    tray_menu.append(&item_quit)?;
+    #[cfg(not(target_os = "linux"))]
+    let mut tray_icon = {
+        let tray_menu = Menu::new();
+        let item_settings = MenuItem::new("打开设置", true, None);
+        let item_share = MenuItem::new("暂停/启用共享", true, None);
+        let item_quit = MenuItem::new("退出", true, None);
+        tray_menu.append(&item_settings)?;
+        tray_menu.append(&item_share)?;
+        tray_menu.append(&item_quit)?;
 
-    let tray_icon_img = icon::app_tray_icon();
-    let mut tray_icon = Some(
-        TrayIconBuilder::new()
+        let tray_icon_img = icon::app_tray_icon();
+        let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip(app_title())
             .with_icon(tray_icon_img)
             .build()
-            .context("create tray icon")?,
-    );
+            .context("create tray icon")?;
 
-    let settings_id = item_settings.id().clone();
-    let share_id = item_share.id().clone();
-    let quit_id = item_quit.id().clone();
+        let settings_id = item_settings.id().clone();
+        let share_id = item_share.id().clone();
+        let quit_id = item_quit.id().clone();
 
-    MenuEvent::set_event_handler(Some({
-        let proxy = proxy.clone();
-        move |event: MenuEvent| {
-            if event.id == settings_id {
-                let _ = proxy.send_event(UserEvent::ShowSettings);
-            } else if event.id == share_id {
-                let _ = proxy.send_event(UserEvent::ToggleShare);
-            } else if event.id == quit_id {
-                let _ = proxy.send_event(UserEvent::Quit);
+        MenuEvent::set_event_handler(Some({
+            let proxy = proxy.clone();
+            move |event: MenuEvent| {
+                if event.id == settings_id {
+                    let _ = proxy.send_event(UserEvent::ShowSettings);
+                } else if event.id == share_id {
+                    let _ = proxy.send_event(UserEvent::ToggleShare);
+                } else if event.id == quit_id {
+                    let _ = proxy.send_event(UserEvent::Quit);
+                }
             }
-        }
-    }));
+        }));
 
-    TrayIconEvent::set_event_handler(Some({
-        let proxy = proxy.clone();
-        move |event: TrayIconEvent| {
-            if let TrayIconEvent::DoubleClick { .. } = event {
-                let _ = proxy.send_event(UserEvent::ShowSettings);
+        TrayIconEvent::set_event_handler(Some({
+            let proxy = proxy.clone();
+            move |event: TrayIconEvent| {
+                if let TrayIconEvent::DoubleClick { .. } = event {
+                    let _ = proxy.send_event(UserEvent::ShowSettings);
+                }
             }
-        }
-    }));
+        }));
+        Some(tray_icon)
+    };
+    #[cfg(target_os = "linux")]
+    {
+        // Linux panels do not deliver a double-click. Left click is Activate.
+        ksni::TrayService::new(linux_tray::LinuxTray {
+            proxy: proxy.clone(),
+        })
+        .spawn();
+    }
 
     // Bring the settings window forward when a client asks to connect.
     {
@@ -403,6 +418,7 @@ fn main() -> anyhow::Result<()> {
             }
             Event::UserEvent(UserEvent::Quit) => {
                 let _ = ipc_client::quit_core();
+                #[cfg(not(target_os = "linux"))]
                 tray_icon.take();
                 webview.take();
                 window.take();

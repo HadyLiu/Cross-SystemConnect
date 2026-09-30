@@ -131,18 +131,27 @@ impl SwitchController {
                 *cursor_y = remote.height.saturating_sub(1);
                 *cursor_x = ((remote.width as f32) * pct) as i32;
             }
+            Edge::TopLeft => {
+                *cursor_x = 0;
+                *cursor_y = 0;
+            }
+            Edge::TopRight => {
+                *cursor_x = remote.width.saturating_sub(1);
+                *cursor_y = 0;
+            }
+            Edge::BottomLeft => {
+                *cursor_x = 0;
+                *cursor_y = remote.height.saturating_sub(1);
+            }
+            Edge::BottomRight => {
+                *cursor_x = remote.width.saturating_sub(1);
+                *cursor_y = remote.height.saturating_sub(1);
+            }
         }
     }
 
     pub fn confirm_returned(&mut self) {
         self.unlock_to_local();
-    }
-
-    fn in_corner_dead_zone(&self, x: i32, y: i32) -> bool {
-        let d = self.cfg.corner_dead_zone_px;
-        let w = self.screen.width;
-        let h = self.screen.height;
-        (x <= d || x >= w - d) && (y <= d || y >= h - d)
     }
 
     fn hit_outer_edge(&self, x: i32, y: i32) -> Option<Edge> {
@@ -161,15 +170,43 @@ impl SwitchController {
         }
     }
 
+    /// Corner that the pointer is in, using the configured dead-zone size.
+    fn diagonal_at(&self, x: i32, y: i32) -> Option<Edge> {
+        let d = self.cfg.corner_dead_zone_px.max(0);
+        let w = self.screen.width;
+        let h = self.screen.height;
+        let left = x <= d;
+        let right = x >= w.saturating_sub(1).saturating_sub(d);
+        let top = y <= d;
+        let bottom = y >= h.saturating_sub(1).saturating_sub(d);
+        if left && top {
+            Some(Edge::TopLeft)
+        } else if right && top {
+            Some(Edge::TopRight)
+        } else if left && bottom {
+            Some(Edge::BottomLeft)
+        } else if right && bottom {
+            Some(Edge::BottomRight)
+        } else {
+            None
+        }
+    }
+
     pub fn on_local_cursor(&mut self, x: i32, y: i32, now: Instant) -> Option<EnterDecision> {
         if !self.enabled || self.state != SwitchState::Local {
             return None;
         }
-        if self.in_corner_dead_zone(x, y) {
-            self.pending_edge = None;
-            return None;
-        }
-        let Some(edge) = self.hit_outer_edge(x, y) else {
+        let edge = if let Some(diag) = self.diagonal_at(x, y) {
+            if self.layout.neighbor(&self.local_name, diag).is_some() {
+                diag
+            } else {
+                // No machine on this corner: keep the corner from triggering a side.
+                self.pending_edge = None;
+                return None;
+            }
+        } else if let Some(edge) = self.hit_outer_edge(x, y) {
+            edge
+        } else {
             self.pending_edge = None;
             self.pending_second_tap = false;
             return None;
@@ -233,6 +270,7 @@ impl SwitchController {
                     0.5
                 }
             }
+            Edge::TopLeft | Edge::TopRight | Edge::BottomLeft | Edge::BottomRight => 0.5,
         };
         EnterDecision {
             neighbor,
@@ -254,13 +292,38 @@ impl SwitchController {
         }
         *cursor_x += dx;
         *cursor_y += dy;
-        let leave_edge = if *cursor_x < 0 {
+        let past_left = *cursor_x < 0;
+        let past_right = *cursor_x >= remote.width;
+        let past_top = *cursor_y < 0;
+        let past_bottom = *cursor_y >= remote.height;
+        let diagonal = match (past_left, past_right, past_top, past_bottom) {
+            (true, _, true, _) => Some(Edge::TopLeft),
+            (_, true, true, _) => Some(Edge::TopRight),
+            (true, _, _, true) => Some(Edge::BottomLeft),
+            (_, true, _, true) => Some(Edge::BottomRight),
+            _ => None,
+        };
+        let leave_edge = if let Some(diag) = diagonal {
+            if self.layout.neighbor(&self.active_remote, diag).is_some() {
+                Some(diag)
+            } else if past_left {
+                Some(Edge::Left)
+            } else if past_right {
+                Some(Edge::Right)
+            } else if past_top {
+                Some(Edge::Top)
+            } else if past_bottom {
+                Some(Edge::Bottom)
+            } else {
+                None
+            }
+        } else if past_left {
             Some(Edge::Left)
-        } else if *cursor_x >= remote.width {
+        } else if past_right {
             Some(Edge::Right)
-        } else if *cursor_y < 0 {
+        } else if past_top {
             Some(Edge::Top)
-        } else if *cursor_y >= remote.height {
+        } else if past_bottom {
             Some(Edge::Bottom)
         } else {
             None
@@ -297,5 +360,53 @@ mod tests {
         let d = sw.on_local_cursor(99, 50, Instant::now()).expect("enter");
         assert_eq!(d.neighbor, "REMOTE");
         assert_eq!(d.edge, Edge::Right);
+    }
+
+    #[test]
+    fn corner_enters_diagonal_neighbor() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("top_right".into(), "CORNER".into());
+        e.insert("right".into(), "SIDE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 100,
+                height: 80,
+            },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        let d = sw
+            .on_local_cursor(99, 0, Instant::now())
+            .expect("diagonal");
+        assert_eq!(d.neighbor, "CORNER");
+        assert_eq!(d.edge, Edge::TopRight);
+    }
+
+    #[test]
+    fn corner_without_diagonal_does_not_switch() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("right".into(), "SIDE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 100,
+                height: 80,
+            },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        assert!(sw.on_local_cursor(99, 0, Instant::now()).is_none());
+        let side = sw
+            .on_local_cursor(99, 40, Instant::now())
+            .expect("right edge");
+        assert_eq!(side.neighbor, "SIDE");
+        assert_eq!(side.edge, Edge::Right);
     }
 }
