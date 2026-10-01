@@ -358,6 +358,8 @@ struct Core {
     zone_blocked: bool,
     drag_pending: bool,
     drag_route: Option<DragRoute>,
+    /// Controlled side: a drag from this computer (the sender) is on this screen.
+    incoming_drag: Option<String>,
     clip_seq: u64,
     last_remote_clip: u64,
     shared: SharedClip,
@@ -917,6 +919,7 @@ impl Core {
         let seq = self.clip_seq;
         match ev {
             ClipEvent::Text(text) => {
+                info!("copied text here ({} chars)", text.chars().count());
                 if host {
                     self.shared.copied("", seq, false);
                     csc_platform::paste_watch(false);
@@ -944,6 +947,14 @@ impl Core {
                 self.send_clip_offer(&offer, &peers, None).await;
             }
             ClipEvent::Files(paths) => {
+                info!(
+                    "copied {} file(s) here: {}",
+                    paths.len(),
+                    paths
+                        .first()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
                 self.my_files = Some((seq, paths.clone()));
                 if host {
                     self.shared.copied("", seq, true);
@@ -951,6 +962,7 @@ impl Core {
                     return;
                 }
                 if peers.is_empty() || !c.files {
+                    info!("copied files are not offered: no keyboard host, or file copying is off");
                     return;
                 }
                 // Only names go out; the files are sent when someone pastes them.
@@ -972,18 +984,39 @@ impl Core {
                 };
                 self.send_clip_offer(&offer, &peers, None).await;
             }
+            ClipEvent::Image(img) => {
+                info!(
+                    "copied an image here ({}x{}, {} KB PNG)",
+                    img.width,
+                    img.height,
+                    img.png.len() / 1024
+                );
+                if host {
+                    self.shared.copied("", seq, false);
+                    csc_platform::paste_watch(false);
+                }
+                if peers.is_empty() || !c.enabled || !c.image {
+                    return;
+                }
+                let limit = c.max_inline_bytes().min(csc_proto::MAX_PAYLOAD - 8);
+                if img.png.len() > limit {
+                    popup(
+                        &format!(
+                            "复制的图片有 {:.1} MB，超过同步上限 {} MB，没有同步到其他电脑。",
+                            img.png.len() as f64 / (1024.0 * 1024.0),
+                            c.max_inline_mb
+                        ),
+                        true,
+                    );
+                    return;
+                }
+                let frame = csc_proto::encode_clip_image_bin(seq, &img.png);
+                self.send_clip_frame(frame, &peers, None).await;
+            }
         }
     }
 
-    async fn send_clip_offer(
-        &self,
-        offer: &ClipOfferPayload,
-        peers: &[String],
-        except: Option<&str>,
-    ) {
-        let Ok(frame) = encode_json_frame(MsgType::ClipOffer, offer) else {
-            return;
-        };
+    async fn send_clip_frame(&self, frame: Vec<u8>, peers: &[String], except: Option<&str>) {
         for p in peers {
             if except.is_some_and(|e| e.eq_ignore_ascii_case(p)) {
                 continue;
@@ -996,12 +1029,48 @@ impl Core {
         }
     }
 
+    /// An image copied on `peer`. The keyboard host passes it on like text.
+    async fn on_clip_image(&mut self, peer: &str, payload: Vec<u8>) {
+        let Some((seq, png)) = csc_proto::decode_clip_image_bin(&payload) else {
+            warn!("bad clipboard image from {peer}");
+            return;
+        };
+        info!("{peer} copied an image ({} KB PNG)", png.len() / 1024);
+        let c = self.config.read().await.clipboard.clone();
+        if self.is_host().await {
+            self.shared.copied(peer, seq, false);
+            csc_platform::paste_watch(false);
+            let peers = self.net.peer_names().await;
+            let frame = csc_proto::encode_clip_image_bin(seq, png);
+            self.send_clip_frame(frame, &peers, Some(peer)).await;
+        }
+        if c.enabled && c.image && seq != self.last_remote_clip {
+            self.last_remote_clip = seq;
+            self.clip.set_image(png.to_vec());
+        }
+    }
+
+    async fn send_clip_offer(
+        &self,
+        offer: &ClipOfferPayload,
+        peers: &[String],
+        except: Option<&str>,
+    ) {
+        let Ok(frame) = encode_json_frame(MsgType::ClipOffer, offer) else {
+            return;
+        };
+        self.send_clip_frame(frame, peers, except).await;
+    }
+
     async fn on_clip_offer(&mut self, peer: &str, offer: ClipOfferPayload) {
         let host = self.is_host().await;
         let c = self.config.read().await.clipboard.clone();
         if offer.formats.iter().any(|f| f == "files") {
             if host && c.files {
-                debug!("{peer} copied {} file(s)", offer.files.len());
+                info!(
+                    "{peer} copied {} file(s); Ctrl+V on another computer fetches them",
+                    offer.files.len()
+                );
                 self.shared.copied(peer, offer.seq, true);
                 csc_platform::paste_watch(true);
             }
@@ -1019,7 +1088,7 @@ impl Core {
         }
         if c.enabled && c.text && offer.seq != self.last_remote_clip {
             self.last_remote_clip = offer.seq;
-            debug!(
+            info!(
                 "clipboard text from {peer} ({} chars)",
                 text.chars().count()
             );
@@ -1166,6 +1235,7 @@ impl Core {
                 button: 0,
                 down: true,
             });
+            self.incoming_drag = Some(peer.to_string());
         }
         self.drag.begin(peer.to_string(), begin).await;
     }
@@ -1232,8 +1302,17 @@ impl Core {
             return;
         };
         let dragging = self.injected.buttons.contains(&0);
+        if !dragging {
+            self.incoming_drag = None;
+        }
         let host_reads_edges = self.net.peer_caps(&host).await & CAP_EDGE_REPORT != 0;
-        if dragging && host_reads_edges && self.config.read().await.file_transfer.enabled {
+        // What is being dragged here came from another computer: the edge window
+        // would only catch our own placeholders and send them back.
+        if dragging
+            && self.incoming_drag.is_none()
+            && host_reads_edges
+            && self.config.read().await.file_transfer.enabled
+        {
             let r = drop_zone_rect(
                 report.edge,
                 real.0,
@@ -1251,6 +1330,12 @@ impl Core {
             };
             self.show_zone(zone, ZoneOrigin::Controlled(report)).await;
             return;
+        }
+        if let Some(from) = self.incoming_drag.take() {
+            info!(
+                "pointer pushed {:?} during the drag from {from}; that drag is cancelled",
+                report.edge
+            );
         }
         info!(
             "pointer at {:?} pushed {:?} {:.2} (corner {:?})",
@@ -1316,6 +1401,7 @@ impl Core {
                 Ok(offer) => self.on_clip_offer(&peer, offer).await,
                 Err(e) => warn!("bad clip offer: {e}"),
             },
+            MsgType::ClipData => self.on_clip_image(&peer, payload).await,
             MsgType::EdgeHit => {
                 if let Ok(hit) = serde_json::from_slice(&payload) {
                     self.on_edge_hit(&peer, hit).await;
@@ -1691,6 +1777,7 @@ async fn main() -> anyhow::Result<()> {
         zone_blocked: false,
         drag_pending: false,
         drag_route: None,
+        incoming_drag: None,
         clip_seq,
         last_remote_clip: 0,
         shared: SharedClip::default(),

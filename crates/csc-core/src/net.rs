@@ -23,6 +23,7 @@ use csc_proto::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -744,6 +745,7 @@ fn spawn_server_link(
                 inbound.last_peers.lock().await.insert(key.clone(), tcp_addr);
                 refresh_link_status(&status, &peers).await;
                 let kick = inbound.kick.clone();
+                let events = inbound.clone();
                 tokio::select! {
                     result = session(
                         &cfg,
@@ -765,6 +767,7 @@ fn spawn_server_link(
                     _ = stop.changed() => {}
                 }
                 peers.remove_owned(&key, &tx).await;
+                report_gone(&peers, &events, &key).await;
                 refresh_link_status(&status, &peers).await;
                 kick.notify_one();
             }
@@ -914,11 +917,13 @@ struct ClientCtx {
 async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
     let key = peer.ip().to_string();
     let (tx, rx) = new_link();
+    let registered = Arc::new(AtomicBool::new(false));
     let link = ClientLink {
         peers: ctx.peers.clone(),
         status: ctx.status.clone(),
         key: key.clone(),
         tx: tx.clone(),
+        registered: registered.clone(),
     };
     let admit = Admit {
         app_status: ctx.app_status.clone(),
@@ -957,8 +962,27 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
         _ = stop.changed() => {}
     }
     ctx.peers.remove_owned(&key, &tx).await;
+    // A second connection that never got past HELLO or trust was never this peer's session.
+    if registered.load(Ordering::Acquire) {
+        report_gone(&ctx.peers, &ctx.inbound, &key).await;
+    }
     refresh_link_status(&ctx.status, &ctx.peers).await;
     ctx.inbound.kick.notify_one();
+}
+
+/// Tell the main loop `key` is gone, unless another session to it has taken over.
+/// Both sides dial at once when they reconnect; the extra link ending is not a disconnect.
+async fn report_gone(peers: &PeerTable, wires: &Wires, key: &str) {
+    if peers.contains(key).await {
+        debug!("extra session to {key} closed; another one is still up");
+        return;
+    }
+    let _ = wires
+        .events
+        .send(InboundEvent::Disconnected {
+            peer: key.to_string(),
+        })
+        .await;
 }
 
 /// Consecutive discovery rounds where no datagram could be sent. The socket is
@@ -1162,6 +1186,8 @@ struct ClientLink {
     status: Arc<RwLock<NetStatus>>,
     key: String,
     tx: Link,
+    /// Set once the session is in the peer table.
+    registered: Arc<AtomicBool>,
 }
 
 struct Admit {
@@ -1173,46 +1199,6 @@ struct Admit {
     address: String,
 }
 
-/// Runs one control session and always reports `Disconnected` when it ends,
-/// whether the peer closed, reset, timed out or sent garbage.
-#[allow(clippy::too_many_arguments)]
-async fn session<S>(
-    cfg: &Config,
-    live: &Arc<RwLock<Config>>,
-    config_path: &Path,
-    stream: S,
-    peer_cert: Vec<u8>,
-    status: &Arc<RwLock<NetStatus>>,
-    peer: String,
-    outbound: LinkRx,
-    inbound: Wires,
-    link: Option<ClientLink>,
-    admit: Option<Admit>,
-) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let result = session_inner(
-        cfg,
-        live,
-        config_path,
-        stream,
-        peer_cert,
-        status,
-        peer.clone(),
-        outbound,
-        inbound.clone(),
-        link,
-        admit,
-    )
-    .await;
-    let _ = inbound
-        .events
-        .send(InboundEvent::Disconnected { peer })
-        .await;
-    result
-}
-
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -1221,8 +1207,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Runs one control session. The caller reports `Disconnected` (see `report_gone`),
+/// whether the peer closed, reset, timed out or sent garbage.
 #[allow(clippy::too_many_arguments)]
-async fn session_inner<S>(
+async fn session<S>(
     cfg: &Config,
     live: &Arc<RwLock<Config>>,
     config_path: &Path,
@@ -1350,6 +1338,7 @@ where
 
     if let Some(link) = link {
         link.peers.insert(&link.key, link.tx).await;
+        link.registered.store(true, Ordering::Release);
         refresh_link_status(&link.status, &link.peers).await;
     }
 
@@ -1567,6 +1556,7 @@ async fn dispatch_frame(
                 .await;
         }
         MsgType::ClipOffer
+        | MsgType::ClipData
         | MsgType::EdgeHit
         | MsgType::PasteRequest
         | MsgType::DragBegin

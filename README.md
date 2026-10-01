@@ -39,18 +39,20 @@
 
 完整步骤见 **[Doc/开发环境.md](Doc/开发环境.md)**。
 
+使用 release 版本。重新编译前先托盘右键「退出」，否则新启动的界面会连上还在运行的旧内核。
+
 ```bash
 cargo build --release -p csc-core -p csc-ui
 
-# 推荐入口：托盘 UI（自动启动内核）
-./target/release/Cross-SystemConnect.exe
+# 推荐入口：托盘 UI（自动启动同目录下的内核）
+./target/release/Cross-SystemConnect        # Windows: .\target\release\Cross-SystemConnect.exe
 
 # 仅内核
-./target/release/Cross-SystemConnect-core.exe
+./target/release/Cross-SystemConnect-core   # Windows: .\target\release\Cross-SystemConnect-core.exe
 ```
 
-配置：`%APPDATA%\Cross-SystemConnect\config.json`（会自动迁移旧版 `%APPDATA%\CSC\`）。  
-日志：`%APPDATA%\Cross-SystemConnect\Cross-SystemConnect.log`。
+配置：Windows `%APPDATA%\Cross-SystemConnect\config.json`（会自动迁移旧版 `%APPDATA%\CSC\`），Linux `~/.config/cross-systemconnect/config.json`。  
+日志：程序目录下的 `log.txt`（如 `target/release/log.txt`），超过 100 KB 自动清空。
 
 托盘右键只有「设置」和「退出」。Windows 可双击托盘图标；Linux 用左键打开设置。被控端首次连上时只提示「信任」或「取消」。
 

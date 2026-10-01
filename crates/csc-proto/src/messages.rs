@@ -340,6 +340,20 @@ pub fn encode_lock_screen_bin() -> Vec<u8> {
     encode_frame(MsgType::LockScreen, &[], 0)
 }
 
+/// A copied image: `ClipData` with the copy's sequence number, then the PNG.
+pub fn encode_clip_image_bin(seq: u64, png: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + png.len());
+    body.extend_from_slice(&seq.to_le_bytes());
+    body.extend_from_slice(png);
+    encode_frame(MsgType::ClipData, &body, 0)
+}
+
+pub fn decode_clip_image_bin(payload: &[u8]) -> Option<(u64, &[u8])> {
+    let seq = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+    let png = &payload[8..];
+    (!png.is_empty()).then_some((seq, png))
+}
+
 fn encode_switch_msg(msg_type: MsgType, s: &SwitchPayload) -> Vec<u8> {
     let edge = match s.edge {
         Edge::Left => 0u8,

@@ -20,6 +20,7 @@ pub enum MsgType {
     Key = 0x23,
     ClipOffer = 0x30,
     ClipRequest = 0x31,
+    /// A copied image (PNG), see `encode_clip_image_bin`.
     ClipData = 0x32,
     /// Keyboard host to the computer that copied files: send them for pasting.
     PasteRequest = 0x33,
