@@ -2,6 +2,7 @@
 /target/
 **/target/
 /dist/
+/dist/
 **/*.pdb
 **/*.ilk
 **/*.exp

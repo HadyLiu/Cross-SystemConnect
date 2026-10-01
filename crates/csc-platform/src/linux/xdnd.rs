@@ -292,7 +292,7 @@ impl Drag {
             .reply()
             .map_err(err)?;
         if u16::from(held.mask) & 0x100 != 0 {
-            super::xdo::x_button(1, false);
+            super::inject_x_button(1, false);
             std::thread::sleep(Duration::from_millis(20));
         }
         self.pos = (held.root_x, held.root_y);
@@ -316,7 +316,7 @@ impl Drag {
                 .status;
             if status == GrabStatus::SUCCESS {
                 self.conn.flush().map_err(err)?;
-                super::xdo::x_button(1, true);
+                super::inject_x_button(1, true);
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(30));
@@ -432,7 +432,7 @@ impl Drag {
             if self.cancelled() {
                 self.leave()?;
                 self.conn.flush().map_err(err)?;
-                super::xdo::x_button(1, false);
+                super::inject_x_button(1, false);
                 return Ok(DragEvent::Cancelled {
                     id,
                     reason: "left screen",

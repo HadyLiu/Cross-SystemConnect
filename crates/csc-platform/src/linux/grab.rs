@@ -272,7 +272,7 @@ pub fn start() -> bool {
         return ok;
     }
     if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland")) {
-        warn!("Wayland session: X11 grabs do not see native windows; only pointer motion is forwarded");
+        warn!("Wayland session: X11 cannot grab native windows; this screen is controlled through /dev/uinput and does not ask for remote interaction");
         *started = Some(false);
         return false;
     }

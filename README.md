@@ -31,7 +31,7 @@
 - **`Cross-SystemConnect-core`**：无界面内核（网络、切换、剪贴板、文件、本机 IPC）
 - **`Cross-SystemConnect`**：托盘 + 内嵌 WebView 设置；经 Named Pipe / Unix socket 控制内核；启动时自动拉起内核
 
-不使用本机 HTTP 配置端口。Windows 构建使用 **MSYS2 UCRT64 + GNU**（**不使用 MSVC**）。
+不使用本机 HTTP 配置端口。Windows 与 Linux 的可执行文件由 Docker 镜像 `cross-systemconnect-packager` 一次生成，不在两端分别编译。Windows 目标仍是 GNU，不使用 MSVC。
 
 ---
 
@@ -39,28 +39,30 @@
 
 完整步骤见 **[Doc/开发环境.md](Doc/开发环境.md)**。
 
-使用 release 版本。重新编译前先托盘右键「退出」，否则新启动的界面会连上还在运行的旧内核。
+使用 Docker 生成的程序。重新生成前先托盘右键「退出」，否则新启动的界面会连上还在运行的旧内核。
 
 ```bash
-cargo build --release -p csc-core -p csc-ui
+bash scripts/package-docker.sh
 
-# 推荐入口：托盘 UI（自动启动同目录下的内核）
-./target/release/Cross-SystemConnect        # Windows: .\target\release\Cross-SystemConnect.exe
+# Linux（界面会拉起同目录的内核）
+./dist/linux/Cross-SystemConnect
 
-# 仅内核
-./target/release/Cross-SystemConnect-core   # Windows: .\target\release\Cross-SystemConnect-core.exe
+# Windows
+.\dist\windows\Cross-SystemConnect.exe
 ```
 
+压缩包：`dist/Cross-SystemConnect-linux-x86_64.tar.gz`、`dist/Cross-SystemConnect-windows-x86_64.zip`。
+
 配置：Windows `%APPDATA%\Cross-SystemConnect\config.json`（会自动迁移旧版 `%APPDATA%\CSC\`），Linux `~/.config/cross-systemconnect/config.json`。  
-日志：程序目录下的 `log.txt`（如 `target/release/log.txt`），超过 100 KB 自动清空。
+日志：程序目录下的 `log.txt`（如 `dist/linux/log.txt`），超过 100 KB 自动清空。
 
 托盘右键只有「设置」和「退出」。Windows 可双击托盘图标；Linux 用左键打开设置。被控端首次连上时只提示「信任」或「取消」。
 
 电脑之间的键鼠通道是 TLS。每台机器在配置目录保存自己的 `identity.crt` 和 `identity.key`。发现广播只包含计算机名和端口。
 
-Linux 被控端要能移动指针，需要 `libx11-6`、`libxtst6`，以及 X11 或 XWayland。见 [Doc/开发环境.md](Doc/开发环境.md)。
+Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/uinput`，不弹出远程交互。见 [Doc/开发环境.md](Doc/开发环境.md)。
 
-版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤（Windows 与 Linux 打到同一个 GitHub Release）见 [Doc/开发环境.md](Doc/开发环境.md) 第 5、6 节。
+版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/开发环境.md](Doc/开发环境.md) 第 6 节。
 
 ---
 
@@ -70,8 +72,9 @@ Linux 被控端要能移动指针，需要 `libx11-6`、`libxtst6`，以及 X11 
 |-------------|------|
 | [Doc/设计方案.md](Doc/设计方案.md) | 需求、协议、架构 |
 | [Doc/开发环境.md](Doc/开发环境.md) | 环境搭建、构建、运行、FAQ |
-| `scripts/` | 本地检查、打包、上传 GitHub Release |
+| `packaging/` | Docker 镜像定义，一次生成 Windows 与 Linux |
+| `scripts/` | `package-docker.sh` |
 | `crates/` | Rust 源码（crate 名可含 csc-*，产物名为 Cross-SystemConnect*） |
 | `resources/` | 图标等资源 |
 
-生成产物（如 `target/`）不纳入版本库。
+生成产物（如 `dist/`）不纳入版本库。

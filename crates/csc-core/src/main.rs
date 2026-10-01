@@ -89,9 +89,8 @@ fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i3
     }
 }
 
-/// GNOME on Wayland turns an absolute XTest warp into a Remote Desktop portal
-/// move. After “允许远程交互” that warp is rejected, so the pointer stays put.
-/// Relative motion is accepted on the same permission.
+/// Move the controlled pointer by a relative step. On Linux Wayland the
+/// platform crate sends this through a virtual device, not XTest.
 fn inject_controlled_delta(
     injector: &mut dyn csc_platform::InputInjector,
     x: i32,
@@ -111,14 +110,6 @@ fn inject_controlled_delta(
 /// Place the pointer when control arrives. On Linux this is one relative jump
 /// from wherever the pointer already is.
 fn inject_controlled_jump(injector: &mut dyn csc_platform::InputInjector, x: i32, y: i32) {
-    static NOTED: std::sync::Once = std::sync::Once::new();
-    NOTED.call_once(|| {
-        if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland")) {
-            info!(
-                "Wayland pointer control uses relative motion; if a “远程桌面” prompt appears, turn on remote interaction and the pointer can move"
-            );
-        }
-    });
     if cfg!(target_os = "linux") {
         if let Some((ax, ay)) = csc_platform::cursor_pos() {
             let (ox, oy) = csc_platform::virtual_origin();

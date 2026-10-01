@@ -64,10 +64,6 @@ impl EdgePush {
         self.edge = None;
         self.acc = 0;
     }
-
-    pub fn amount(&self) -> i32 {
-        self.acc
-    }
 }
 
 /// An outer edge the real pointer of this (controlled) computer pushed through.

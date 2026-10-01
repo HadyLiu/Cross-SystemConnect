@@ -1,4 +1,5 @@
 pub mod grab;
+mod uinput;
 pub mod xdnd;
 mod xdo;
 
@@ -48,15 +49,33 @@ impl LinuxInputInjector {
 
 impl InputInjector for LinuxInputInjector {
     fn mouse_move_abs(&mut self, x: i32, y: i32) {
+        if wayland_session() {
+            if let Some((cx, cy)) = xdo::pointer() {
+                uinput::move_rel(x - cx, y - cy);
+            }
+            return;
+        }
         xdo::move_abs(x, y);
     }
     fn mouse_move_rel(&mut self, dx: i32, dy: i32) {
+        if wayland_session() {
+            uinput::move_rel(dx, dy);
+            return;
+        }
         xdo::move_rel(dx, dy);
     }
     fn mouse_button(&mut self, button: u32, down: bool) {
+        if wayland_session() {
+            uinput::button(button, down);
+            return;
+        }
         xdo::button(button, down);
     }
     fn mouse_wheel(&mut self, v: i32, h: i32) {
+        if wayland_session() {
+            uinput::wheel(v, h);
+            return;
+        }
         // X11 scrolls with button clicks: 4 up, 5 down, 6 left, 7 right.
         let clicks = [(v, 4, 5), (h, 7, 6)];
         for (amount, positive, negative) in clicks {
@@ -69,8 +88,21 @@ impl InputInjector for LinuxInputInjector {
     }
     fn key(&mut self, hid_usage: u32, down: bool) {
         if let Some(code) = crate::keymap::evdev_from_hid(hid_usage) {
+            if wayland_session() {
+                uinput::key(code, down);
+                return;
+            }
             xdo::key(code as u32 + 8, down);
         }
+    }
+}
+
+/// Wayland turns XTest into a Remote Desktop prompt. Inject with uinput instead.
+pub(crate) fn wayland_session() -> bool {
+    match std::env::var("XDG_SESSION_TYPE") {
+        Ok(kind) if kind.eq_ignore_ascii_case("wayland") => true,
+        Ok(kind) if kind.eq_ignore_ascii_case("x11") => false,
+        _ => std::env::var_os("WAYLAND_DISPLAY").is_some(),
     }
 }
 
@@ -120,5 +152,29 @@ pub(crate) fn primary_button_down() -> bool {
 }
 
 pub(crate) fn warp_cursor(x: i32, y: i32) {
+    if wayland_session() {
+        if let Some((cx, cy)) = xdo::pointer() {
+            uinput::move_rel(x - cx, y - cy);
+        }
+        return;
+    }
     xdo::warp(x, y);
+}
+
+/// Press or release an X11 button. On Wayland this is a uinput button, so it
+/// does not open the remote-interaction prompt.
+pub(crate) fn inject_x_button(xbtn: u32, down: bool) {
+    if wayland_session() {
+        let button = match xbtn {
+            1 => 0,
+            3 => 1,
+            2 => 2,
+            8 => 3,
+            9 => 4,
+            _ => return,
+        };
+        uinput::button(button, down);
+        return;
+    }
+    xdo::x_button(xbtn, down);
 }
