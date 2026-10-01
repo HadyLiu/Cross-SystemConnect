@@ -1,5 +1,7 @@
 //! X11 pointer injection via libXtst. Loaded at runtime so a missing library
 //! does not stop the process. Wayland sessions without XWayland cannot be driven.
+//! On Wayland, absolute warps are rejected after the remote-interaction prompt;
+//! callers send relative motion instead.
 
 use libc::{c_int, c_uint, c_ulong, c_void};
 use std::sync::Mutex;
@@ -130,10 +132,19 @@ pub fn move_abs(x: i32, y: i32) {
 }
 
 pub fn move_rel(dx: i32, dy: i32) {
-    let _ = with(|c| unsafe {
-        (c.fake_rel)(c.dpy, c.screen, dx, dy, 0);
-        (c.flush)(c.dpy);
-    });
+    // One huge relative event is dropped by some compositors. Step across.
+    const STEP: i32 = 400;
+    let (mut left_x, mut left_y) = (dx, dy);
+    while left_x != 0 || left_y != 0 {
+        let sx = left_x.clamp(-STEP, STEP);
+        let sy = left_y.clamp(-STEP, STEP);
+        let _ = with(|c| unsafe {
+            (c.fake_rel)(c.dpy, c.screen, sx, sy, 0);
+            (c.flush)(c.dpy);
+        });
+        left_x -= sx;
+        left_y -= sy;
+    }
 }
 
 pub fn button(button: u32, down: bool) {

@@ -89,6 +89,59 @@ fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i3
     }
 }
 
+/// GNOME on Wayland turns an absolute XTest warp into a Remote Desktop portal
+/// move. After “允许远程交互” that warp is rejected, so the pointer stays put.
+/// Relative motion is accepted on the same permission.
+fn inject_controlled_delta(
+    injector: &mut dyn csc_platform::InputInjector,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+) {
+    if cfg!(target_os = "linux") {
+        if dx != 0 || dy != 0 {
+            injector.mouse_move_rel(dx, dy);
+        }
+    } else {
+        injector.mouse_move_abs(x, y);
+    }
+}
+
+/// Place the pointer when control arrives. On Linux this is one relative jump
+/// from wherever the pointer already is.
+fn inject_controlled_jump(injector: &mut dyn csc_platform::InputInjector, x: i32, y: i32) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    NOTED.call_once(|| {
+        if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland")) {
+            info!(
+                "Wayland pointer control uses relative motion; if a “远程桌面” prompt appears, turn on remote interaction and the pointer can move"
+            );
+        }
+    });
+    if cfg!(target_os = "linux") {
+        if let Some((ax, ay)) = csc_platform::cursor_pos() {
+            let (ox, oy) = csc_platform::virtual_origin();
+            let dx = x.saturating_sub(ax - ox);
+            let dy = y.saturating_sub(ay - oy);
+            if dx != 0 || dy != 0 {
+                injector.mouse_move_rel(dx, dy);
+            }
+            return;
+        }
+    }
+    injector.mouse_move_abs(x, y);
+}
+
+/// Follow the compositor pointer only when it actually moved.
+fn follow_real_pointer(logical: (i32, i32), real: (i32, i32), real_moved: bool) -> (i32, i32) {
+    if real_moved {
+        real
+    } else {
+        logical
+    }
+}
+
 /// Give input back to this computer. `target` is where the cursor reappears,
 /// in desktop coordinates relative to the virtual origin.
 fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
@@ -1273,25 +1326,37 @@ impl Core {
     async fn controlled_move(&mut self, dx: i32, dy: i32) {
         let w = self.screen.width.max(1);
         let h = self.screen.height.max(1);
+        let prev = (self.remote_x, self.remote_y);
         self.remote_x = self.remote_x.saturating_add(dx).clamp(0, w - 1);
         self.remote_y = self.remote_y.saturating_add(dy).clamp(0, h - 1);
-        self.injector.mouse_move_abs(self.remote_x, self.remote_y);
+        let applied = (self.remote_x - prev.0, self.remote_y - prev.1);
+        inject_controlled_delta(
+            self.injector.as_mut(),
+            self.remote_x,
+            self.remote_y,
+            applied.0,
+            applied.1,
+        );
         let Some((ax, ay)) = csc_platform::cursor_pos() else {
             return;
         };
         let (ox, oy) = csc_platform::virtual_origin();
         let real = (ax - ox, ay - oy);
-        let moved = self
+        let real_delta = self
             .last_real
             .map(|l| (real.0 - l.0, real.1 - l.1))
             .unwrap_or((0, 0));
+        // A rejected warp leaves the pointer where it was. Copying that
+        // position back pinned every later move on Wayland.
+        let real_moved = self.last_real.is_some() && real_delta != (0, 0);
         self.last_real = Some(real);
-        // Follow the real pointer, which the system keeps on the monitors.
-        self.remote_x = real.0;
-        self.remote_y = real.1;
+        let at = follow_real_pointer((self.remote_x, self.remote_y), real, real_moved);
+        self.remote_x = at.0;
+        self.remote_y = at.1;
+        let moved = if real_moved { real_delta } else { applied };
         let Some(report) = self
             .switch
-            .probe_edge(&mut self.probe, real.0, real.1, (dx, dy), moved)
+            .probe_edge(&mut self.probe, at.0, at.1, (dx, dy), moved)
         else {
             return;
         };
@@ -1487,12 +1552,19 @@ impl Core {
                     "",
                 );
                 self.probe.reset();
-                self.last_real = None;
                 // Land on the real monitor at that position, not in a gap of the bounding box.
                 let m = self.switch.monitor_at(self.remote_x, self.remote_y);
                 self.remote_x = self.remote_x.clamp(m.left, m.right - 1);
                 self.remote_y = self.remote_y.clamp(m.top, m.bottom - 1);
-                self.injector.mouse_move_abs(self.remote_x, self.remote_y);
+                // Seed with the pointer before the jump. If the jump is ignored,
+                // the pointer has not moved and later events must not snap back.
+                let (ox, oy) = csc_platform::virtual_origin();
+                self.last_real = csc_platform::cursor_pos().map(|(ax, ay)| (ax - ox, ay - oy));
+                inject_controlled_jump(self.injector.as_mut(), self.remote_x, self.remote_y);
+                info!(
+                    "pointer entered this screen from {:?} at ({}, {})",
+                    p.edge, self.remote_x, self.remote_y
+                );
             }
             Some(InboundEvent::SwitchLeave(p)) => {
                 debug!(edge = ?p.edge, "switch leave");
@@ -1841,6 +1913,17 @@ mod tests {
         let right_win: HashSet<u32> = [0xE7].into_iter().collect();
         assert!(lock.completes(0x0F, &right_win));
         assert!(!lock.completes(0x0F, &ctrl_alt));
+    }
+
+    #[test]
+    fn rejected_warp_does_not_pin_the_pointer() {
+        let logical = (10, 400);
+        let stale = (1800, 900);
+        assert_eq!(super::follow_real_pointer(logical, stale, false), logical);
+        assert_eq!(
+            super::follow_real_pointer(logical, (12, 400), true),
+            (12, 400)
+        );
     }
 
     #[test]
