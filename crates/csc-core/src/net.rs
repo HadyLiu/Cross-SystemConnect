@@ -118,16 +118,33 @@ impl PeerTable {
         }
     }
 
-    async fn insert(&self, name: &str, link: Link) {
-        if let Some(old) = self.txs.lock().await.insert(name.to_string(), link.clone()) {
-            if !old.same(&link) {
-                let _ = old.kill.send(true);
+    /// Keep `link` as the session for `name`.
+    /// A different session younger than `min_age` stays, and this call returns
+    /// false: that is the other computer dialing at the same moment.
+    /// An older session is replaced, because the peer has given it up.
+    async fn adopt(&self, name: &str, link: Link, min_age: Duration) -> bool {
+        {
+            let mut txs = self.txs.lock().await;
+            let old = txs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(k, l)| (k.clone(), l.clone()));
+            if let Some((key, old)) = old {
+                if !old.same(&link) && old.since.elapsed() < min_age {
+                    return false;
+                }
+                if !old.same(&link) {
+                    let _ = old.kill.send(true);
+                }
+                txs.remove(&key);
             }
+            txs.insert(name.to_string(), link);
         }
         let mut active = self.active.lock().await;
         if active.is_empty() {
             *active = name.to_string();
         }
+        true
     }
 
     /// Insert only when no link to `name` exists yet.
@@ -143,27 +160,6 @@ impl PeerTable {
         if active.is_empty() {
             *active = name.to_string();
         }
-        true
-    }
-
-    /// End the session to `name`, if any. Used when the other side shows it
-    /// has already given that session up. Links younger than `min_age` are kept: the other side may not have
-    /// registered them yet.
-    async fn evict_older_than(&self, name: &str, min_age: Duration) -> bool {
-        let link = {
-            let txs = self.txs.lock().await;
-            txs.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(k, l)| (k.clone(), l.clone()))
-        };
-        let Some((key, link)) = link else {
-            return false;
-        };
-        if link.since.elapsed() < min_age {
-            return false;
-        }
-        let _ = link.kill.send(true);
-        self.remove(&key).await;
         true
     }
 
@@ -730,10 +726,9 @@ fn spawn_server_link(
                         inflight.lock().await.remove(&key);
                         return;
                     }
-                } else {
-                    // The client only dials back when it has no session with us,
-                    // so any link we still hold for it is dead.
-                    peers.insert(&key, tx.clone()).await;
+                } else if !peers.adopt(&key, tx.clone(), DUPLICATE_LINK).await {
+                    debug!("already linked to {key}; dropping extra connection {peer_addr}");
+                    return;
                 }
                 let how = if dialed { "dialed" } else { "dialed back by client" };
                 info!("connected to client {key} at {peer_addr} ({how})");
@@ -836,6 +831,11 @@ async fn run_client(
         stop: stop_rx.clone(),
     };
     let dialing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Inbound TCP that has not finished yet. Do not dial the host again meanwhile.
+    let incoming: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Dial the host only if its own connection has not arrived within a second.
+    // Dialing at the same moment replaces the session that just came up.
+    let mut host_wait: HashMap<String, (Instant, SocketAddr)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut buf = [0u8; 2048];
     let mut udp_fails = 0u32;
@@ -844,6 +844,21 @@ async fn run_client(
         tokio::select! {
             _ = tick.tick() => {
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &announce, &targets).await)?;
+                let due: Vec<(String, SocketAddr)> = host_wait
+                    .iter()
+                    .filter(|(_, (at, _))| at.elapsed() >= Duration::from_secs(1))
+                    .map(|(key, (_, addr))| (key.clone(), *addr))
+                    .collect();
+                for (key, addr) in due {
+                    host_wait.remove(&key);
+                    let incoming_now = incoming.lock().await.contains_key(&key);
+                    if incoming_now || peers.contains(&key).await {
+                        continue;
+                    }
+                    if dialing.lock().await.insert(key.clone()) {
+                        spawn_client_dial(ctx.clone(), dialing.clone(), key, addr);
+                    }
+                }
             }
             _ = kick.notified() => {
                 send_to_targets(&udp, &announce, &targets).await;
@@ -862,29 +877,16 @@ async fn run_client(
                 if matches!(datagram, Some(Datagram::Search | Datagram::SearchUnlinked)) {
                     let _ = udp.send_to(&announce, src).await;
                     let key = src.ip().to_string();
-                    if datagram == Some(Datagram::SearchUnlinked)
-                        && peers.evict_older_than(&key, Duration::from_secs(3)).await
-                    {
-                        info!("keyboard host {key} has no session with us; dropping the stale one");
-                        refresh_link_status(&ctx.status, peers).await;
-                    }
-                    if !peers.contains(&key).await && dialing.lock().await.insert(key.clone()) {
-                        let ctx = ctx.clone();
-                        let dialing = dialing.clone();
-                        let addr = SocketAddr::new(src.ip(), port);
-                        tokio::spawn(async move {
-                            // The host accepts only computers whose announce it has seen;
-                            // let the announce above arrive first.
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            match connect_peer(addr).await {
-                                Ok(tcp) => {
-                                    info!("dialed keyboard host at {addr}");
-                                    client_link(ctx, tcp, addr).await;
-                                }
-                                Err(e) => debug!("dial keyboard host {addr}: {e:#}"),
-                            }
-                            dialing.lock().await.remove(&key);
-                        });
+                    // A live session stays up. SearchUnlinked only means the host
+                    // has not registered one yet; dropping ours made the link flap.
+                    let incoming_now = incoming.lock().await.contains_key(&key);
+                    if incoming_now || peers.contains(&key).await {
+                        host_wait.remove(&key);
+                    } else {
+                        host_wait.entry(key).or_insert((
+                            Instant::now(),
+                            SocketAddr::new(src.ip(), port),
+                        ));
                     }
                 }
             }
@@ -892,7 +894,24 @@ async fn run_client(
                 let (tcp, peer) = acc?;
                 let _ = tcp.set_nodelay(true);
                 info!("keyboard host connected from {peer}");
-                tokio::spawn(client_link(ctx.clone(), tcp, peer));
+                let key = peer.ip().to_string();
+                *incoming
+                    .lock()
+                    .await
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
+                let ctx = ctx.clone();
+                let incoming = incoming.clone();
+                tokio::spawn(async move {
+                    client_link(ctx, tcp, peer).await;
+                    let mut n = incoming.lock().await;
+                    if let Some(left) = n.get_mut(&key) {
+                        *left = left.saturating_sub(1);
+                        if *left == 0 {
+                            n.remove(&key);
+                        }
+                    }
+                });
             }
         }
     }
@@ -911,6 +930,24 @@ struct ClientCtx {
     inbound: Wires,
     rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
     stop: watch::Receiver<bool>,
+}
+
+fn spawn_client_dial(
+    ctx: ClientCtx,
+    dialing: Arc<Mutex<HashSet<String>>>,
+    key: String,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        match connect_peer(addr).await {
+            Ok(tcp) => {
+                info!("dialed keyboard host at {addr}");
+                client_link(ctx, tcp, addr).await;
+            }
+            Err(e) => debug!("dial keyboard host {addr}: {e:#}"),
+        }
+        dialing.lock().await.remove(&key);
+    });
 }
 
 /// Run one control session with the keyboard host, whichever side opened the TCP.
@@ -1337,7 +1374,17 @@ where
     }
 
     if let Some(link) = link {
-        link.peers.insert(&link.key, link.tx).await;
+        if !link
+            .peers
+            .adopt(&link.key, link.tx.clone(), DUPLICATE_LINK)
+            .await
+        {
+            debug!(
+                "already linked to {}; dropping extra connection",
+                link.key
+            );
+            return Ok(());
+        }
         link.registered.store(true, Ordering::Release);
         refresh_link_status(&link.status, &link.peers).await;
     }
@@ -1422,6 +1469,9 @@ fn local_capabilities() -> u32 {
     caps
 }
 
+/// A second TCP opened this soon is the other computer dialing at the same time.
+/// Keep the session that is already up.
+const DUPLICATE_LINK: Duration = Duration::from_secs(3);
 /// Controlled computer: heartbeat interval while its trust prompt is open.
 const HELLO_KEEPALIVE: Duration = Duration::from_secs(2);
 /// Keyboard host: give up on a controlled computer silent this long before its HELLO.
@@ -1655,6 +1705,29 @@ pub fn encode_clip_offer(v: &impl serde::Serialize) -> Result<Vec<u8>, serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_young_session_is_not_replaced_by_the_other_dial() {
+        let peers = PeerTable::new();
+        let (first, rx1) = new_link();
+        assert!(peers.adopt("hady", first, DUPLICATE_LINK).await);
+        let (second, rx2) = new_link();
+        assert!(!peers.adopt("hady", second, DUPLICATE_LINK).await);
+        assert!(!*rx1.kill.borrow());
+        assert!(!*rx2.kill.borrow());
+        assert!(peers.contains("hady").await);
+    }
+
+    #[tokio::test]
+    async fn an_old_session_is_replaced_when_the_peer_dials_again() {
+        let peers = PeerTable::new();
+        let (first, rx1) = new_link();
+        assert!(peers.adopt("hady", first, Duration::ZERO).await);
+        let (second, _rx2) = new_link();
+        assert!(peers.adopt("hady", second, Duration::ZERO).await);
+        assert!(*rx1.kill.borrow());
+        assert!(peers.contains("hady").await);
+    }
 
     #[test]
     fn redial_backs_off_to_ten_seconds() {

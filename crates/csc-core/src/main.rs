@@ -1,5 +1,3 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
-
 mod clipboard;
 mod discover;
 mod drag;
@@ -108,20 +106,64 @@ fn inject_controlled_delta(
 }
 
 /// Place the pointer when control arrives. On Linux this is one relative jump
-/// from wherever the pointer already is.
-fn inject_controlled_jump(injector: &mut dyn csc_platform::InputInjector, x: i32, y: i32) {
+/// from wherever the pointer already is. On Wayland the X cursor does not follow
+/// the virtual device, so later jumps continue from the last position we sent.
+fn inject_controlled_jump(
+    injector: &mut dyn csc_platform::InputInjector,
+    commanded: &mut Option<(i32, i32)>,
+    x: i32,
+    y: i32,
+) {
     if cfg!(target_os = "linux") {
-        if let Some((ax, ay)) = csc_platform::cursor_pos() {
-            let (ox, oy) = csc_platform::virtual_origin();
-            let dx = x.saturating_sub(ax - ox);
-            let dy = y.saturating_sub(ay - oy);
+        let origin = if csc_platform::wayland_session() {
+            (*commanded).or_else(x11_pointer)
+        } else {
+            x11_pointer()
+        };
+        if let Some((cx, cy)) = origin {
+            let dx = x.saturating_sub(cx);
+            let dy = y.saturating_sub(cy);
             if dx != 0 || dy != 0 {
                 injector.mouse_move_rel(dx, dy);
             }
-            return;
+        } else {
+            injector.mouse_move_abs(x, y);
         }
+        if csc_platform::wayland_session() {
+            *commanded = Some((x, y));
+        }
+        return;
     }
     injector.mouse_move_abs(x, y);
+}
+
+fn x11_pointer() -> Option<(i32, i32)> {
+    let (ax, ay) = csc_platform::cursor_pos()?;
+    let (ox, oy) = csc_platform::virtual_origin();
+    Some((ax - ox, ay - oy))
+}
+
+/// Land inside the screen, not on the edge that was just crossed.
+fn inset_from_edge(edge: csc_proto::Edge, x: &mut i32, y: &mut i32, m: &csc_platform::Rect) {
+    const N: i32 = 48;
+    match edge {
+        csc_proto::Edge::Left | csc_proto::Edge::TopLeft | csc_proto::Edge::BottomLeft => {
+            *x = (*x + N).min(m.right - 1);
+        }
+        csc_proto::Edge::Right | csc_proto::Edge::TopRight | csc_proto::Edge::BottomRight => {
+            *x = (*x - N).max(m.left);
+        }
+        _ => {}
+    }
+    match edge {
+        csc_proto::Edge::Top | csc_proto::Edge::TopLeft | csc_proto::Edge::TopRight => {
+            *y = (*y + N).min(m.bottom - 1);
+        }
+        csc_proto::Edge::Bottom | csc_proto::Edge::BottomLeft | csc_proto::Edge::BottomRight => {
+            *y = (*y - N).max(m.top);
+        }
+        _ => {}
+    }
 }
 
 /// Follow the compositor pointer only when it actually moved.
@@ -300,18 +342,18 @@ fn park_inside(
 }
 
 fn single_instance_lock() -> anyhow::Result<std::fs::File> {
-    let dir = default_config_path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-    let lock_path = dir.join("Cross-SystemConnect-core.lock");
-    let file = OpenOptions::new()
+    let lock_path = csc_config::core_lock_path();
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)?;
-    std::fs::write(&lock_path, format!("{}", std::process::id()))?;
+    use std::io::Write;
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
     Ok(file)
 }
 
@@ -412,6 +454,10 @@ struct Core {
     /// Controlled computer: push through its own edges, and the last pointer position.
     probe: EdgePush,
     last_real: Option<(i32, i32)>,
+    /// Wayland: last position sent to the virtual pointer. The X cursor is not that position.
+    commanded: Option<(i32, i32)>,
+    /// Ignore edge-leave until this moment, so the crossing itself does not bounce back.
+    control_ready: Instant,
     last_edge_sent: Instant,
 }
 
@@ -618,7 +664,16 @@ impl Core {
         // With hooks, local input arrives already swallowed. Without them,
         // poll the cursor and pull it back to the park point each tick.
         let steps: Vec<Captured> = if self.hooked {
-            csc_platform::capture_drain()
+            let mut steps = csc_platform::capture_drain();
+            // Raw motion is not stopped by the edge of this screen. The cursor
+            // deltas are, so they only cover about half of this monitor.
+            if let Some((dx, dy)) = csc_platform::take_raw_motion() {
+                if dx != 0 || dy != 0 {
+                    steps.retain(|step| !matches!(step, Captured::Move { .. }));
+                    steps.push(Captured::Move { dx, dy });
+                }
+            }
+            steps
         } else {
             let mut polled = Vec::new();
             if let Some((ax, ay)) = csc_platform::cursor_pos() {
@@ -1268,10 +1323,10 @@ impl Core {
             }
             return;
         }
-        // The system drag needs the button down. The hand is still holding it;
-        // its release arrives as usual and drops the files. On X11 the drag
-        // source presses it itself once it holds the pointer grab.
-        if cfg!(windows) {
+        // The hand is still holding the button. Windows and Wayland need that
+        // press here; the X11 drag source presses it after it grabs the pointer.
+        // The release is what drops the files into the folder under the pointer.
+        if cfg!(windows) || csc_platform::wayland_session() {
             self.injector.mouse_button(0, true);
         }
         if !self.is_host().await {
@@ -1321,6 +1376,7 @@ impl Core {
         self.remote_x = self.remote_x.saturating_add(dx).clamp(0, w - 1);
         self.remote_y = self.remote_y.saturating_add(dy).clamp(0, h - 1);
         let applied = (self.remote_x - prev.0, self.remote_y - prev.1);
+        csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
         inject_controlled_delta(
             self.injector.as_mut(),
             self.remote_x,
@@ -1328,23 +1384,36 @@ impl Core {
             applied.0,
             applied.1,
         );
-        let Some((ax, ay)) = csc_platform::cursor_pos() else {
-            return;
-        };
         let (ox, oy) = csc_platform::virtual_origin();
-        let real = (ax - ox, ay - oy);
-        let real_delta = self
-            .last_real
-            .map(|l| (real.0 - l.0, real.1 - l.1))
-            .unwrap_or((0, 0));
-        // A rejected warp leaves the pointer where it was. Copying that
-        // position back pinned every later move on Wayland.
-        let real_moved = self.last_real.is_some() && real_delta != (0, 0);
-        self.last_real = Some(real);
-        let at = follow_real_pointer((self.remote_x, self.remote_y), real, real_moved);
-        self.remote_x = at.0;
-        self.remote_y = at.1;
-        let moved = if real_moved { real_delta } else { applied };
+        let (at, moved, real) = if csc_platform::wayland_session() {
+            self.commanded = Some((self.remote_x, self.remote_y));
+            if Instant::now() < self.control_ready {
+                return;
+            }
+            (
+                (self.remote_x, self.remote_y),
+                applied,
+                (self.remote_x, self.remote_y),
+            )
+        } else {
+            let Some((ax, ay)) = csc_platform::cursor_pos() else {
+                return;
+            };
+            let real = (ax - ox, ay - oy);
+            let real_delta = self
+                .last_real
+                .map(|l| (real.0 - l.0, real.1 - l.1))
+                .unwrap_or((0, 0));
+            // A rejected warp leaves the pointer where it was. Copying that
+            // position back pinned every later move on Wayland.
+            let real_moved = self.last_real.is_some() && real_delta != (0, 0);
+            self.last_real = Some(real);
+            let at = follow_real_pointer((self.remote_x, self.remote_y), real, real_moved);
+            self.remote_x = at.0;
+            self.remote_y = at.1;
+            let moved = if real_moved { real_delta } else { applied };
+            (at, moved, real)
+        };
         let Some(report) = self
             .switch
             .probe_edge(&mut self.probe, at.0, at.1, (dx, dy), moved)
@@ -1547,11 +1616,20 @@ impl Core {
                 let m = self.switch.monitor_at(self.remote_x, self.remote_y);
                 self.remote_x = self.remote_x.clamp(m.left, m.right - 1);
                 self.remote_y = self.remote_y.clamp(m.top, m.bottom - 1);
+                inset_from_edge(p.edge, &mut self.remote_x, &mut self.remote_y, &m);
+                self.probe.reset();
+                self.control_ready = Instant::now() + Duration::from_millis(400);
                 // Seed with the pointer before the jump. If the jump is ignored,
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
                 self.last_real = csc_platform::cursor_pos().map(|(ax, ay)| (ax - ox, ay - oy));
-                inject_controlled_jump(self.injector.as_mut(), self.remote_x, self.remote_y);
+                inject_controlled_jump(
+                    self.injector.as_mut(),
+                    &mut self.commanded,
+                    self.remote_x,
+                    self.remote_y,
+                );
+                csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
                 info!(
                     "pointer entered this screen from {:?} at ({}, {})",
                     p.edge, self.remote_x, self.remote_y
@@ -1559,7 +1637,11 @@ impl Core {
             }
             Some(InboundEvent::SwitchLeave(p)) => {
                 debug!(edge = ?p.edge, "switch leave");
+                csc_platform::vdrag::cancel_follow();
                 self.drag.pointer_left().await;
+                if !self.grab {
+                    self.injected.release_injected(self.injector.as_mut());
+                }
                 let current = self.switch.active_remote().to_string();
                 let local = self.local_name().await;
                 let next = self.switch.neighbor_from_active(p.edge);
@@ -1632,8 +1714,7 @@ impl Core {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let config_path = std::env::args()
         .position(|a| a == "--config")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -1733,7 +1814,11 @@ async fn main() -> anyhow::Result<()> {
     let ipc_bound = match claim_ipc() {
         Ok(bound) => bound,
         Err(err) if err.downcast_ref::<IpcBusy>().is_some() => {
-            info!("core already running, exiting");
+            info!("core already running");
+            // Inside the window process, exiting would close the window too.
+            if std::thread::current().name() == Some("csc-core") {
+                return Ok(());
+            }
             std::process::exit(0);
         }
         Err(err) => return Err(err),
@@ -1847,6 +1932,8 @@ async fn main() -> anyhow::Result<()> {
         my_files: None,
         probe: EdgePush::default(),
         last_real: None,
+        commanded: None,
+        control_ready: Instant::now(),
         last_edge_sent: Instant::now() - Duration::from_secs(5),
     };
     let mut tick = tokio::time::interval(Duration::from_millis(8));

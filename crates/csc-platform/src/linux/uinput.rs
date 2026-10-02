@@ -8,6 +8,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -78,22 +80,90 @@ struct Dev {
 
 struct Slot {
     dev: Option<Dev>,
-    failed: bool,
+    warned: bool,
 }
 
 static SLOT: Mutex<Slot> = Mutex::new(Slot {
     dev: None,
-    failed: false,
+    warned: false,
 });
 
+static ASKING: AtomicBool = AtomicBool::new(false);
+static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn left_down() -> bool {
+    LEFT_DOWN.load(Ordering::Acquire)
+}
+
 fn ensure(slot: &mut Slot) -> Option<&mut Dev> {
-    if slot.dev.is_none() && !slot.failed {
+    if slot.dev.is_none() {
         match open_dev() {
-            Some(dev) => slot.dev = Some(dev),
-            None => slot.failed = true,
+            Some(dev) => {
+                slot.dev = Some(dev);
+                slot.warned = false;
+            }
+            None => {
+                if !slot.warned && !ASKING.load(Ordering::Relaxed) {
+                    warn!(
+                        "cannot open /dev/uinput; Wayland pointer control needs it and does not use remote interaction"
+                    );
+                    slot.warned = true;
+                }
+            }
         }
     }
     slot.dev.as_mut()
+}
+
+/// Make `/dev/uinput` writable before the pointer arrives.
+/// A password dialog is shown once, at startup, while this computer still has the mouse.
+pub fn grant_access() {
+    if device_writable() {
+        return;
+    }
+    install_rule();
+    if device_writable() {
+        info!("Wayland pointer control can use /dev/uinput");
+        return;
+    }
+    info!("asking once for permission to use /dev/uinput");
+    ASKING.store(true, Ordering::Relaxed);
+    let ok = prompt_install();
+    ASKING.store(false, Ordering::Relaxed);
+    if ok && device_writable() {
+        info!("Wayland pointer control can use /dev/uinput; remote interaction is not requested");
+    } else {
+        warn!(
+            "cannot open /dev/uinput; install /etc/udev/rules.d/71-cross-systemconnect.rules and reload udev, then start the program again"
+        );
+    }
+}
+
+fn device_writable() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/uinput")
+        .is_ok()
+}
+
+fn prompt_install() -> bool {
+    let script = format!(
+        "cat > /etc/udev/rules.d/71-cross-systemconnect.rules << 'END'\n{RULE}END\nudevadm control --reload-rules\nudevadm trigger --sysname-match=uinput --action=change\n"
+    );
+    let status = Command::new("pkexec")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            warn!("could not ask for /dev/uinput permission ({e})");
+            false
+        }
+    }
 }
 
 fn open_dev() -> Option<Dev> {
@@ -111,12 +181,7 @@ fn open_dev() -> Option<Dev> {
         });
     let file = match file {
         Ok(file) => file,
-        Err(e) => {
-            warn!(
-                "cannot open /dev/uinput ({e}); Wayland pointer control needs this device and does not use remote interaction. Start the program as root once so it can grant access, then start it again as your user"
-            );
-            return None;
-        }
+        Err(_) => return None,
     };
     unsafe {
         let fd = file.as_raw_fd();
@@ -242,6 +307,9 @@ pub fn move_rel(dx: i32, dy: i32) {
 }
 
 pub fn button(button: u32, down: bool) {
+    if button == 0 {
+        LEFT_DOWN.store(down, Ordering::Release);
+    }
     let code = match button {
         0 => BTN_LEFT,
         1 => BTN_LEFT + 1,

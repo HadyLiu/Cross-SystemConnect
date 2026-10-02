@@ -501,6 +501,11 @@ pub fn default_config_path() -> PathBuf {
     modern
 }
 
+/// PID file the tray uses to stop the kernel when the quit message is missed.
+pub fn core_lock_path() -> PathBuf {
+    app_config_dir().join("Cross-SystemConnect-core.lock")
+}
+
 /// `log.txt` next to the running program.
 pub fn default_log_path() -> PathBuf {
     std::env::current_exe()

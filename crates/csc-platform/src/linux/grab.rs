@@ -273,6 +273,9 @@ pub fn start() -> bool {
     }
     if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland")) {
         warn!("Wayland session: X11 cannot grab native windows; this screen is controlled through /dev/uinput and does not ask for remote interaction");
+        let _ = std::thread::Builder::new()
+            .name("uinput-access".into())
+            .spawn(super::uinput::grant_access);
         *started = Some(false);
         return false;
     }

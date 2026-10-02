@@ -276,7 +276,29 @@ fn build_webview(
     }
 }
 
+/// Kernel thread inside the window process. A second executable is what
+/// Smart App Control reports as a blocked unsafe app.
+#[cfg(windows)]
+fn start_core_in_process() {
+    let _ = std::thread::Builder::new().name("csc-core".into()).spawn(|| {
+        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        if let Err(e) = rt.block_on(csc_core::run()) {
+            eprintln!("core: {e:#}");
+        }
+    });
+}
+
 fn main() -> anyhow::Result<()> {
+    // Smart App Control blocks a second program, even this same file launched
+    // again. The kernel runs in this process, so nothing else is started.
+    #[cfg(windows)]
+    start_core_in_process();
+
     // WebKitGTK draws <select> popups with the GTK theme, which CSS cannot reach.
     // Must be set before GTK starts. A theme the user chose still wins.
     #[cfg(target_os = "linux")]
@@ -292,11 +314,11 @@ fn main() -> anyhow::Result<()> {
         if let Some(dir) = dirs::config_dir() {
             file.set(CappedLog::open(&dir.join("Cross-SystemConnect").join("ui.log")).ok());
         }
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(move || file.clone())
             .with_ansi(false)
-            .init();
+            .try_init();
     }
 
     let open_settings = std::env::args().any(|a| a == "--open-settings");

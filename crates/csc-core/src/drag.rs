@@ -7,6 +7,7 @@ use csc_config::Config;
 use csc_platform::vdrag::{self, DragDesc, DragEvent, DragItem, StagedFeed};
 use csc_proto::DragBeginPayload;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
@@ -38,12 +39,27 @@ impl DragHandle {
 struct Running {
     feed: Option<Arc<StagedFeed>>,
     bound: bool,
+    /// Set when the pointer leaves so a later button release is not a drop.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 pub fn spawn(transfer: TransferHandle, config: Arc<RwLock<Config>>) -> DragHandle {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(run(rx, transfer, config));
     DragHandle { tx }
+}
+
+fn badge_of(items: &[DragItem]) -> (String, bool, bool) {
+    let tops: Vec<&DragItem> = items.iter().filter(|it| it.is_top()).collect();
+    if tops.len() == 1 {
+        (tops[0].name().to_string(), tops[0].is_directory, false)
+    } else {
+        (
+            format!("{} items", tops.len()),
+            tops.iter().all(|it| it.is_directory),
+            true,
+        )
+    }
 }
 
 fn items_of(begin: &DragBeginPayload) -> Vec<DragItem> {
@@ -95,9 +111,58 @@ async fn run(
                         });
                         info!("drag {id} from {peer}: {} items", items.len());
                         transfer.park_drag(peer, begin).await;
+                        if csc_platform::wayland_session() {
+                            let (label, is_dir, stacked) = badge_of(&items);
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            vdrag::arm_follow();
+                            let tx = std_tx.clone();
+                            let flag = cancel.clone();
+                            info!("drag {id} follows the pointer until the left button is released");
+                            let spawned = std::thread::Builder::new()
+                                .name("csc-drag-badge".into())
+                                .spawn(move || {
+                                    let ev = match vdrag::watch_drop(&label, is_dir, stacked, &flag)
+                                    {
+                                        Some((x, y)) => match vdrag::folder_at(x, y) {
+                                            Some(dir) => DragEvent::Folder { id, dir },
+                                            None => DragEvent::Cancelled {
+                                                id,
+                                                reason: "no-folder",
+                                            },
+                                        },
+                                        None => DragEvent::Cancelled {
+                                            id,
+                                            reason: "cancelled",
+                                        },
+                                    };
+                                    let _ = tx.send(ev);
+                                })
+                                .is_ok();
+                            if spawned {
+                                running.insert(
+                                    id,
+                                    Running {
+                                        feed,
+                                        bound: false,
+                                        cancel: Some(cancel),
+                                    },
+                                );
+                                active = Some(id);
+                            } else {
+                                transfer.cancel_drag(id, "unsupported").await;
+                            }
+                            continue;
+                        }
                         let desc = DragDesc { id, items, staged: feed.clone() };
                         if vdrag::start(desc, std_tx.clone()) {
-                            running.insert(id, Running { feed, bound: false });
+                            running.insert(
+                                id,
+                                Running {
+                                    feed,
+                                    bound: false,
+                                    cancel: None,
+                                },
+                            );
                             active = Some(id);
                         } else {
                             warn!("could not start a drag here");
@@ -106,6 +171,11 @@ async fn run(
                     }
                     DragCmd::PointerLeft => {
                         if let Some(id) = active.take() {
+                            if let Some(run) = running.get(&id) {
+                                if let Some(flag) = &run.cancel {
+                                    flag.store(true, Ordering::Release);
+                                }
+                            }
                             vdrag::cancel(id);
                         }
                     }
@@ -144,6 +214,13 @@ async fn run(
                     }
                     DragEvent::Cancelled { reason, .. } => {
                         info!("drag {id} ended without a drop ({reason})");
+                        if reason == "no-folder" {
+                            csc_platform::notify(
+                                "Cross-SystemConnect 文件传输",
+                                "没有放到文件夹上，已取消。请拖到文件夹后松开左键。",
+                                false,
+                            );
+                        }
                         running.remove(&id);
                         transfer.cancel_drag(id, reason).await;
                         continue;

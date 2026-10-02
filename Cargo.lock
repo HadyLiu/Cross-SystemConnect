@@ -436,6 +436,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "csc-config",
+ "dbus",
  "image",
  "libc",
  "tracing",
@@ -460,6 +461,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "csc-config",
+ "csc-core",
  "csc-proto",
  "dirs",
  "gtk",

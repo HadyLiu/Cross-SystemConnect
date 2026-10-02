@@ -99,6 +99,19 @@ pub fn virtual_origin() -> (i32, i32) {
     (0, 0)
 }
 
+/// Wayland moves the pointer with a virtual device. The X11 cursor position
+/// does not follow that device, so callers must not treat it as the real pointer.
+pub fn wayland_session() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::wayland_session()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        false
+    }
+}
+
 #[cfg(windows)]
 pub fn warp_cursor(x: i32, y: i32) {
     win::warp_cursor(x, y);

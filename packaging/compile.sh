@@ -6,6 +6,7 @@ cd /src
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
 export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
 export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
+export WINDRES=x86_64-w64-mingw32-windres
 
 cargo build --release --locked -p csc-core -p csc-ui
 cargo build --release --locked --target x86_64-pc-windows-gnu -p csc-core -p csc-ui

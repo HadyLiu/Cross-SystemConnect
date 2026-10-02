@@ -3,11 +3,13 @@
 use csc_proto::{encode_ipc_message, try_decode_ipc_message, IpcRequest, IpcResponse};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Set before the kernel is asked to exit, so status polling does not start a new one.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 pub const CORE_PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
@@ -104,7 +106,7 @@ fn decode_response(resp: IpcResponse) -> anyhow::Result<Value> {
 pub fn call(method: &str, params: Value) -> anyhow::Result<Value> {
     match call_raw(method, &params) {
         Ok(resp) => decode_response(resp),
-        Err(err) if core_is_down(&err) => {
+        Err(err) if core_is_down(&err) && !QUITTING.load(Ordering::SeqCst) => {
             ensure_core_running()
                 .map_err(|start| anyhow::anyhow!("{start}（套接字 {}）", ipc_endpoint()))?;
             decode_response(call_raw(method, &params)?)
@@ -130,9 +132,26 @@ fn start_failure() -> &'static Mutex<Option<StartFailure>> {
 }
 
 pub fn ensure_core_running() -> anyhow::Result<()> {
+    if QUITTING.load(Ordering::SeqCst) {
+        anyhow::bail!("界面正在退出");
+    }
     if try_connect() {
         return Ok(());
     }
+    // The kernel is already a thread in this process. Spawning it would make
+    // Smart App Control show "已阻止可能不安全的应用".
+    #[cfg(windows)]
+    {
+        for _ in 0..80 {
+            std::thread::sleep(Duration::from_millis(100));
+            if try_connect() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("内核没有就绪。端点 {}", ipc_endpoint());
+    }
+    #[cfg(not(windows))]
+    {
     let mut slot = start_failure()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -158,17 +177,19 @@ pub fn ensure_core_running() -> anyhow::Result<()> {
             Err(err)
         }
     }
+    }
 }
 
+#[cfg(not(windows))]
 fn spawn_core() -> anyhow::Result<()> {
+    if QUITTING.load(Ordering::SeqCst) {
+        anyhow::bail!("界面正在退出");
+    }
     let exe = std::env::current_exe()?;
     let core = exe
         .parent()
         .map(|p| p.join(CORE_BIN))
         .unwrap_or_else(|| std::path::PathBuf::from(CORE_BIN));
-    #[cfg(windows)]
-    let core = core.with_extension("exe");
-
     if !core.exists() {
         anyhow::bail!(
             "找不到内核程序 {}。套接字不会被创建。请先执行 cargo build -p csc-core -p csc-ui，再重新打开界面。",
@@ -177,12 +198,6 @@ fn spawn_core() -> anyhow::Result<()> {
     }
 
     let mut cmd = std::process::Command::new(&core);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", core.display()))?;
@@ -255,22 +270,15 @@ pub fn resolve_peer(host_name: &str, decision: &str) -> anyhow::Result<Value> {
     )
 }
 
-fn core_lock_path() -> std::path::PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Cross-SystemConnect")
-        .join("Cross-SystemConnect-core.lock")
-}
-
-fn kill_core_by_lock() {
-    let path = core_lock_path();
+fn kill_core_by_lock(force: bool) {
+    let path = csc_config::core_lock_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
     let Ok(pid) = text.trim().parse::<u32>() else {
         return;
     };
-    if pid == 0 {
+    if pid == 0 || pid == std::process::id() {
         return;
     }
     #[cfg(windows)]
@@ -281,18 +289,23 @@ fn kill_core_by_lock() {
             .args(["/PID", &pid.to_string(), "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .status();
+        let _ = force;
     }
     #[cfg(unix)]
     {
+        let sig = if force { "-KILL" } else { "-TERM" };
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args([sig, &pid.to_string()])
             .status();
     }
-    let _ = std::fs::remove_file(path);
+    if force {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.
 pub fn quit_core() -> anyhow::Result<()> {
+    QUITTING.store(true, Ordering::SeqCst);
     let _ = call_raw("quit", &json!({})).and_then(decode_response);
     for _ in 0..15 {
         std::thread::sleep(Duration::from_millis(100));
@@ -300,7 +313,11 @@ pub fn quit_core() -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    kill_core_by_lock();
+    kill_core_by_lock(false);
+    std::thread::sleep(Duration::from_millis(300));
+    if try_connect() {
+        kill_core_by_lock(true);
+    }
     Ok(())
 }
 

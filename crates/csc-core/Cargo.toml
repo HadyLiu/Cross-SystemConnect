@@ -2,10 +2,15 @@
 name = "csc-core"
 version.workspace = true
 edition.workspace = true
+autobins = false
+
+[lib]
+name = "csc_core"
+path = "src/main.rs"
 
 [[bin]]
 name = "Cross-SystemConnect-core"
-path = "src/main.rs"
+path = "src/bin_main.rs"
 
 [dependencies]
 anyhow.workspace = true

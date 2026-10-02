@@ -31,6 +31,7 @@ ksni = "0.2"
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+csc-core = { path = "../csc-core" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",

@@ -1,3 +1,5 @@
+pub(crate) mod badge;
+pub(crate) mod drop_folder;
 pub mod grab;
 mod uinput;
 pub mod xdnd;
@@ -147,6 +149,9 @@ pub(crate) fn pointer_pos() -> Option<(i32, i32)> {
 }
 
 pub(crate) fn primary_button_down() -> bool {
+    if wayland_session() && uinput::left_down() {
+        return true;
+    }
     const BUTTON1_MASK: u32 = 1 << 8;
     xdo::pointer_state().is_some_and(|(_, _, mask)| mask & BUTTON1_MASK != 0)
 }

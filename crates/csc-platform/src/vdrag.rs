@@ -5,7 +5,7 @@
 //! was cancelled. Data then arrives over the network and is written by the core.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,64 @@ impl DragEvent {
             | Self::Lost { id }
             | Self::Cancelled { id, .. } => *id,
         }
+    }
+}
+
+static POINTER_X: AtomicI32 = AtomicI32::new(0);
+static POINTER_Y: AtomicI32 = AtomicI32::new(0);
+static FOLLOW_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Latest pointer position on this screen, in the same pixels as the monitors.
+pub fn note_pointer(x: i32, y: i32) {
+    POINTER_X.store(x, Ordering::Relaxed);
+    POINTER_Y.store(y, Ordering::Relaxed);
+}
+
+pub(crate) fn pointed() -> (i32, i32) {
+    (
+        POINTER_X.load(Ordering::Relaxed),
+        POINTER_Y.load(Ordering::Relaxed),
+    )
+}
+
+/// Allow the next drag-follow to run.
+pub fn arm_follow() {
+    FOLLOW_CANCEL.store(false, Ordering::Release);
+}
+
+/// The pointer left this screen; a button release must not count as a drop.
+pub fn cancel_follow() {
+    FOLLOW_CANCEL.store(true, Ordering::Release);
+}
+
+pub(crate) fn follow_cancelled() -> bool {
+    FOLLOW_CANCEL.load(Ordering::Acquire)
+}
+
+/// Show a file or folder on the pointer until the left button is released.
+/// `None` when the drag is cancelled or the button was never released.
+pub fn watch_drop(label: &str, is_dir: bool, stacked: bool, cancel: &AtomicBool) -> Option<(i32, i32)> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::linux::badge::watch_drop(label, is_dir, stacked, cancel)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (label, is_dir, stacked, cancel);
+        None
+    }
+}
+
+/// Directory the pointer was released over, when this desktop can name it.
+pub fn folder_at(x: i32, y: i32) -> Option<PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::linux::drop_folder::folder_at(x, y)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (x, y);
+        None
     }
 }
 

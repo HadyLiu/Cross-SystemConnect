@@ -422,6 +422,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 // Let this IPC response reach the UI before tearing down.
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                 let _ = quit_tx.send(true);
+                // The main loop should exit on its own. If it is stuck, leave anyway.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                info!("quit timed out in the main loop; exiting");
+                std::process::exit(0);
             });
             IpcResponse::ok(req.id, json!({"ok": true}))
         }

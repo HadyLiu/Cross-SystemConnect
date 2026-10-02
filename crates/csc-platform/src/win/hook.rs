@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use tracing::{info, warn};
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -27,9 +27,9 @@ use windows::Win32::UI::Input::{
     RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, GetMessageW, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, GetMessageW, RegisterClassW,
+    SetCursorPos, SetWindowsHookExW, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 
 const WM_INPUT: u32 = 0x00FF;
@@ -221,7 +221,8 @@ fn hook_thread(ready: std::sync::mpsc::Sender<bool>) {
 }
 
 /// Start or stop swallowing input. `park` is the absolute screen point the
-/// cursor is held at while grabbed.
+/// cursor is held at while grabbed. With raw input the cursor is clipped to
+/// that point, so the screen edge cannot stop the pointer on the other computer.
 pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     if let Some((x, y)) = park {
         PARK_X.store(x, Ordering::SeqCst);
@@ -233,6 +234,20 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     WHEEL_V.store(0, Ordering::SeqCst);
     WHEEL_H.store(0, Ordering::SeqCst);
     GRAB.store(grab, Ordering::SeqCst);
+    unsafe {
+        if grab && RAW_OK.load(Ordering::Relaxed) {
+            let x = PARK_X.load(Ordering::SeqCst);
+            let y = PARK_Y.load(Ordering::SeqCst);
+            let _ = ClipCursor(Some(&RECT {
+                left: x,
+                top: y,
+                right: x + 1,
+                bottom: y + 1,
+            }));
+        } else {
+            let _ = ClipCursor(None);
+        }
+    }
     if !grab {
         if let Ok(mut q) = QUEUE.lock() {
             q.clear();
@@ -277,8 +292,17 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let high = (info.mouseData >> 16) as u16;
             let ev = match wparam.0 as u32 {
                 WM_MOUSEMOVE => {
-                    let dx = info.pt.x - PARK_X.load(Ordering::Relaxed);
-                    let dy = info.pt.y - PARK_Y.load(Ordering::Relaxed);
+                    let park_x = PARK_X.load(Ordering::Relaxed);
+                    let park_y = PARK_Y.load(Ordering::Relaxed);
+                    let dx = info.pt.x - park_x;
+                    let dy = info.pt.y - park_y;
+                    if dx != 0 || dy != 0 {
+                        // Without raw input the cursor itself is the measurement.
+                        // Put it back before it reaches the screen edge and stops.
+                        if !RAW_OK.load(Ordering::Relaxed) {
+                            let _ = SetCursorPos(park_x, park_y);
+                        }
+                    }
                     (dx != 0 || dy != 0).then_some(Captured::Move { dx, dy })
                 }
                 WM_LBUTTONDOWN => Some(Captured::Button {
