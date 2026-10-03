@@ -13,7 +13,22 @@ mod xdo;
 
 use crate::stub::StubInputCapture;
 use crate::traits::*;
+use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::info;
+
+const WHEEL_DELTA: i32 = 120;
+static X_WHEEL_V: AtomicI32 = AtomicI32::new(0);
+static X_WHEEL_H: AtomicI32 = AtomicI32::new(0);
+
+/// Add 1/120 units to `acc` and take out the whole notches it now holds.
+pub(crate) fn wheel_notches(acc: &AtomicI32, units: i32) -> i32 {
+    let total = acc.fetch_add(units, Ordering::AcqRel).saturating_add(units);
+    let notches = total / WHEEL_DELTA;
+    if notches != 0 {
+        acc.fetch_sub(notches * WHEEL_DELTA, Ordering::AcqRel);
+    }
+    notches
+}
 
 pub struct LinuxInputCapture {
     inner: StubInputCapture,
@@ -85,7 +100,10 @@ impl InputInjector for LinuxInputInjector {
             return;
         }
         // X11 scrolls with button clicks: 4 up, 5 down, 6 left, 7 right.
-        let clicks = [(v, 4, 5), (h, 7, 6)];
+        let clicks = [
+            (wheel_notches(&X_WHEEL_V, v), 4, 5),
+            (wheel_notches(&X_WHEEL_H, h), 7, 6),
+        ];
         for (amount, positive, negative) in clicks {
             let xbtn = if amount > 0 { positive } else { negative };
             for _ in 0..amount.unsigned_abs().min(20) {

@@ -42,8 +42,12 @@ button.primary{background:var(--accent);border-color:var(--accent)}
 .seg button.on{background:var(--accent);border-color:var(--accent)}
 .all{color:var(--dim);display:flex;gap:6px;align-items:center;justify-content:flex-end;margin:4px 0}
 .empty{color:var(--dim);text-align:center;padding:30px 0}
+.ren{margin-top:6px;color:var(--dim)}
+.ren summary{cursor:pointer}
+.ren div{word-break:break-all;font-size:12px;padding:2px 0 2px 12px}
 </style></head><body><div id="list"><div class="empty">没有正在接收的文件</div></div><script>
 const picks={};
+const openRen={};
 const LABEL={skip:'跳过',keep_both:'保留两者',replace:'替换'};
 const STATE={waiting:'等待中',conflict:'有重名文件',running:'正在接收',done:'已完成',failed:'失败',cancelled:'已取消',paused_link_lost:'等待重连'};
 function post(m){ window.ipc.postMessage(JSON.stringify(m)); }
@@ -87,10 +91,13 @@ function render(list){
     const files=t.filesTotal>1?`${t.filesDone}/${t.filesTotal} 个文件　`:'';
     const speed=t.state==='running'&&t.bytesPerSec?size(t.bytesPerSec)+'/s　':'';
     const msg=t.message?`<div class="msg">${esc(t.message)}</div>`:(t.dest&&!fin?`<div class="msg">保存到 ${esc(t.dest)}</div>`:'');
+    const rn=t.renamed||[];
+    const ren=rn.length?`<details class="ren"${openRen[t.id]?' open':''} ontoggle="openRen[${t.id}]=this.open"><summary>${rn.length} 个名称已改为本机可用的名称</summary>`+
+      rn.map(r=>`<div>${esc(r.from)} → ${esc(r.to)}</div>`).join('')+`</details>`:'';
     return `<div class="item ${t.state}"><div class="head"><div class="title">${esc(t.title)}</div><div class="from">来自 ${from}</div></div>`+
       `<div class="bar"><div style="width:${pct}%"></div></div>`+
       `<div class="meta"><span>${files}${size(t.bytesDone)} / ${size(t.bytesTotal)}</span><span>${speed}${eta(t)||STATE[t.state]||''}</span></div>`+
-      msg+conf+(acts?`<div class="acts">${acts}</div>`:'')+`</div>`;
+      msg+ren+conf+(acts?`<div class="acts">${acts}</div>`:'')+`</div>`;
   }).join('');
 }
 </script></body></html>"#;

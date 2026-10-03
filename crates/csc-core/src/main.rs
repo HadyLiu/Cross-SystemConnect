@@ -2634,6 +2634,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (paste_tx, mut paste_rx) = mpsc::channel::<LocatedPaste>(4);
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
     let clip = crate::clipboard::spawn(clip_tx);
+    tokio::spawn(watch_memory(state.clone(), board.clone()));
     crate::transfer::spawn(transfer_rx, net.clone(), config.clone(), board);
     let drag = crate::drag::spawn(transfer.clone(), config.clone());
     let (drag_ready_tx, mut drag_ready_rx) = mpsc::channel::<DragReady>(4);
@@ -2742,6 +2743,35 @@ pub async fn run() -> anyhow::Result<()> {
     info!("Cross-SystemConnect-core exiting");
     // Ensure network/IPC tasks die with the process (do not leave a stray kernel).
     std::process::exit(0);
+}
+
+/// Resident-memory self-check every minute (`limits.rss_*`). Over the restart
+/// limit with no transfer running, a standalone core quits and the UI starts it
+/// again on its next request. The core inside the Windows window only warns.
+async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoard) {
+    let mut every = tokio::time::interval(Duration::from_secs(60));
+    every.tick().await;
+    loop {
+        every.tick().await;
+        let Some(mb) = csc_platform::resident_mb() else {
+            return;
+        };
+        let limits = state.config.read().await.limits.clone();
+        let warn_mb = u64::from(limits.rss_warn_mb);
+        let restart_mb = u64::from(limits.rss_restart_mb);
+        if restart_mb > 0 && mb > restart_mb {
+            if cfg!(windows) || board.busy() {
+                warn!("resident memory {mb} MiB is over {restart_mb} MiB; restart postponed");
+                continue;
+            }
+            warn!("resident memory {mb} MiB is over {restart_mb} MiB; restarting the core");
+            let _ = state.quit_tx.send(true);
+            return;
+        }
+        if warn_mb > 0 && mb > warn_mb {
+            warn!("resident memory {mb} MiB is over {warn_mb} MiB");
+        }
+    }
 }
 
 #[cfg(test)]

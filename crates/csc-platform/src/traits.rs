@@ -105,7 +105,7 @@ pub enum Captured {
         button: u32,
         down: bool,
     },
-    /// Whole notches. Positive `v` scrolls up, positive `h` scrolls right.
+    /// 1/120 notch units (120 per detent). Positive `v` scrolls up, positive `h` scrolls right.
     Wheel {
         v: i32,
         h: i32,

@@ -19,7 +19,8 @@ use csc_proto::{
     decode_file_batch, decode_file_data, encode_file_batch, encode_file_data, encode_json_frame,
     DragBeginPayload, DragCancelPayload, FileAckPayload, FileBeginPayload, FileDonePayload,
     FileEndPayload, FileEntry, FileErrorPayload, FileOfferPayload, FileRequestPayload, FileResume,
-    MsgType, TransferConflict, TransferProgress, TransferPurpose, TransferState, CAP_FILE_ACK,
+    MsgType, RenamedName, TransferConflict, TransferProgress, TransferPurpose, TransferState,
+    CAP_FILE_ACK,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -36,6 +37,8 @@ use xxhash_rust::xxh64::Xxh64;
 
 const CHUNK: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 20_000;
+/// Renamed names listed in the transfer window; the rest only count in the log.
+const MAX_RENAMED_SHOWN: usize = 200;
 const OFFER_TTL: Duration = Duration::from_secs(30 * 60);
 /// Unacknowledged bytes a sender may have in flight.
 const WINDOW: u64 = 8 * 1024 * 1024;
@@ -598,6 +601,7 @@ struct Incoming {
     resume: HashMap<u32, u64>,
     /// Waiting for the user to choose, by top-level entry index.
     conflicts: Vec<TransferConflict>,
+    renamed: Vec<RenamedName>,
 }
 
 impl Incoming {
@@ -1202,6 +1206,7 @@ impl Engine {
                     },
                     dest: inc.dest(),
                     conflicts: inc.conflicts.clone(),
+                    renamed: inc.renamed.clone(),
                     ..Default::default()
                 });
                 let ready = inc.conflicts.is_empty();
@@ -1751,21 +1756,28 @@ fn prepare_incoming(
     if sum != total {
         return Err("文件大小不一致".into());
     }
-    let mut renamed = 0u32;
+    let mut renamed = Vec::new();
+    let mut renamed_count = 0usize;
     let entries: Vec<FileEntry> = entries
         .into_iter()
         .map(|mut e| {
             if let Ok(adapted) = adapt_relative_path(&e.relative_path) {
                 if adapted != e.relative_path {
-                    renamed += 1;
+                    renamed_count += 1;
+                    if renamed.len() < MAX_RENAMED_SHOWN {
+                        renamed.push(RenamedName {
+                            from: e.relative_path.clone(),
+                            to: adapted.clone(),
+                        });
+                    }
                     e.relative_path = adapted;
                 }
             }
             e
         })
         .collect();
-    if renamed > 0 {
-        info!("renamed {renamed} received names so this computer can store them");
+    if renamed_count > 0 {
+        info!("renamed {renamed_count} received names so this computer can store them");
     }
     let shape = shape(&entries, cfg)?;
     let n = entries.len();
@@ -1830,6 +1842,7 @@ fn prepare_incoming(
         acked: 0,
         resume: HashMap::new(),
         conflicts,
+        renamed,
     })
 }
 

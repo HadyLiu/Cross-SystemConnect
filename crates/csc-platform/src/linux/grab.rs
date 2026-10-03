@@ -202,6 +202,9 @@ const GRAB_MODE_ASYNC: c_int = 1;
 const GRAB_SUCCESS: c_int = 0;
 /// Warp back to the park point once the pointer drifts this far from it.
 const REPARK_PX: i32 = 64;
+/// One wheel notch in the 1/120 units of `Captured::Wheel`.
+const NOTCH: i32 = 120;
+type SetDetectableAutoRepeat = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_int;
 
 /// Layout shared by XKeyEvent, XButtonEvent and XMotionEvent up to `detail`.
 #[repr(C)]
@@ -310,6 +313,7 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
         };
         s.queue.clear();
     }
+    crate::keyrepeat::reset();
 }
 
 pub fn drain() -> Vec<Captured> {
@@ -333,6 +337,11 @@ unsafe fn open() -> Option<Api> {
     // A refused key grab must not end the process (Xlib's default handler exits).
     if let Some(set_handler) = sym::<SetErrorHandler>(x11, "XSetErrorHandler") {
         set_handler(Some(ignore_x_error));
+    }
+    // Auto-repeat then arrives as presses without releases, which keyrepeat drops.
+    if let Some(detectable) = sym::<SetDetectableAutoRepeat>(x11, "XkbSetDetectableAutoRepeat") {
+        let mut supported = 0;
+        detectable(dpy, 1, &mut supported);
     }
     let root = default_root(dpy);
     let keysym_to_keycode: KeysymToKeycode = sym(x11, "XKeysymToKeycode")?;
@@ -440,10 +449,10 @@ fn button_event(detail: c_uint, down: bool) -> Option<Captured> {
         9 => 4,
         // Wheel buttons send a press and a release per notch; count the press.
         4..=7 if !down => return None,
-        4 => return Some(Captured::Wheel { v: 1, h: 0 }),
-        5 => return Some(Captured::Wheel { v: -1, h: 0 }),
-        6 => return Some(Captured::Wheel { v: 0, h: -1 }),
-        7 => return Some(Captured::Wheel { v: 0, h: 1 }),
+        4 => return Some(Captured::Wheel { v: NOTCH, h: 0 }),
+        5 => return Some(Captured::Wheel { v: -NOTCH, h: 0 }),
+        6 => return Some(Captured::Wheel { v: 0, h: -NOTCH }),
+        7 => return Some(Captured::Wheel { v: 0, h: NOTCH }),
         _ => return None,
     };
     Some(Captured::Button { button, down })
@@ -602,10 +611,10 @@ fn run(mut api: Api) {
                     KEY_PRESS | KEY_RELEASE => {
                         let evdev = ev.detail.saturating_sub(8) as u16;
                         if let Some(hid) = crate::keymap::hid_from_evdev(evdev) {
-                            push(Captured::Key {
-                                hid,
-                                down: ev.kind == KEY_PRESS,
-                            });
+                            let down = ev.kind == KEY_PRESS;
+                            if crate::keyrepeat::forward(hid, down) {
+                                push(Captured::Key { hid, down });
+                            }
                         }
                     }
                     _ => {}

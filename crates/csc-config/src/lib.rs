@@ -248,6 +248,32 @@ impl Default for PointerConfig {
     }
 }
 
+fn default_rss_warn_mb() -> u32 {
+    200
+}
+fn default_rss_restart_mb() -> u32 {
+    500
+}
+
+/// Resident-memory self-check of the core process. 0 turns a check off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_rss_warn_mb")]
+    pub rss_warn_mb: u32,
+    /// Above this, the core exits when no transfer runs and the UI restarts it.
+    #[serde(default = "default_rss_restart_mb")]
+    pub rss_restart_mb: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            rss_warn_mb: default_rss_warn_mb(),
+            rss_restart_mb: default_rss_restart_mb(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeyConfig {
     /// Locks this computer and every connected one.
@@ -568,6 +594,8 @@ pub struct Config {
     #[serde(default)]
     pub network: NetworkExtras,
     #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
     pub enable_enter_command: bool,
     #[serde(default)]
     pub enable_exit_command: bool,
@@ -625,6 +653,7 @@ impl Default for Config {
                 discovery_port: default_control_port(),
                 ..NetworkExtras::default()
             },
+            limits: LimitsConfig::default(),
             enable_enter_command: false,
             enable_exit_command: false,
             enter_command: String::new(),
@@ -972,6 +1001,32 @@ impl Config {
         Ok(())
     }
 
+    /// Add or update a manually entered peer address. False when `address` is empty.
+    pub fn add_manual_peer(&mut self, address: &str, control_port: u16) -> bool {
+        let address = address.trim();
+        if address.is_empty() {
+            return false;
+        }
+        let peers = &mut self.network.manual_peers;
+        match peers.iter_mut().find(|p| p.address.eq_ignore_ascii_case(address)) {
+            Some(p) => p.control_port = control_port,
+            None => peers.push(ManualPeer {
+                address: address.to_string(),
+                control_port,
+            }),
+        }
+        true
+    }
+
+    /// Remove a manually entered peer address. True when one was removed.
+    pub fn remove_manual_peer(&mut self, address: &str) -> bool {
+        let address = address.trim();
+        let peers = &mut self.network.manual_peers;
+        let before = peers.len();
+        peers.retain(|p| !p.address.eq_ignore_ascii_case(address));
+        peers.len() != before
+    }
+
     pub fn trust_peer(&mut self, host_name: &str) -> bool {
         let host = host_name.trim();
         if host.is_empty() {
@@ -1087,6 +1142,20 @@ mod tests {
         assert_eq!(cfg.control_port, 24900);
         assert_eq!(cfg.server_address, "192.168.1.9");
         assert_eq!(cfg.trusted_peers, vec!["Other-PC".to_string()]);
+    }
+
+    #[test]
+    fn manual_peers_add_update_remove() {
+        let mut cfg = Config::default();
+        assert!(!cfg.add_manual_peer("  ", 0));
+        assert!(cfg.add_manual_peer(" host.lan ", 0));
+        assert!(cfg.add_manual_peer("HOST.lan", 24910));
+        assert_eq!(cfg.network.manual_peers.len(), 1);
+        assert_eq!(cfg.network.manual_peers[0].control_port, 24910);
+        assert!(cfg.remove_manual_peer("host.LAN"));
+        assert!(!cfg.remove_manual_peer("host.lan"));
+        assert_eq!(cfg.limits.rss_warn_mb, 200);
+        assert_eq!(cfg.limits.rss_restart_mb, 500);
     }
 
     #[test]

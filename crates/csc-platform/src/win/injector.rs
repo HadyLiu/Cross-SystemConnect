@@ -86,7 +86,7 @@ impl InputInjector for WinInputInjector {
                         mi: MOUSEINPUT {
                             dx: 0,
                             dy: 0,
-                            mouseData: (v * 120) as u32,
+                            mouseData: v as u32,
                             dwFlags: MOUSEEVENTF_WHEEL,
                             time: 0,
                             dwExtraInfo: 0,
@@ -102,7 +102,7 @@ impl InputInjector for WinInputInjector {
                         mi: MOUSEINPUT {
                             dx: 0,
                             dy: 0,
-                            mouseData: (h * 120) as u32,
+                            mouseData: h as u32,
                             dwFlags: MOUSEEVENTF_HWHEEL,
                             time: 0,
                             dwExtraInfo: 0,

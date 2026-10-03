@@ -159,6 +159,16 @@ pub struct TransferProgress {
     pub open_path: String,
     #[serde(default)]
     pub conflicts: Vec<TransferConflict>,
+    /// Names changed so this computer can store them.
+    #[serde(default)]
+    pub renamed: Vec<RenamedName>,
+}
+
+/// A received name that had to change, as plain text for the transfer window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RenamedName {
+    pub from: String,
+    pub to: String,
 }
 
 /// Screen area (absolute desktop pixels) where a drop sends files to `peer`.

@@ -110,6 +110,11 @@ impl TransferBoard {
         self.with(|items| items.retain(|i| i.p.id != id || !i.p.state.finished()));
     }
 
+    /// Whether any batch is still running or waiting for a decision.
+    pub fn busy(&self) -> bool {
+        self.with(|items| items.iter().any(|i| !i.p.state.finished()))
+    }
+
     pub fn snapshot(&self) -> Vec<TransferProgress> {
         self.snapshot_at(Instant::now())
     }

@@ -158,15 +158,12 @@ const LLMHF_INJECTED: u32 = 0x01;
 const LLKHF_EXTENDED: u32 = 0x01;
 const LLKHF_INJECTED: u32 = 0x10;
 const LLKHF_UP: u32 = 0x80;
-const WHEEL_DELTA: i32 = 120;
 
 static START: Once = Once::new();
 static HOOKED: AtomicBool = AtomicBool::new(false);
 static GRAB: AtomicBool = AtomicBool::new(false);
 static PARK_X: AtomicI32 = AtomicI32::new(0);
 static PARK_Y: AtomicI32 = AtomicI32::new(0);
-static WHEEL_V: AtomicI32 = AtomicI32::new(0);
-static WHEEL_H: AtomicI32 = AtomicI32::new(0);
 static QUEUE: Mutex<VecDeque<Captured>> = Mutex::new(VecDeque::new());
 
 /// Install the hooks on their own message-loop thread. Returns whether they are active.
@@ -231,8 +228,7 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
             let _ = SetCursorPos(x, y);
         }
     }
-    WHEEL_V.store(0, Ordering::SeqCst);
-    WHEEL_H.store(0, Ordering::SeqCst);
+    crate::keyrepeat::reset();
     GRAB.store(grab, Ordering::SeqCst);
     unsafe {
         if grab && RAW_OK.load(Ordering::Relaxed) {
@@ -274,15 +270,6 @@ fn push(ev: Captured) {
         }
         q.push_back(ev);
     }
-}
-
-fn wheel_notches(acc: &AtomicI32, delta: i32) -> i32 {
-    let total = acc.fetch_add(delta, Ordering::SeqCst) + delta;
-    let notches = total / WHEEL_DELTA;
-    if notches != 0 {
-        acc.fetch_sub(notches * WHEEL_DELTA, Ordering::SeqCst);
-    }
-    notches
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -334,11 +321,11 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     down: wparam.0 as u32 == WM_XBUTTONDOWN,
                 }),
                 WM_MOUSEWHEEL => {
-                    let v = wheel_notches(&WHEEL_V, high as i16 as i32);
+                    let v = high as i16 as i32;
                     (v != 0).then_some(Captured::Wheel { v, h: 0 })
                 }
                 WM_MOUSEHWHEEL => {
-                    let h = wheel_notches(&WHEEL_H, high as i16 as i32);
+                    let h = high as i16 as i32;
                     (h != 0).then_some(Captured::Wheel { v: 0, h })
                 }
                 _ => None,
@@ -359,10 +346,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         if flags & LLKHF_INJECTED == 0 {
             let extended = flags & LLKHF_EXTENDED != 0;
             if let Some(hid) = hid_from_scan(info.scanCode as u16, extended) {
-                push(Captured::Key {
-                    hid,
-                    down: flags & LLKHF_UP == 0,
-                });
+                let down = flags & LLKHF_UP == 0;
+                if crate::keyrepeat::forward(hid, down) {
+                    push(Captured::Key { hid, down });
+                }
             }
             return LRESULT(1);
         }

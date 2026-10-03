@@ -3,6 +3,8 @@
 pub mod clip;
 mod host;
 pub mod keymap;
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+mod keyrepeat;
 mod lock;
 mod notify;
 mod traits;
@@ -278,6 +280,34 @@ pub fn warp_cursor(x: i32, y: i32) {
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
 pub fn warp_cursor(_x: i32, _y: i32) {}
+
+/// Resident memory of this process in MiB, when the platform reports it.
+pub fn resident_mb() -> Option<u64> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if !K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size).as_bool() {
+            return None;
+        }
+        Some(counters.WorkingSetSize as u64 / (1024 * 1024))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        Some(pages * u64::try_from(page).ok()? / (1024 * 1024))
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        None
+    }
+}
 
 #[cfg(windows)]
 pub fn set_cursor_visible(visible: bool) {

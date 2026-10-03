@@ -357,6 +357,39 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
         }
+        "add_manual_peer" | "remove_manual_peer" => {
+            let address = req
+                .params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if address.is_empty() {
+                return IpcResponse::err(req.id, "address is required");
+            }
+            let port = req
+                .params
+                .get("control_port")
+                .or_else(|| req.params.get("controlPort"))
+                .and_then(|v| v.as_u64())
+                .and_then(|p| u16::try_from(p).ok())
+                .unwrap_or(0);
+            let mut cfg = state.config.write().await;
+            let changed = if req.method == "add_manual_peer" {
+                cfg.add_manual_peer(&address, port)
+            } else {
+                cfg.remove_manual_peer(&address)
+            };
+            if let Err(e) = cfg.save(&state.config_path) {
+                return IpcResponse::err(req.id, e.to_string());
+            }
+            drop(cfg);
+            if changed {
+                state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            }
+            IpcResponse::ok(req.id, json!({"ok": true, "changed": changed}))
+        }
         "send_files" => {
             let peer = req
                 .params

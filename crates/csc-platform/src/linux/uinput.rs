@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -321,18 +321,29 @@ pub fn button(button: u32, down: bool) {
     emit(&[(EV_KEY, code, if down { 1 } else { 0 })]);
 }
 
+/// `v` and `h` in 1/120 notch units. Hi-res axes get every unit; the legacy
+/// axes get whole notches once enough units add up.
 pub fn wheel(v: i32, h: i32) {
     let mut ev = Vec::new();
     if v != 0 {
-        ev.push((EV_REL, REL_WHEEL_HI_RES, v.saturating_mul(120)));
-        ev.push((EV_REL, REL_WHEEL, v));
+        ev.push((EV_REL, REL_WHEEL_HI_RES, v));
+        let notches = super::wheel_notches(&WHEEL_V, v);
+        if notches != 0 {
+            ev.push((EV_REL, REL_WHEEL, notches));
+        }
     }
     if h != 0 {
-        ev.push((EV_REL, REL_HWHEEL_HI_RES, h.saturating_mul(120)));
-        ev.push((EV_REL, REL_HWHEEL, h));
+        ev.push((EV_REL, REL_HWHEEL_HI_RES, h));
+        let notches = super::wheel_notches(&WHEEL_H, h);
+        if notches != 0 {
+            ev.push((EV_REL, REL_HWHEEL, notches));
+        }
     }
     emit(&ev);
 }
+
+static WHEEL_V: AtomicI32 = AtomicI32::new(0);
+static WHEEL_H: AtomicI32 = AtomicI32::new(0);
 
 pub fn key(code: u16, down: bool) {
     emit(&[(EV_KEY, code, if down { 1 } else { 0 })]);

@@ -168,6 +168,7 @@ pub struct MouseButtonPayload {
     pub down: u8,
 }
 
+/// Wheel movement in 1/120 notch units (120 per detent).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseWheelPayload {
     pub wheel_v: i32,
