@@ -44,6 +44,63 @@ pub fn name_problem(name: &str) -> Option<&'static str> {
     None
 }
 
+/// Rewrite one file name so Windows and Linux can both store it.
+pub fn adapt_component(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    while out.ends_with('.') || out.ends_with(' ') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    if reserved {
+        if let Some(dot) = out.find('.') {
+            out.insert(dot, '_');
+        } else {
+            out.push('_');
+        }
+    }
+    let bytes = out.as_bytes();
+    if bytes.len() > 255 {
+        let mut end = 255;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out
+}
+
+/// `/`-separated relative path with each part adapted. `..` and empty parts stay errors.
+pub fn adapt_relative_path(rel: &str) -> Result<String, String> {
+    if rel.is_empty() || rel.starts_with('/') || rel.contains("//") {
+        return Err("不安全的路径".into());
+    }
+    let mut parts = Vec::new();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err("不安全的路径".into());
+        }
+        parts.push(adapt_component(part));
+    }
+    Ok(parts.join("/"))
+}
+
 /// Check a `/`-separated relative path from a peer. Returns the local path or the reason.
 pub fn check_relative_path(rel: &str) -> Result<PathBuf, String> {
     if rel.encode_utf16().count() > MAX_RELATIVE_PATH {
@@ -101,6 +158,10 @@ mod tests {
         assert!(check_relative_path("dir/../x").is_err());
         assert!(check_relative_path("/abs").is_err());
         assert!(check_relative_path("a//b").is_err());
+        assert_eq!(adapt_component("bad:name.txt"), "bad_name.txt");
+        assert_eq!(adapt_component("CON.txt"), "CON_.txt");
+        assert_eq!(adapt_relative_path("dir/a:b").unwrap(), "dir/a_b");
+        assert!(adapt_relative_path("dir/../x").is_err());
     }
 
     #[test]

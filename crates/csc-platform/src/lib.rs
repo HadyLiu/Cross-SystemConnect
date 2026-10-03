@@ -8,8 +8,162 @@ mod notify;
 mod traits;
 pub mod vdrag;
 
-pub use lock::{lock_hits, lock_screen, lock_watch};
+pub use lock::{lock_hits, lock_screen, lock_watch, mods_held, pause_hits, pause_watch, stay_hits, stay_watch};
 pub use notify::notify;
+
+/// The machine is about to sleep, shutting down, or has woken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerEvent {
+    Suspending,
+    ShuttingDown,
+    Resumed,
+    /// The session lock screen is up. Display only; input can still be injected.
+    Locked,
+    Unlocked,
+    /// Windows lock, UAC, or the secure attention screen. The host must take the pointer back.
+    SecureDesktop,
+}
+
+/// Ask the OS not to idle-sleep while connected computers are in use.
+pub fn set_keep_awake(on: bool) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::power::set_keep_awake(on);
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Power::{
+            SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+        };
+        unsafe {
+            if on {
+                let _ = SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
+                );
+            } else {
+                let _ = SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        }
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        let _ = on;
+    }
+}
+
+/// Ask the OS to treat this computer as recently used (anti-idle / anti-blank).
+pub fn note_user_activity() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::power::note_user_activity();
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_MOVE,
+        };
+        use windows::Win32::System::Power::{
+            SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+        };
+        unsafe {
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            let _ = SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
+            );
+        }
+    }
+}
+
+/// Free bytes on the filesystem that holds `path`.
+pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(path.to_str()?).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        return Some(st.f_bavail as u64 * st.f_frsize as u64);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Caps Lock, Num Lock, Scroll Lock as reported by the keyboard lights.
+pub fn lock_leds() -> (bool, bool, bool) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::leds::lock_leds()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        (false, false, false)
+    }
+}
+
+/// Hide or show this computer's cursor while it is controlling another one.
+/// Wayland leaves the cursor to the compositor.
+pub fn set_host_cursor_hidden(hidden: bool) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::cursor::set_hidden(hidden);
+    #[cfg(windows)]
+    win::set_cursor_visible(!hidden);
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        let _ = hidden;
+    }
+}
+
+/// True when the foreground X11 window is fullscreen. Wayland-native windows report false.
+pub fn foreground_fullscreen() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::fullscreen::foreground_fullscreen()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        false
+    }
+}
+
+/// A small label while another computer is moving this pointer. `None` hides it.
+pub fn set_controlled_hint(text: Option<String>) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::hint::set_controlled_hint(text);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = text;
+    }
+}
+
+/// A background watch. The receiver stays open; events arrive when the OS reports them.
+pub fn spawn_power_watch() -> std::sync::mpsc::Receiver<PowerEvent> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::power::spawn()
+    }
+    #[cfg(windows)]
+    {
+        win::power::spawn()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        rx
+    }
+}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
@@ -226,6 +380,50 @@ pub fn paste_watch(enable: bool) {
     linux::grab::paste_watch(enable);
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     let _ = enable;
+}
+
+/// Put copied names on this computer as placeholder files. The file manager
+/// pastes those; [`wait_paste`] finds the copies. `None` on Windows.
+pub fn prepare_paste(id: u64, items: &[vdrag::DragItem]) -> Option<(u64, Vec<std::path::PathBuf>)> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::xdnd::prepare_paste(id, items)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (id, items);
+        None
+    }
+}
+
+/// Wait until placeholders from [`prepare_paste`] have been copied.
+pub fn wait_paste(gen: u64, wait: std::time::Duration) -> Option<Vec<std::path::PathBuf>> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::xdnd::wait_paste(gen, wait)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (gen, wait);
+        None
+    }
+}
+
+/// Where a file paste should be written when this computer's focus is a file
+/// manager or the desktop. `None` means use the fallback directory.
+pub fn paste_folder() -> Option<std::path::PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::paste_folder()
+    }
+    #[cfg(windows)]
+    {
+        win::paste_folder()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        None
+    }
 }
 
 /// Ctrl+V presses caught since the last call.

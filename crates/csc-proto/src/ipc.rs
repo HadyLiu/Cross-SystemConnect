@@ -39,6 +39,10 @@ impl IpcResponse {
     }
 }
 
+fn default_host_state() -> String {
+    "no_host".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
@@ -63,6 +67,18 @@ pub struct AppStatus {
     /// Set while the server is waiting for trust / this-time / reject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_peer: Option<PendingPeer>,
+    /// Six digits the keyboard host shows while a new computer is pairing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pairing_code: String,
+    /// Unix seconds until which a new computer may start pairing. 0 means closed.
+    #[serde(default)]
+    pub pairing_open_until: u64,
+    /// Short note about a peer, such as a lock screen. Empty when there is nothing to show.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_note: String,
+    /// Controlled computer: `no_host`, `connected`, `host_sleeping`, `host_lost`, `reconnecting`.
+    #[serde(default = "default_host_state")]
+    pub host_state: String,
     /// Peers seen on the selected LAN, whether or not they are connected yet.
     #[serde(default)]
     pub discovered: Vec<DiscoveredPeer>,
@@ -88,11 +104,17 @@ pub enum TransferState {
     Done,
     Failed,
     Cancelled,
+    /// The link dropped; the partial file is kept until the resume window ends.
+    #[serde(rename = "paused_link_lost")]
+    Paused,
 }
 
 impl TransferState {
     pub fn finished(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Paused
+        )
     }
 }
 

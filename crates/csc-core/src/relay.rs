@@ -8,7 +8,8 @@
 
 use crate::net::NetHub;
 use csc_proto::{
-    encode_frame, encode_json_frame, set_file_data_id, FileAckPayload, MsgType, FLAG_JSON_PAYLOAD,
+    encode_frame, encode_json_frame, set_file_batch_id, set_file_data_id, FileAckPayload, MsgType,
+    FLAG_BINARY, FLAG_JSON_PAYLOAD,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -62,7 +63,10 @@ pub fn rewrite_json(msg: MsgType, payload: &[u8], id: u64) -> Option<Vec<u8>> {
 pub fn rewrite(msg: MsgType, payload: &[u8], id: u64) -> Option<Vec<u8>> {
     if msg == MsgType::FileData {
         let mut body = payload.to_vec();
-        set_file_data_id(&mut body, id).then(|| encode_frame(msg, &body, 0))
+        set_file_data_id(&mut body, id).then(|| encode_frame(msg, &body, FLAG_BINARY))
+    } else if msg == MsgType::FileBatch {
+        let mut body = payload.to_vec();
+        set_file_batch_id(&mut body, id).then(|| encode_frame(msg, &body, FLAG_BINARY))
     } else {
         rewrite_json(msg, payload, id)
     }
@@ -173,6 +177,8 @@ async fn forward(
     while let Some(frame) = rx.recv().await {
         let data = if frame.get(3) == Some(&(MsgType::FileData as u8)) {
             frame.len().saturating_sub(csc_proto::HEADER_SIZE + 12) as u64
+        } else if frame.get(3) == Some(&(MsgType::FileBatch as u8)) {
+            frame.len().saturating_sub(csc_proto::HEADER_SIZE + 10) as u64
         } else {
             0
         };
@@ -211,6 +217,7 @@ mod tests {
         let req = serde_json::to_vec(&FileRequestPayload {
             transfer_id: 5,
             skip: vec![2],
+            resume: Vec::new(),
         })
         .unwrap();
         let out = rewrite(MsgType::FileRequest, &req, 99).unwrap();

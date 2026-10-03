@@ -22,6 +22,7 @@ body{padding:10px;box-sizing:border-box}
 .bar>div{height:100%;background:var(--accent);transition:width .2s}
 .item.done .bar>div{background:var(--good)}
 .item.failed .bar>div,.item.cancelled .bar>div{background:var(--bad)}
+.item.paused_link_lost .bar>div{background:#e6b35a}
 .meta{display:flex;justify-content:space-between;color:var(--dim);gap:8px}
 .msg{margin-top:6px;color:var(--dim);word-break:break-all}
 .item.failed .msg{color:var(--bad)}
@@ -44,7 +45,7 @@ button.primary{background:var(--accent);border-color:var(--accent)}
 </style></head><body><div id="list"><div class="empty">没有正在接收的文件</div></div><script>
 const picks={};
 const LABEL={skip:'跳过',keep_both:'保留两者',replace:'替换'};
-const STATE={waiting:'等待中',conflict:'有重名文件',running:'正在接收',done:'已完成',failed:'失败',cancelled:'已取消'};
+const STATE={waiting:'等待中',conflict:'有重名文件',running:'正在接收',done:'已完成',failed:'失败',cancelled:'已取消',paused_link_lost:'等待重连'};
 function post(m){ window.ipc.postMessage(JSON.stringify(m)); }
 function size(n){ const u=['B','KB','MB','GB','TB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+' '+u[i]; }
 function eta(t){ if(!t.bytesPerSec||t.state!=='running') return ''; const s=Math.ceil((t.bytesTotal-t.bytesDone)/t.bytesPerSec);
@@ -63,7 +64,7 @@ function render(list){
   el.innerHTML=last.map(t=>{
     const pct=t.bytesTotal?Math.min(100,Math.floor(t.bytesDone*100/t.bytesTotal)):(t.state==='done'?100:0);
     const from=t.via?(esc(t.peer)+'（经 '+esc(t.via)+'）'):esc(t.peer);
-    const fin=['done','failed','cancelled'].includes(t.state);
+    const fin=['done','failed','cancelled','paused_link_lost'].includes(t.state);
     let acts='';
     if(!fin) acts+=`<button onclick="post({action:'cancel',id:${t.id}})">取消</button>`;
     if(t.state==='done'&&t.openPath) acts+=`<button onclick='post({action:"open",path:${esc(JSON.stringify(t.openPath))}})'>打开</button>`;

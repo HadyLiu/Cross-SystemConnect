@@ -30,7 +30,7 @@ body{
 }
 .brand b{font-size:12px;line-height:1.25}
 .ver{font-size:11px;color:var(--muted);line-height:1.2}
-.nav{display:flex;flex-direction:column;gap:4px;flex:1}
+.nav{display:flex;flex-direction:column;gap:4px;flex:1;overflow:auto}
 .nav button{
   appearance:none;border:0;background:transparent;color:var(--muted);
   display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;
@@ -148,6 +148,15 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
 .help p,.help li{color:var(--text)}
 .help ul{margin:0;padding-left:18px}
 .help li{margin:4px 0}
+.warn{color:#ffb4b4;margin:6px 0 0}
+button.danger{color:#ffb4b4;border-color:#6a3030}
+.code{
+  margin:14px 0;padding:16px 8px;border-radius:12px;background:#101218;
+  font:40px/1 ui-monospace,Consolas,monospace;letter-spacing:.18em;text-align:center;
+}
+.peer-list{margin:0;padding:0;list-style:none}
+.peer-list li{padding:8px 0;border-bottom:1px solid var(--line)}
+.peer-list li:last-child{border-bottom:0}
 </style>
 </head>
 <body>
@@ -155,9 +164,14 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
   <div class="brand"><img class="logo" src="/icon.png" alt=""/><div class="brand-text"><b>Cross-SystemConnect</b><span class="ver">v__CSC_VERSION__</span></div></div>
   <nav class="nav" id="nav">
     <button type="button" class="active" data-page="home"><span class="ico">⌂</span><span>首页</span></button>
-    <button type="button" data-page="settings"><span class="ico">⚙</span><span>设置</span></button>
-    <button type="button" data-page="logs"><span class="ico">☰</span><span>日志</span></button>
-    <button type="button" data-page="help"><span class="ico">?</span><span>帮助</span></button>
+    <button type="button" data-page="devices"><span class="ico">▣</span><span>设备</span></button>
+    <button type="button" data-page="files"><span class="ico">⎘</span><span>剪贴板与文件</span></button>
+    <button type="button" data-page="keys"><span class="ico">⌨</span><span>快捷键与切换</span></button>
+    <button type="button" data-page="net"><span class="ico">◎</span><span>网络</span></button>
+    <button type="button" data-page="lang"><span class="ico">文</span><span>通知与语言</span></button>
+    <button type="button" data-page="privacy"><span class="ico">◉</span><span>隐私与诊断</span></button>
+    <button type="button" data-page="advanced"><span class="ico">⚙</span><span>高级</span></button>
+    <button type="button" data-page="about"><span class="ico">?</span><span>关于</span></button>
   </nav>
 </aside>
 <div class="main">
@@ -166,6 +180,7 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
     <div class="top-side">
       <span id="msg"></span>
       <div class="pill"><span class="dot" id="dot"></span><span id="pillText">加载中…</span></div>
+      <p class="hint" id="pairBanner" hidden></p>
       <button type="button" class="btn" id="rescanBtn" title="清空已发现的设备并重新搜索">⟳ 刷新</button>
     </div>
   </div>
@@ -180,20 +195,14 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
             <div class="stat"><div class="k">活动屏幕</div><div class="v" id="st_screen">—</div></div>
             <div class="stat"><div class="k">键鼠共享</div><div class="v" id="st_share">—</div></div>
           </div>
+          <p class="warn" id="shareBanner" hidden>键鼠共享已暂停。边缘切换和远程控制都停着。</p>
+          <p class="hint" id="peerNote" hidden></p>
+          <p><button type="button" class="btn" id="shareBtn">暂停共享</button></p>
         </div>
-        <div class="card">
-          <h2>本机信息</h2>
-          <div class="row"><label class="f">计算机名</label><input id="name" type="text" autocomplete="off"/></div>
-          <p class="hint" id="osNameHint">只在本软件中使用，不会修改 Windows 或 Linux 的计算机名。</p>
-          <div class="row"><label class="f">本机模式</label>
-            <div class="seg" id="roleSeg">
-              <button type="button" data-v="server">键鼠主机</button>
-              <button type="button" data-v="client">被控端</button>
-            </div>
-          </div>
-          <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
-          <p class="hint" id="ipHint">以太网和 Wi-Fi 都会列出，默认选中以太网</p>
-          <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
+        <div class="card" id="hostCard">
+          <h2>主机状态</h2>
+          <div class="stat"><div class="k">当前</div><div class="v" id="hostStateText">还没有主机</div></div>
+          <p class="hint">被控端在这里看键鼠主机是已连接、休眠还是失联。本机是主机时不显示这张卡片。</p>
         </div>
       </div>
       <div class="card screen-card" id="screenCard" hidden>
@@ -202,34 +211,43 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
         <div class="desk" id="desk"></div>
       </div>
     </section>
-    <section class="page" id="page-settings">
+    <section class="page" id="page-devices">
       <div class="stack">
         <div class="card">
-          <h2>端口</h2>
-          <div class="row"><label class="f">端口</label><input id="control_port" type="number" min="1" max="65535" placeholder="24900"/></div>
-          <p class="hint" id="portHint">不修改则使用默认端口 24900。两边必须相同。</p>
+          <h2>已发现</h2>
+          <ul class="peer-list" id="seenList"><li class="hint">还没有发现其他电脑。</li></ul>
+          <p class="hint">同一网段里正在运行本软件的电脑会出现在这里。第一次连接要在被控端输入主机上的六位配对码。</p>
+          <p><button type="button" class="btn" id="pairOpen">允许新配对</button></p>
+          <p class="hint" id="pairOpenHint">新电脑要在两边都打开这扇窗口（两分钟）才会开始配对。已经信任的电脑不受影响。</p>
         </div>
         <div class="card">
-          <h2>心跳 / 其它</h2>
-          <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
-          <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
-          <label class="check"><input id="prevent_sleep" type="checkbox"/><span>运行时防止休眠</span></label>
+          <h2>手动地址</h2>
+          <div class="row"><label class="f">地址</label><input id="manualAddr" type="text" placeholder="10.10.10.8 或主机名"/></div>
+          <div class="row"><label class="f">控制端口</label><input id="manualPort" type="number" min="0" max="65535" value="24900"/></div>
+          <p><button type="button" class="btn" id="manualAdd">添加</button></p>
+          <ul class="peer-list" id="manualList"><li class="hint">还没有手动地址。</li></ul>
+          <p class="hint">发现不到的电脑填在这里。端口 0 表示用本机控制端口。保存后会按这个地址拨号。</p>
         </div>
         <div class="card">
-          <h2>边缘切换</h2>
-          <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
-          <div class="row" title="指针到达边缘后，还要继续往外推这么多像素才切换；0 表示碰到边缘就切换"><label class="f">推过边缘 px</label><input id="edge_push_px" type="number" min="0" max="200"/></div>
-          <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
-          <div class="row" title="对角放置的电脑：指针贴着外侧边缘、距角落这么多像素内即可切换"><label class="f">对角切换区</label><input id="diagonal_zone_px" type="number" min="1"/></div>
-          <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
-          <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
-          <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
+          <h2>已信任</h2>
+          <ul class="peer-list" id="trustedList"><li class="hint">还没有信任的电脑。</li></ul>
+          <p class="hint">信任后记住对方证书，下次不再询问。证书变了会再问一次。</p>
         </div>
+      </div>
+    </section>
+    <section class="page" id="page-files">
+      <div class="stack">
         <div class="card">
           <h2>剪贴板</h2>
           <label class="check"><input id="clip_enabled" type="checkbox"/><span>启用剪贴板共享</span></label>
           <label class="check"><input id="clip_text" type="checkbox"/><span>文本</span></label>
           <label class="check"><input id="clip_image" type="checkbox"/><span>图片</span></label>
+          <div class="row"><label class="f">发送时机</label>
+            <select id="clip_push_mode">
+              <option value="immediate">立即发给已连接电脑</option>
+              <option value="on_switch">只在切到该电脑时发送</option>
+            </select>
+          </div>
           <div class="row" title="复制的文字超过这个大小时不同步，并提示"><label class="f">文字上限 MB</label><input id="max_inline_mb" type="number" min="1" max="15"/></div>
           <p class="hint">文字最大 15 MB。</p>
         </div>
@@ -240,13 +258,115 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
           <div class="row"><label class="f">单文件上限 MB</label><input id="ft_max_size_mb" type="number"/></div>
           <label class="check"><input id="ft_limit_speed" type="checkbox"/><span>限制传输速度（不勾选则不限速，跑满带宽）</span></label>
           <div class="row"><label class="f">限速 MiB/s</label><input id="ft_max_speed_mibs" type="number" min="1"/></div>
-          <p class="hint">把文件或文件夹拖过屏幕边缘，到另一台电脑上松开即可；进度只在接收的电脑上显示。</p>
+          <div class="row" title="0 表示断开后不续传"><label class="f">断点续传 分钟</label><input id="resume_window_min" type="number" min="0" max="1440" value="30"/></div>
+          <p class="hint">把文件或文件夹拖过屏幕边缘，到另一台电脑上松开即可。传输中断开时，在这段时间内重连会从断点继续。</p>
         </div>
+      </div>
+    </section>
+    <section class="page" id="page-keys">
+      <div class="stack">
         <div class="card">
           <h2>快捷键</h2>
-          <div class="row" title="在任意一台电脑上按下，所有已连接的电脑一起锁屏"><label class="f">锁定屏幕</label><input id="lock_screen" class="hotkey" type="text" readonly data-default="Win+L" placeholder="Win+L"/><button type="button" class="btn hk-reset" data-for="lock_screen">默认</button></div>
-          <div class="row" title="键鼠在另一台电脑上时按下，立即回到本机"><label class="f">回到本机</label><input id="return_to_server" class="hotkey" type="text" readonly data-default="Ctrl+Alt+/" placeholder="Ctrl+Alt+/"/><button type="button" class="btn hk-reset" data-for="return_to_server">默认</button></div>
-          <p class="hint">点一下输入框，再按下新的组合键即可修改；Esc 取消。锁定屏幕：在任意一台电脑上按下，所有已连接的电脑一起锁屏。Win+L 会被系统直接锁屏、无法录入，用「默认」恢复。</p>
+          <div class="row" title="在任意一台电脑上按下，所有已连接的电脑一起锁屏"><label class="f">锁定屏幕</label><input id="lock_screen" class="hotkey" type="text" readonly data-default="Ctrl+Alt+Shift+L" placeholder="Ctrl+Alt+Shift+L"/><button type="button" class="btn hk-reset" data-for="lock_screen">默认</button></div>
+          <div class="row" id="returnRow" title="键鼠在另一台电脑上时按下，立即回到本机"><label class="f">回到本机</label><input id="return_to_server" class="hotkey" type="text" readonly data-default="Ctrl+Alt+/" placeholder="Ctrl+Alt+/"/><button type="button" class="btn hk-reset" data-for="return_to_server">默认</button></div>
+          <div class="row" title="按住后指针停在当前屏幕"><label class="f">锁定在当前屏幕</label><input id="lock_to_screen" class="hotkey" type="text" readonly data-default="Ctrl+Alt+Shift+K" placeholder="Ctrl+Alt+Shift+K"/><button type="button" class="btn hk-reset" data-for="lock_to_screen">默认</button></div>
+          <div class="row" title="在被控电脑上按下，立刻停止键鼠共享"><label class="f">紧急暂停</label><input id="emergency_pause" class="hotkey" type="text" readonly data-default="Ctrl+Alt+Shift+P" placeholder="Ctrl+Alt+Shift+P"/><button type="button" class="btn hk-reset" data-for="emergency_pause">默认</button></div>
+          <p class="hint">点一下输入框，再按下新的组合键即可修改；Esc 取消。默认锁屏是 Ctrl+Alt+Shift+L。Win+L 会被系统直接锁屏、无法录入。</p>
+          <p class="warn" id="hkClash" hidden></p>
+        </div>
+        <div class="card" id="edgeCard">
+          <h2>边缘切换</h2>
+          <p class="hint" id="edgeClientHint" hidden>切换规则由键鼠主机设置。</p>
+          <div class="row"><label class="f">延迟 ms</label><input id="edge_delay_ms" type="number"/></div>
+          <div class="row" title="指针到达边缘后，还要继续往外推这么多像素才切换；0 表示碰到边缘就切换"><label class="f">推过边缘 px</label><input id="edge_push_px" type="number" min="0" max="200"/></div>
+          <div class="row"><label class="f">角落死区</label><input id="corner_dead_zone_px" type="number"/></div>
+          <div class="row" title="对角放置的电脑：指针贴着外侧边缘、距角落这么多像素内即可切换"><label class="f">对角切换区</label><input id="diagonal_zone_px" type="number" min="1"/></div>
+          <label class="check"><input id="double_tap_edge" type="checkbox"/><span>二次撞边切换</span></label>
+          <div class="row"><label class="f">二次窗口</label><input id="double_tap_window_ms" type="number"/></div>
+          <label class="check"><input id="relative_mouse_moves" type="checkbox"/><span>相对鼠标移动</span></label>
+          <div class="row" title="按住这个键时，指针贴着边缘也不会切到另一台电脑"><label class="f">按住不切换</label><select id="block_modifier"><option value="none">不使用</option><option value="ctrl">Ctrl</option><option value="shift">Shift</option><option value="alt">Alt</option></select></div>
+          <label class="check"><input id="block_when_fullscreen" type="checkbox" checked/><span>全屏程序时不切换</span></label>
+          <label class="check"><input id="prevent_sleep" type="checkbox"/><span>有人使用时尽量不让电脑休眠</span></label>
+          <div class="row" title="控制另一台电脑时的指针速度。1 与本机相同，范围 0.25 到 4"><label class="f">指针速度</label><input id="pointer_speed" type="number" min="0.25" max="4" step="0.05" value="1"/></div>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-net">
+      <div class="stack">
+        <div class="card">
+          <h2>端口</h2>
+          <div class="row"><label class="f">控制端口</label><input id="control_port" type="number" min="1" max="65535" value="24900" placeholder="24900"/></div>
+          <div class="row"><label class="f">数据端口</label><input id="data_port" type="number" min="1" max="65535" value="24901" placeholder="24901"/></div>
+          <div class="row"><label class="f">发现端口</label><input id="discovery_port" type="number" min="1" max="65535" value="24900" placeholder="24900"/></div>
+          <p class="hint" id="portHint">控制端口默认 24900，数据端口默认 24901，两者不能相同。发现端口所有电脑必须相同。</p>
+          <p class="warn" id="portClash" hidden>控制端口和数据端口不能相同</p>
+        </div>
+        <div class="card">
+          <h2>网卡</h2>
+          <p class="hint" id="ipHint">以太网和 Wi-Fi 都会列出，默认选中以太网</p>
+          <div class="ip-list" id="ip_list"><span class="hint">读取中…</span></div>
+        </div>
+        <div class="card">
+          <h2>心跳</h2>
+          <label class="check"><input id="heartbeat_enabled" type="checkbox"/><span>启用心跳</span></label>
+          <div class="row"><label class="f">间隔 ms</label><input id="heartbeat_ms" type="number"/></div>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-lang">
+      <div class="stack">
+        <div class="card">
+          <h2>通知</h2>
+          <label class="check"><input id="notify_connect" type="checkbox"/><span>对端连接</span></label>
+          <label class="check"><input id="notify_disconnect" type="checkbox"/><span>断开、主机休眠或失联</span></label>
+          <label class="check"><input id="notify_transfer" type="checkbox"/><span>文件传输</span></label>
+          <label class="check"><input id="notify_errors" type="checkbox"/><span>错误</span></label>
+          <p class="hint">配对请求总会弹出。连接提醒默认关闭，另外三项默认打开。</p>
+        </div>
+        <div class="card">
+          <h2>界面语言</h2>
+          <div class="row"><label class="f">语言</label>
+            <select id="language">
+              <option value="auto">跟随系统</option>
+              <option value="zh-CN">简体中文</option>
+              <option value="en-US">English</option>
+            </select>
+          </div>
+          <p class="hint">选择会立刻切换这个窗口和托盘菜单的文字。</p>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-privacy">
+      <div class="stack">
+        <div class="card">
+          <h2>隐私</h2>
+          <p>日志不记录按键内容、剪贴板内容和文件内容。诊断包里的证书指纹只保留前 8 位，不含私钥。</p>
+        </div>
+        <div class="card">
+          <h2>诊断与测量</h2>
+          <label class="check"><input id="bench_enabled" type="checkbox"/><span>测量模式（两端都打开才接受测速）</span></label>
+          <p><button type="button" class="btn" id="exportDiag">导出诊断信息</button></p>
+          <p><button type="button" class="btn danger" id="resetKeep">重置设置（保留配对）</button></p>
+          <p><button type="button" class="btn danger" id="resetAll">重置设置并清除配对</button></p>
+          <p class="hint">重置只清本机设置和日志，不删除已经收到的文件，也不动另一台电脑上的配对记录。</p>
+          <p class="hint">导出的 zip 写在日志旁边，包含日志和去掉完整指纹的配置。</p>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-advanced">
+      <div class="stack">
+        <div class="card">
+          <h2>本机</h2>
+          <div class="row"><label class="f">计算机名</label><input id="name" type="text" autocomplete="off"/></div>
+          <p class="hint" id="osNameHint">只在本软件中使用，不会修改 Windows 或 Linux 的计算机名。</p>
+          <div class="row"><label class="f">本机模式</label>
+            <div class="seg" id="roleSeg">
+              <button type="button" data-v="server">键鼠主机</button>
+              <button type="button" data-v="client">被控端</button>
+            </div>
+          </div>
+          <select id="role" hidden><option value="server">server</option><option value="client">client</option></select>
+          <p class="hint">改角色或端口会重新搜索，正在进行的连接会断开。</p>
         </div>
         <div class="card">
           <h2>窗口 / 托盘</h2>
@@ -260,7 +380,11 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
             <select id="log_level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
           <label class="check"><input id="log_to_file" type="checkbox"/><span>写入文件</span></label>
           <div class="row"><label class="f">路径</label><input id="log_file" type="text" placeholder="默认：程序目录下的 log.txt"/><button type="button" class="btn hk-reset" id="log_pick">浏览…</button><button type="button" class="btn hk-reset" id="log_default">默认</button></div>
-          <p class="hint">日志超过 100 KB 自动清空重写。修改级别、路径或开关后立即生效，实时内容在「日志」页。<span id="log_now"></span></p>
+          <p class="hint">日志超过 1 MB 时，旧内容转到同目录的 log.1.txt，再从头写。修改级别、路径或开关后立即生效。<span id="log_now"></span></p>
+        </div>
+        <div class="card">
+          <h2>日志 <span class="sub" id="logMeta">实时</span></h2>
+          <pre class="logbox" id="logView">等待日志…</pre>
         </div>
         <div class="card">
           <h2>进入 / 离开命令</h2>
@@ -271,71 +395,146 @@ input.hotkey.recording{border-color:var(--accent);color:var(--muted)}
         </div>
       </div>
     </section>
-    <section class="page" id="page-logs">
-      <div class="card">
-        <h2>日志 <span class="sub" id="logMeta">实时</span></h2>
-        <pre class="logbox" id="logView">等待日志…</pre>
-      </div>
-    </section>
-    <section class="page" id="page-help">
+    <section class="page" id="page-about">
       <div class="stack help">
         <div class="card">
-          <h2>这是什么</h2>
-          <p>用一台电脑的键盘和鼠标控制局域网里的其他 Windows 或 Linux 电脑，并可以同步剪贴板。左上角的版本号来自程序编译时的版本。Windows 双击托盘图标打开这个窗口。Linux 托盘没有双击事件，单击图标打开，右键是菜单。</p>
-        </div>
-        <div class="card">
-          <h2>两种模式</h2>
+          <h2>Cross-SystemConnect <span class="sub">v__CSC_VERSION__</span></h2>
+          <p>协议版本 2。用一台电脑的键盘和鼠标控制局域网里的其他 Windows 或 Linux 电脑，并可以同步剪贴板和文件。</p>
           <ul>
-            <li><b>键鼠主机</b>：物理键鼠在这台电脑上。首页会显示屏幕位置，把连上的电脑拖到主机的上下左右或四个角，鼠标移到对应的边或角就会切过去。</li>
-            <li><b>被控端</b>：接受主机的键鼠。不显示屏幕位置。默认就是被控端。</li>
+            <li>键鼠主机在首页摆放屏幕。被控端看主机状态。</li>
+            <li>控制端口 24900，数据端口 24901。两边发现端口必须相同。</li>
+            <li>第一次连接时，主机显示六位配对码，被控端输入后信任。</li>
+            <li>锁屏 Ctrl+Alt+Shift+L，回到本机 Ctrl+Alt+/。</li>
           </ul>
-        </div>
-        <div class="card">
-          <h2>怎么连上</h2>
-          <ul>
-            <li>两台电脑选同一网段的网卡。以太网和 Wi-Fi 都会列出，有以太网时默认用以太网。</li>
-            <li>端口在「设置」里，不改则是 24900。两边必须相同，并在防火墙上放行该端口的 UDP 和 TCP。</li>
-            <li>主机搜索时可以同时连多台。键鼠数据走 TLS 加密。被控端会询问是否允许这台键鼠主机控制：信任后记住对方证书，取消则拒绝。证书变了会再问一次。</li>
-            <li>计算机名只在本软件里使用，不会修改 Windows 或 Linux 的计算机名。布局里的名字要和对方的计算机名一致。</li>
-          </ul>
-        </div>
-        <div class="card">
-          <h2>快捷键</h2>
-          <ul>
-            <li>锁定屏幕：Win+L，所有已连接的电脑一起锁屏</li>
-            <li>切回键鼠主机：Ctrl+Alt+/</li>
-          </ul>
-          <p class="hint">可以在「设置」里改。边缘切换的延迟和死区也在设置里。</p>
-        </div>
-        <div class="card">
-          <h2>日志</h2>
-          <p>「日志」页显示内核最近写入的内容。默认写到程序所在目录的 log.txt，级别 info；程序目录不能写入时，Windows 改写到 %APPDATA%\Cross-SystemConnect\Cross-SystemConnect.log，Linux 改写到 ~/.local/state/cross-systemconnect/Cross-SystemConnect.log。日志超过 100 KB 自动清空重写。路径可以用「浏览…」选择，修改后立即生效。</p>
+          <p><button type="button" class="btn" id="checkUpdate">检查更新</button></p>
+          <p class="hint" id="updateHint">更新地址还没有配置，所以这里不会联网。</p>
         </div>
       </div>
     </section>
+  </div>
+  <div class="modal" id="wizard">
+    <div class="modal-card">
+      <h2>这台电脑的角色</h2>
+      <p>键鼠主机是你坐在前面的那一台。被控端接受主机的键盘和鼠标。</p>
+      <div class="modal-actions">
+        <button type="button" class="btn primary" id="wizardHost">这台是键鼠主机</button>
+        <button type="button" class="btn" id="wizardClient">这台是被控端</button>
+      </div>
+    </div>
   </div>
   <div class="modal" id="peerModal">
     <div class="modal-card">
       <h2>键鼠主机请求控制</h2>
       <p id="peerText"></p>
+      <label class="f" for="peerCode">配对码</label>
+      <input id="peerCode" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="键鼠主机屏幕上的六位数字"/>
       <div class="modal-actions">
-        <button type="button" class="btn primary" id="peerTrust">信任</button>
+        <button type="button" class="btn primary" id="peerTrust">配对</button>
         <button type="button" class="btn" id="peerReject">取消</button>
       </div>
-      <p class="hint">信任后记住这台主机的证书，下次不再询问。取消则拒绝本次控制。证书变了会再问一次。</p>
+      <p class="hint">看键鼠主机屏幕上的六位配对码，填在这里再点配对。对上后记住证书，下次不再询问。取消则拒绝本次控制。</p>
+    </div>
+  </div>
+  <div class="modal" id="codeModal">
+    <div class="modal-card">
+      <h2>配对码</h2>
+      <p>请在被控端输入这六位数字。</p>
+      <div class="code" id="codeDigits">------</div>
+      <p class="hint">对上后记住对方证书。两分钟内没有确认会取消这次配对。</p>
     </div>
   </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const titles={home:'首页',settings:'设置',logs:'日志',help:'帮助'};
+const titles={home:'首页',devices:'设备',files:'剪贴板与文件',keys:'快捷键与切换',net:'网络',lang:'通知与语言',privacy:'隐私与诊断',advanced:'高级',about:'关于'};
+let langCode='zh-CN';
+function t(zh,en){ return langCode==='en-US'?en:zh; }
+const EN={
+'首页':'Home','设备':'Devices','剪贴板与文件':'Clipboard and files','快捷键与切换':'Shortcuts and switching','网络':'Network','通知与语言':'Notifications and language','隐私与诊断':'Privacy and diagnostics','高级':'Advanced','关于':'About',
+'加载中…':'Loading…','⟳ 刷新':'⟳ Refresh','运行状态':'Status','连接':'Connection','对端':'Peer','活动屏幕':'Active screen','键鼠共享':'Sharing','暂停共享':'Pause sharing','继续共享':'Resume sharing','主机状态':'Host','当前':'Now','还没有主机':'No host yet',
+'被控端在这里看键鼠主机是已连接、休眠还是失联。本机是主机时不显示这张卡片。':'A controlled computer shows whether the keyboard host is connected, asleep, or gone. This card hides when this computer is the host.',
+'屏幕位置':'Screen layout','仅键鼠主机显示。主机固定在中间。电脑可以放在上、下、左、右，也可以放在四个角。从对应的边或角穿过去。没有连接时只显示主机。':'Only the keyboard host shows this. The host stays in the center. Other computers sit on a side or a corner. Move through that edge. With nobody connected, only the host is shown.',
+'已发现':'Discovered','还没有发现其他电脑。':'No other computers yet.','同一网段里正在运行本软件的电脑会出现在这里。第一次连接要在被控端输入主机上的六位配对码。':'Computers on the same subnet show up here. The first connection asks for the six-digit code on the controlled computer.',
+'已信任':'Trusted','还没有信任的电脑。':'No trusted computers yet.','信任后记住对方证书，下次不再询问。证书变了会再问一次。':'After trust, the certificate is remembered. A changed certificate asks again.',
+'剪贴板':'Clipboard','启用剪贴板共享':'Share the clipboard','文本':'Text','图片':'Images','发送时机':'When to send','立即发给已连接电脑':'Send to connected computers immediately','只在切到该电脑时发送':'Only when switching to that computer','文字上限 MB':'Text limit MB','文字最大 15 MB。':'Text is limited to 15 MB.',
+'文件传输':'File transfer','启用':'On','复制文件后，在另一台电脑按 Ctrl+V 传输':'After copying files, press Ctrl+V on the other computer','单文件上限 MB':'Per-file limit MB','限制传输速度（不勾选则不限速，跑满带宽）':'Limit speed (off means full bandwidth)','限速 MiB/s':'Limit MiB/s','断点续传 分钟':'Resume window, minutes','把文件或文件夹拖过屏幕边缘，到另一台电脑上松开即可。传输中断开时，在这段时间内重连会从断点继续。':'Drag files across the screen edge and release on the other computer. If the link drops, reconnecting within this window resumes the transfer.',
+'快捷键':'Shortcuts','锁定屏幕':'Lock screens','默认':'Default','回到本机':'Back to this computer','锁定在当前屏幕':'Stay on this screen','点一下输入框，再按下新的组合键即可修改；Esc 取消。默认锁屏是 Ctrl+Alt+Shift+L。Win+L 会被系统直接锁屏、无法录入。':'Click the box, then press the new keys. Esc cancels. The default lock is Ctrl+Alt+Shift+L. Win+L locks Windows before it can be recorded.',
+'边缘切换':'Edge switching','切换规则由键鼠主机设置。':'The keyboard host sets the switching rules.','延迟 ms':'Delay ms','推过边缘 px':'Push past edge px','角落死区':'Corner dead zone','对角切换区':'Diagonal zone','二次撞边切换':'Switch on a second hit','二次窗口':'Second-hit window','相对鼠标移动':'Relative mouse moves','有人使用时尽量不让电脑休眠':'Try to keep this computer awake while it is in use',
+'端口':'Ports','控制端口':'Control port','数据端口':'Data port','发现端口':'Discovery port','控制端口默认 24900，数据端口默认 24901，两者不能相同。发现端口所有电脑必须相同。':'Control port defaults to 24900 and the data port to 24901. They must differ. Every computer uses the same discovery port.','控制端口和数据端口不能相同':'The control port and the data port must differ.',
+'网卡':'Network adapters','以太网和 Wi-Fi 都会列出，默认选中以太网':'Ethernet and Wi-Fi are both listed. Ethernet is selected when it exists.','读取中…':'Reading…',
+'心跳':'Heartbeat','启用心跳':'Enable heartbeat','间隔 ms':'Interval ms',
+'通知':'Notifications','对端连接':'A computer connected','断开、主机休眠或失联':'Disconnect, sleep, or host lost','文件传输':'File transfer','错误':'Errors','配对请求总会弹出。连接提醒默认关闭，另外三项默认打开。':'Pairing always opens its window. The connection notice is off unless you turn it on. The other three are on.',
+'界面语言':'Language','语言':'Language','跟随系统':'Match the system','简体中文':'Simplified Chinese','选择会立刻切换这个窗口和托盘菜单的文字。':'The window and the tray menu switch immediately.',
+'隐私':'Privacy','日志不记录按键内容、剪贴板内容和文件内容。诊断包里的证书指纹只保留前 8 位，不含私钥。':'Logs do not record keystrokes, clipboard contents, or file contents. A diagnostics bundle keeps only the first 8 characters of a certificate fingerprint, and never the private key.',
+'诊断与测量':'Diagnostics and measurement','测量模式（两端都打开才接受测速）':'Measurement mode (both computers must turn this on)','导出诊断信息':'Export diagnostics','导出的 zip 写在日志旁边，包含日志和去掉完整指纹的配置。':'The zip is written next to the log. It contains the log and the config with fingerprints shortened.',
+'本机':'This computer','计算机名':'Computer name','只在本软件中使用，不会修改 Windows 或 Linux 的计算机名。':'Used only by this app. It does not change the Windows or Linux computer name.','本机模式':'Role','键鼠主机':'Keyboard host','被控端':'Controlled','改角色或端口会重新搜索，正在进行的连接会断开。':'Changing the role or a port starts a new search and drops current connections.',
+'窗口 / 托盘':'Window / tray','启动后驻留托盘':'Stay in the tray after start','关闭设置后继续驻留':'Closing settings leaves the app running','开机自启':'Start at login',
+'日志设置':'Log settings','级别':'Level','写入文件':'Write to a file','路径':'Path','浏览…':'Browse…','日志超过 1 MB 时，旧内容转到同目录的 log.1.txt，再从头写。修改级别、路径或开关后立即生效。':'After 1 MB the old log is moved to log.1.txt and a new file starts. Level, path, and the switch apply immediately.',
+'键鼠共享已暂停。边缘切换和远程控制都停着。':'Sharing is paused. Edge switching and remote control are stopped.',
+'允许新配对':'Allow new pairing','新电脑要在两边都打开这扇窗口（两分钟）才会开始配对。已经信任的电脑不受影响。':'A new computer starts pairing only while this window is open on both sides (two minutes). Trusted computers are unchanged.',
+'手动地址':'Manual addresses','地址':'Address','添加':'Add','还没有手动地址。':'No manual addresses yet.','发现不到的电脑填在这里。端口 0 表示用本机控制端口。保存后会按这个地址拨号。':'Use this when discovery cannot see the other computer. Port 0 uses this computer’s control port.',
+'紧急暂停':'Emergency pause','按住不切换':'Hold to stay','不使用':'Off','全屏程序时不切换':'Do not switch while a program is fullscreen','有人使用时尽量不让电脑休眠':'Try not to sleep while someone is using a connected computer',
+'重置设置（保留配对）':'Reset settings (keep pairing)','重置设置并清除配对':'Reset settings and pairing','重置只清本机设置和日志，不删除已经收到的文件，也不动另一台电脑上的配对记录。':'Reset clears settings and logs on this computer. Received files stay, and the other computer keeps its own pairing record.','日志':'Log','实时':'Live','等待日志…':'Waiting for the log…',
+'进入 / 离开命令':'Enter / leave commands','进入本机时执行':'Run when entering this computer','命令':'Command','离开本机时执行':'Run when leaving this computer',
+'协议版本 2。用一台电脑的键盘和鼠标控制局域网里的其他 Windows 或 Linux 电脑，并可以同步剪贴板和文件。':'Protocol 2. Use one computer’s keyboard and mouse on other Windows or Linux computers on the LAN, and share the clipboard and files.',
+'键鼠主机在首页摆放屏幕。被控端看主机状态。':'The keyboard host arranges screens on Home. A controlled computer watches the host status.',
+'控制端口 24900，数据端口 24901。两边发现端口必须相同。':'Control port 24900, data port 24901. Discovery ports must match.',
+'第一次连接时，主机显示六位配对码，被控端输入后信任。':'On the first connection the host shows a six-digit code. The controlled computer enters it to trust the host.',
+'锁屏 Ctrl+Alt+Shift+L，回到本机 Ctrl+Alt+/。':'Lock screens with Ctrl+Alt+Shift+L. Return here with Ctrl+Alt+/.',
+'键鼠主机请求控制':'A keyboard host wants control','配对码':'Pairing code','配对':'Pair','取消':'Cancel',
+'看键鼠主机屏幕上的六位配对码，填在这里再点配对。对上后记住证书，下次不再询问。取消则拒绝本次控制。':'Type the six digits shown on the keyboard host, then choose Pair. The certificate is remembered. Cancel refuses this control.',
+'请按下组合键…':'Press a key combination…','键鼠主机屏幕上的六位数字':'Six digits on the keyboard host','默认：程序目录下的 log.txt':'Default: log.txt in the program folder',
+'请在被控端输入这六位数字。':'Enter these six digits on the controlled computer.',
+'对上后记住对方证书。两分钟内没有确认会取消这次配对。':'A match remembers the certificate. The attempt is cancelled if it is not confirmed within two minutes.',
+'移除':'Remove','已连接':'Connected',
+'指针速度':'Pointer speed','检查更新':'Check for updates','更新地址还没有配置，所以这里不会联网。':'No update address is configured, so this does not use the network.',
+'这台电脑的角色':'Role of this computer','键鼠主机是你坐在前面的那一台。被控端接受主机的键盘和鼠标。':'The keyboard host is the computer you sit at. A controlled computer accepts that keyboard and mouse.',
+'这台是键鼠主机':'This is the keyboard host','这台是被控端':'This is controlled'
+};
+function applyLang(code){
+  const raw=code||($('language')&&$('language').value)||'auto';
+  const nav=(navigator.language||'').toLowerCase();
+  langCode=(raw==='en-US'||(raw==='auto'&&nav.startsWith('en')))?'en-US':'zh-CN';
+  const skip=new Set(['title','msg','pillText','st_conn','st_peer','st_screen','st_share','st_role','hostStateText','portHint','osNameHint','pairBanner','shareBanner','pairOpenHint','peerNote','updateHint','logMeta','log_now','logView','peerText','codeDigits','desk','seenList','trustedList','manualList','ip_list']);
+  const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,{acceptNode(n){
+    const p=n.parentElement;
+    if(!p||p.closest('script,style')) return NodeFilter.FILTER_REJECT;
+    if(p.closest('[id]')&&skip.has(p.closest('[id]').id)&&skip.has(p.id||p.closest('[id]').id)){
+      let el=p;
+      while(el&&el!==document.body){ if(skip.has(el.id)) return NodeFilter.FILTER_REJECT; el=el.parentElement; }
+    }
+    if(!n.__zh){
+      if(!/[\u4e00-\u9fff]/.test(n.nodeValue||'')) return NodeFilter.FILTER_REJECT;
+      n.__zh=n.nodeValue;
+    }
+    return NodeFilter.FILTER_ACCEPT;
+  }});
+  const nodes=[];
+  while(walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(n=>{
+    const zh=n.__zh, trimmed=zh.trim(), en=EN[trimmed];
+    n.nodeValue=(langCode==='en-US'&&en)?zh.replace(trimmed,en):zh;
+  });
+  document.querySelectorAll('[placeholder]').forEach(el=>{
+    if(!el.dataset.ph) el.dataset.ph=el.placeholder||'';
+    const en=EN[el.dataset.ph];
+    if(en) el.placeholder=langCode==='en-US'?en:el.dataset.ph;
+  });
+  if(window.ipc&&window.ipc.postMessage) window.ipc.postMessage('lang:'+langCode);
+  const active=document.querySelector('#nav button.active');
+  if(active){
+    const zh=titles[active.dataset.page]||'';
+    $('title').textContent=(langCode==='en-US'&&EN[zh])?EN[zh]:zh;
+  }
+}
 document.querySelectorAll('#nav button').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b===btn));
     document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+btn.dataset.page));
-    $('title').textContent=titles[btn.dataset.page]||'';
+    const zh=titles[btn.dataset.page]||'';
+    $('title').textContent=(langCode==='en-US'&&EN[zh])?EN[zh]:zh;
     if(btn.dataset.page==='home') renderDesk();
-    if(btn.dataset.page==='logs') refreshLogs();
+    if(btn.dataset.page==='advanced') refreshLogs();
   };
 });
 function setRole(v){
@@ -343,6 +542,17 @@ function setRole(v){
   document.querySelectorAll('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const card=$('screenCard');
   if(card) card.hidden=v!=='server';
+  if($('hostCard')) $('hostCard').hidden=v==='server';
+  if($('returnRow')) $('returnRow').hidden=v!=='server';
+  if($('edgeClientHint')) $('edgeClientHint').hidden=v==='server';
+  ['edge_delay_ms','edge_push_px','corner_dead_zone_px','diagonal_zone_px','double_tap_window_ms'].forEach(id=>{
+    const row=$(id)&&$(id).closest('.row');
+    if(row) row.hidden=v!=='server';
+  });
+  ['double_tap_edge','relative_mouse_moves'].forEach(id=>{
+    const el=$(id)&&$(id).closest('label');
+    if(el) el.hidden=v!=='server';
+  });
   if(v==='server') renderDesk();
   scheduleSave();
 }
@@ -355,6 +565,9 @@ let saveQueued=false;
 let selectedIp='';
 let knownNics=[];
 let places=[];
+let manuals=[];
+let pointerPeers={};
+let wizardDone=true;
 let livePeers=[];
 let liveSig='';
 let drag=null;
@@ -641,10 +854,16 @@ function scheduleSave(){
   saveTimer=setTimeout(saveNow, 450);
 }
 document.querySelector('.content').addEventListener('input', e=>{
+  portClash();
   if(e.target&&e.target.id==='control_port') return;
   scheduleSave();
 });
-document.querySelector('.content').addEventListener('change', scheduleSave);
+document.querySelector('.content').addEventListener('change', e=>{
+  portClash();
+  hotkeyClash();
+  if(e.target&&e.target.id==='language') applyLang(e.target.value);
+  scheduleSave();
+});
 
 // Hotkey fields record the combination pressed, in the names the core parses (Ctrl+Alt+/).
 const HK_KEYS={Slash:'/',Minus:'-',Equal:'=',BracketLeft:'[',BracketRight:']',Backslash:'\\',
@@ -662,7 +881,7 @@ function hkMods(e){
   return [e.ctrlKey&&'Ctrl',e.altKey&&'Alt',e.shiftKey&&'Shift',e.metaKey&&'Win'].filter(Boolean);
 }
 // Old keys the core also replaces: Ctrl+Alt+Home (return) and ScrollLock (lock).
-const HK_RETIRED={return_to_server:/^ctrl\+alt\+home$/i,lock_screen:/^scrolllock$/i};
+const HK_RETIRED={return_to_server:/^ctrl\+alt\+home$/i,lock_screen:/^scrolllock$/i,lock_to_screen:/^ctrl\+alt\+k$/i};
 function hkClean(id,v){
   const k=(v||'').replace(/\s/g,'');
   if(!k||(HK_RETIRED[id]&&HK_RETIRED[id].test(k))) return $(id).dataset.default;
@@ -674,7 +893,7 @@ function hkPartial(el,e){
 }
 document.querySelectorAll('input.hotkey').forEach(el=>{
   el.addEventListener('focus',()=>{
-    el.dataset.prev=el.value; el.value=''; el.placeholder='请按下组合键…'; el.classList.add('recording');
+    el.dataset.prev=el.value; el.value=''; el.placeholder=t('请按下组合键…','Press a key combination…'); el.classList.add('recording');
   });
   el.addEventListener('blur',()=>{
     if(!el.value||el.value.endsWith('…')) el.value=el.dataset.prev||'';
@@ -690,6 +909,7 @@ document.querySelectorAll('input.hotkey').forEach(el=>{
     el.value=hkClean(el.id,[...mods,key].join('+'));
     el.dataset.prev=el.value;
     el.blur();
+    hotkeyClash();
     scheduleSave();
   });
   el.addEventListener('keyup',e=>{ if(el.value===''||el.value.endsWith('…')) hkPartial(el,e); });
@@ -700,8 +920,30 @@ $('log_pick').onclick=()=>{
 $('log_default').onclick=()=>{ $('log_file').value=''; scheduleSave(); };
 window.onLogFilePicked=path=>{ $('log_file').value=path; scheduleSave(); };
 document.querySelectorAll('.hk-reset[data-for]').forEach(b=>b.onclick=()=>{
-  const el=$(b.dataset.for); el.value=el.dataset.default; el.dataset.prev=el.value; scheduleSave();
+  const el=$(b.dataset.for); el.value=el.dataset.default; el.dataset.prev=el.value; hotkeyClash(); scheduleSave();
 });
+function hotkeyClash(){
+  const el=$('hkClash');
+  if(!el) return;
+  const rows=[['lock_screen','锁定屏幕','Lock screens'],['return_to_server','回到本机','Back to this computer'],['lock_to_screen','锁定在当前屏幕','Stay on this screen'],['emergency_pause','紧急暂停','Emergency pause']];
+  const map={};
+  rows.forEach(([id,zh,en])=>{
+    const v=($(id).value||'').replace(/\s/g,'').toLowerCase();
+    if(!v) return;
+    (map[v]=map[v]||[]).push(t(zh,en));
+  });
+  const hit=Object.values(map).find(a=>a.length>1);
+  el.hidden=!hit;
+  el.textContent=hit?t('与「'+hit.join('、')+'」相同','Same as '+hit.join(', ')):'';
+}
+function portClash(){
+  const el=$('portClash');
+  if(!el) return;
+  const c=Number($('control_port').value), d=Number($('data_port').value);
+  const bad=c>0&&d>0&&c===d;
+  el.hidden=!bad;
+  if(bad) el.textContent=t('控制端口和数据端口不能相同','The control port and the data port must differ.');
+}
 
 async function getConfig(){
   const r=await fetch('/config');
@@ -735,6 +977,7 @@ function saveBody(){
     name:host,
     search_address:selectedIp,
     control_port:portValue(),
+    data_port:Math.max(1,Math.min(65535,Number($('data_port').value)||24901)),
     screens,
     layout:layoutFromPlaces(),
     switch:{edge_delay_ms:Number($('edge_delay_ms').value), double_tap_edge:$('double_tap_edge').checked,
@@ -742,19 +985,37 @@ function saveBody(){
             double_tap_window_ms:Number($('double_tap_window_ms').value),
             corner_dead_zone_px:Number($('corner_dead_zone_px').value),
             diagonal_zone_px:Number($('diagonal_zone_px').value)||80,
-            relative_mouse_moves:$('relative_mouse_moves').checked},
+            relative_mouse_moves:$('relative_mouse_moves').checked,
+            block_modifier:($('block_modifier')&&$('block_modifier').value)||'none',
+            block_when_fullscreen:!($('block_when_fullscreen')&&$('block_when_fullscreen').checked===false)},
     clipboard:{enabled:$('clip_enabled').checked,text:$('clip_text').checked,image:$('clip_image').checked,
                files:$('clip_files').checked,
-               max_inline_mb:Math.max(1,Math.min(15,Number($('max_inline_mb').value)||15))},
+               max_inline_mb:Math.max(1,Math.min(15,Number($('max_inline_mb').value)||15)),
+               push_mode:($('clip_push_mode')&&$('clip_push_mode').value)||'immediate'},
     file_transfer:{enabled:$('ft_enabled').checked,
                    max_size_mb:Number($('ft_max_size_mb').value),limit_speed:$('ft_limit_speed').checked,
-                   max_speed_mibs:Number($('ft_max_speed_mibs').value)},
-    hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value},
+                   max_speed_mibs:Number($('ft_max_speed_mibs').value),
+                   resume_window_min:Math.max(0,Math.min(1440,Number($('resume_window_min').value)||0))},
+    hotkeys:{lock_screen:$('lock_screen').value, return_to_server:$('return_to_server').value,
+             lock_to_screen:$('lock_to_screen').value,
+             emergency_pause:($('emergency_pause')&&$('emergency_pause').value)||'Ctrl+Alt+Shift+P'},
     gui:{theme:'dark',launch_at_login:$('launch_at_login').checked,
          prevent_sleep:$('prevent_sleep').checked,auto_hide:$('auto_hide').checked,
-         close_to_tray:$('close_to_tray').checked},
+         close_to_tray:$('close_to_tray').checked,
+         language:($('language')&&$('language').value)||'auto',
+         wizard_done:wizardDone},
+    pointer:{speed:Math.max(0.25,Math.min(4,Number($('pointer_speed')&&$('pointer_speed').value)||1)),
+             peers:pointerPeers},
+    diagnostics:{bench_enabled:!!($('bench_enabled')&&$('bench_enabled').checked)},
+    notify:{connect:!!($('notify_connect')&&$('notify_connect').checked),
+            disconnect:$('notify_disconnect')?$('notify_disconnect').checked:true,
+            transfer:$('notify_transfer')?$('notify_transfer').checked:true,
+            errors:$('notify_errors')?$('notify_errors').checked:true},
     log:{level:$('log_level').value,to_file:$('log_to_file').checked,file:$('log_file').value},
-    network:{heartbeat_enabled:$('heartbeat_enabled').checked,heartbeat_ms:Number($('heartbeat_ms').value)},
+    power:{keep_peers_awake:!!($('prevent_sleep')&&$('prevent_sleep').checked)},
+    network:{heartbeat_enabled:$('heartbeat_enabled').checked,heartbeat_ms:Number($('heartbeat_ms').value),
+             discovery_port:Math.max(1,Math.min(65535,Number($('discovery_port').value)||24900)),
+             manual_peers:manuals},
     enable_enter_command:$('enable_enter_command').checked, enter_command:$('enter_command').value,
     enable_exit_command:$('enable_exit_command').checked, exit_command:$('exit_command').value,
     log_level:$('log_level').value
@@ -786,7 +1047,22 @@ async function load(){
     $('name').value=cfg.name||cfg.host_name||'';
     setRole(cfg.role||'client');
     $('control_port').value=cfg.control_port||24900;
-    $('prevent_sleep').checked=!!g.prevent_sleep;
+    $('data_port').value=cfg.data_port||24901;
+    $('discovery_port').value=n.discovery_port||cfg.control_port||24900;
+    $('resume_window_min').value=(ft.resume_window_min===0||ft.resume_window_min>0)?ft.resume_window_min:30;
+    pointerPeers=(cfg.pointer&&cfg.pointer.peers)||{};
+    renderTrusted(cfg.trusted_peers||[]);
+    if($('language')) $('language').value=g.language||'auto';
+    wizardDone=g.wizard_done!==false;
+    if($('wizard')) $('wizard').classList.toggle('show', !wizardDone);
+    if($('pointer_speed')) $('pointer_speed').value=(cfg.pointer&&cfg.pointer.speed)||1;
+    const note=cfg.notify||{};
+    if($('notify_connect')) $('notify_connect').checked=!!note.connect;
+    if($('notify_disconnect')) $('notify_disconnect').checked=note.disconnect!==false;
+    if($('notify_transfer')) $('notify_transfer').checked=note.transfer!==false;
+    if($('notify_errors')) $('notify_errors').checked=note.errors!==false;
+    if($('bench_enabled')) $('bench_enabled').checked=!!(cfg.diagnostics&&cfg.diagnostics.bench_enabled);
+    $('prevent_sleep').checked=(cfg.power?cfg.power.keep_peers_awake!==false:!!g.prevent_sleep);
     $('auto_hide').checked=g.auto_hide!==false; $('close_to_tray').checked=g.close_to_tray!==false;
     $('launch_at_login').checked=!!g.launch_at_login;
     $('heartbeat_enabled').checked=n.heartbeat_enabled!==false;
@@ -805,17 +1081,24 @@ async function load(){
     $('corner_dead_zone_px').value=sw.corner_dead_zone_px||10;
     $('diagonal_zone_px').value=sw.diagonal_zone_px||80;
     $('relative_mouse_moves').checked=!!sw.relative_mouse_moves;
+    if($('block_modifier')) $('block_modifier').value=sw.block_modifier||'none';
+    if($('block_when_fullscreen')) $('block_when_fullscreen').checked=sw.block_when_fullscreen!==false;
     const clip=cfg.clipboard||{};
     $('clip_enabled').checked=clip.enabled!==false;
     $('clip_text').checked=!!clip.text; $('clip_image').checked=!!clip.image;
     $('clip_files').checked=!!clip.files;
     $('max_inline_mb').value=clip.max_inline_mb||15;
+    if($('clip_push_mode')) $('clip_push_mode').value=clip.push_mode==='on_switch'?'on_switch':'immediate';
     $('ft_enabled').checked=ft.enabled!==false;
     $('ft_max_size_mb').value=ft.max_size_mb||10240;
     $('ft_limit_speed').checked=ft.limit_speed===true; $('ft_max_speed_mibs').value=ft.max_speed_mibs||4;
     const hk=cfg.hotkeys||{};
     $('lock_screen').value=hkClean('lock_screen',hk.lock_screen);
     $('return_to_server').value=hkClean('return_to_server',hk.return_to_server);
+    $('lock_to_screen').value=hkClean('lock_to_screen',hk.lock_to_screen);
+    if($('emergency_pause')) $('emergency_pause').value=hkClean('emergency_pause',hk.emergency_pause||'Ctrl+Alt+Shift+P');
+    manuals=Array.isArray(n.manual_peers)?n.manual_peers.map(p=>({address:String(p.address||''),control_port:Number(p.control_port)||0})).filter(p=>p.address):[];
+    renderManual();
     $('log_level').value=(l.level||cfg.log_level||'info');
     $('log_to_file').checked=l.to_file!==false; $('log_file').value=l.file||'';
     $('enable_enter_command').checked=!!cfg.enable_enter_command;
@@ -825,9 +1108,12 @@ async function load(){
     const savedIp=cfg.search_address||'';
     await refreshStatus();
     ready=true;
-    const oldKey=$('return_to_server').value!==hk.return_to_server||$('lock_screen').value!==hk.lock_screen;
+    const oldKey=$('return_to_server').value!==hk.return_to_server||$('lock_screen').value!==hk.lock_screen||$('lock_to_screen').value!==(hk.lock_to_screen||'');
     if((selectedIp&&selectedIp!==savedIp)||placesDirty||oldKey) scheduleSave();
-    msg.className='ok'; msg.textContent='已加载';
+    msg.className='ok'; msg.textContent=t('已加载','Loaded');
+    applyLang($('language').value);
+    hotkeyClash();
+    portClash();
     refreshLogs();
   }catch(e){
     msg.className='err'; msg.textContent='加载失败: '+(e&&e.message?e.message:e);
@@ -835,6 +1121,57 @@ async function load(){
 }
 function peerNames(s){
   return (s.peerName||'').split(',').map(x=>x.trim()).filter(Boolean);
+}
+function esc(s){
+  return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function renderTrusted(names){
+  const ul=$('trustedList');
+  if(!ul) return;
+  const list=(names||[]).filter(Boolean);
+  ul.innerHTML=list.length?list.map(n=>'<li>'+esc(n)+' <input class="peer-speed" data-speed="'+esc(n)+'" type="number" min="0.25" max="4" step="0.05" placeholder="1" value="'+(pointerPeers[n]||'')+'"/> <button type="button" class="btn hk-reset danger" data-forget="'+esc(n)+'">'+t('移除','Remove')+'</button></li>').join(''):'<li class="hint">'+t('还没有信任的电脑。','No trusted computers yet.')+'</li>';
+  ul.querySelectorAll('[data-speed]').forEach(el=>el.onchange=()=>{
+    const v=Number(el.value);
+    if(v>=0.25&&v<=4) pointerPeers[el.dataset.speed]=v;
+    else delete pointerPeers[el.dataset.speed];
+    scheduleSave();
+  });
+  ul.querySelectorAll('[data-forget]').forEach(b=>b.onclick=()=>forgetPeer(b.getAttribute('data-forget')));
+}
+async function forgetPeer(name){
+  const msg=$('msg');
+  const ask=t('移除「'+name+'」后，下次连接需要重新配对。对方电脑上的配对记录不会被删除。','After removing “'+name+'”, the next connection must be paired again. The other computer keeps its own record.');
+  if(!window.confirm(ask)) return;
+  try{
+    const r=await fetch('/forget-peer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hostName:name})});
+    let j=null;
+    try{ j=await r.json(); }catch(_){}
+    if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
+    const cfg=await getConfig();
+    renderTrusted((cfg&&cfg.trusted_peers)||[]);
+    if(msg){ msg.className='ok'; msg.textContent=t('已移除 '+name,'Removed '+name); }
+  }catch(e){
+    if(msg){ msg.className='err'; msg.textContent=t('移除失败: ','Could not remove: ')+(e&&e.message?e.message:e); }
+  }
+}
+function renderSeen(list, connected){
+  const ul=$('seenList');
+  if(!ul) return;
+  const items=(list||[]).filter(p=>p&&(p.name||p.hostName));
+  if(!items.length){ ul.innerHTML='<li class="hint">'+t('还没有发现其他电脑。','No other computers yet.')+'</li>'; return; }
+  ul.innerHTML=items.map(p=>{
+    const name=p.name||p.hostName||'';
+    const on=(connected||[]).indexOf(name)>=0;
+    return '<li>'+esc(name)+(p.address?' · '+esc(p.address):'')+(on?(' · '+t('已连接','Connected')):'')+'</li>';
+  }).join('');
+}
+function showCode(code){
+  const modal=$('codeModal');
+  if(!modal) return;
+  const digits=String(code||'').replace(/\D/g,'');
+  if(digits.length!==6){ modal.classList.remove('show'); return; }
+  $('codeDigits').textContent=digits.slice(0,3)+' '+digits.slice(3);
+  modal.classList.add('show');
 }
 async function refreshStatus(){
   if(document.hidden) return;
@@ -844,18 +1181,43 @@ async function refreshStatus(){
   const port=s.discoveryPort||24900;
   const server=s.role==='server';
   $('dot').className='dot'+(on?' on':'');
+  const hostState=s.hostState||'';
+  const hostLabel=hostState==='host_sleeping'?t('主机休眠','Host asleep'):(hostState==='host_lost'?t('主机失联','Host lost'):(hostState==='reconnecting'?t('重连中','Reconnecting'):''));
   $('pillText').textContent=names.length
-    ?('已连接 '+names.length+' 台')
-    :(server?('正在搜索端口 '+port):('正在向端口 '+port+' 发送'));
-  $('st_conn').textContent=names.length?('已连接 '+names.length+' 台'):(server?'搜索中':'发送中');
-  $('st_peer').textContent=names.length?names.join('、'):'(无)';
-  $('st_screen').textContent=s.activeScreen||'(本地)';
-  $('st_share').textContent=s.sharingEnabled?'开启':'暂停';
-  $('st_role').textContent=(s.localName||computerName()||'')+' · '+(server?'键鼠主机':'被控端');
+    ?t('已连接 '+names.length+' 台','Connected to '+names.length)
+    :(hostLabel||(server?t('正在搜索端口 '+port,'Searching on port '+port):t('正在向端口 '+port+' 发送','Sending to port '+port)));
+  const banner=$('pairBanner');
+  if(banner){
+    if(s.pairingCode){
+      banner.hidden=false;
+      banner.textContent=t('配对码 '+s.pairingCode+'。请在另一台电脑输入这六位数字。','Pairing code '+s.pairingCode+'. Enter these six digits on the other computer.');
+    }else{
+      banner.hidden=true;
+      banner.textContent='';
+    }
+  }
+  $('st_conn').textContent=names.length?t('已连接 '+names.length+' 台','Connected to '+names.length):(server?t('搜索中','Searching'):t('发送中','Sending'));
+  $('st_peer').textContent=names.length?names.join('、'):t('(无)','(none)');
+  $('st_screen').textContent=s.activeScreen||t('(本地)','(local)');
+  $('st_share').textContent=s.sharingEnabled?t('开启','On'):t('暂停','Paused');
+  if($('shareBtn')){
+    $('shareBtn').dataset.sharing=s.sharingEnabled?'1':'0';
+    $('shareBtn').textContent=s.sharingEnabled?t('暂停共享','Pause sharing'):t('继续共享','Resume sharing');
+  }
+  if($('shareBanner')) $('shareBanner').hidden=!!s.sharingEnabled;
+  if($('peerNote')){
+    $('peerNote').hidden=!s.peerNote;
+    $('peerNote').textContent=s.peerNote||'';
+  }
+  if($('pairOpenHint')&&s.pairingOpenUntil){
+    const left=Math.max(0,s.pairingOpenUntil-Math.floor(Date.now()/1000));
+    $('pairOpenHint').textContent=left?t('新配对窗口还开着，剩余 '+left+' 秒。','New pairing stays open for '+left+' more seconds.'):t('新电脑要在两边都打开这扇窗口（两分钟）才会开始配对。已经信任的电脑不受影响。','A new computer starts pairing only while this window is open on both sides (two minutes). Trusted computers are unchanged.');
+  }
+  $('st_role').textContent=(s.localName||computerName()||'')+' · '+(server?t('键鼠主机','Keyboard host'):t('被控端','Controlled'));
   const sub=s.searchSubnet||subnetOf(selectedIp);
-  if($('portHint')) $('portHint').textContent='不修改则使用默认端口 24900。当前发现端口 '+port+(sub?('，搜索网段 '+sub+'。'):'。');
+  if($('portHint')) $('portHint').textContent=t('当前发现端口 '+port+'。控制端口与数据端口不能相同。'+(sub?('搜索网段 '+sub+'。'):''),'Discovery port is '+port+'. The control port and the data port must differ.'+(sub?(' Searching '+sub+'.'):''));
   if(s.hostName){
-    $('osNameHint').textContent='系统计算机名是 '+s.hostName+'，这里的名称只在本软件中使用，不会修改它。';
+    $('osNameHint').textContent=t('系统计算机名是 '+s.hostName+'，这里的名称只在本软件中使用，不会修改它。','The system name is '+s.hostName+'. The name here is only used by this app.');
     if(!$('name').value.trim() && document.activeElement!==$('name')){
       $('name').value=s.localName||s.hostName;
     }
@@ -866,7 +1228,11 @@ async function refreshStatus(){
   }
   renderIps(nicList(s.localNics, s.localIpv4));
   if(!drag) syncLive(names, s.discovered||[]);
-  if($('page-logs').classList.contains('active')) refreshLogs();
+  if($('page-advanced')&&$('page-advanced').classList.contains('active')) refreshLogs();
+  showCode(s.pairingCode||'');
+  renderSeen(s.discovered||[], names);
+  const hostMap={connected:t('已连接','Connected'),host_sleeping:t('主机休眠','Host asleep'),host_lost:t('主机失联','Host lost'),reconnecting:t('重连中','Reconnecting'),no_host:t('还没有主机','No host yet')};
+  if($('hostStateText')) $('hostStateText').textContent=server?t('本机是键鼠主机','This computer is the keyboard host'):(hostMap[hostState]||hostLabel||t('还没有主机','No host yet'));
 }
 async function refreshLogs(){
   const box=$('logView');
@@ -876,7 +1242,7 @@ async function refreshLogs(){
     const j=await getLogs();
     const text=(j&&j.text)||'';
     const off=j&&j.to_file===false;
-    box.textContent=text||(off?'没有写入日志文件：设置里「写入文件」已关闭。':(j&&j.error?'暂无日志: '+j.error:'暂无日志'));
+    box.textContent=text||(off?'没有写入日志文件：高级里「写入文件」已关闭。':(j&&j.error?'暂无日志: '+j.error:'暂无日志'));
     if($('logMeta')) $('logMeta').textContent=(text?('最近 '+text.split('\n').length+' 行'):'实时')+(j&&j.path?' · '+j.path:'');
     if($('log_now')) $('log_now').textContent=j&&j.path?' 当前写入：'+j.path:'';
     if(nearBottom) box.scrollTop=box.scrollHeight;
@@ -898,6 +1264,7 @@ function showPeer(p){
   peerShown=p.hostName;
   const who=(p.name&&p.name!==p.hostName)?(p.name+'（'+p.hostName+'）'):(p.name||p.hostName);
   $('peerText').textContent=who+' 请求控制这台电脑，来自 '+(p.address||'未知地址')+'。';
+  if($('peerCode')) $('peerCode').value='';
   modal.classList.add('show');
   $('peerReject').focus();
 }
@@ -908,7 +1275,7 @@ async function decidePeer(decision){
   try{
     const r=await fetch('/peer-decision',{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({hostName:host, decision})
+      body:JSON.stringify({hostName:host, decision, code:($('peerCode')&&$('peerCode').value)||''})
     });
     const j=await r.json();
     if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
@@ -925,6 +1292,17 @@ async function decidePeer(decision){
     deciding=false;
   }
 }
+if($('exportDiag')) $('exportDiag').onclick=async()=>{
+  const msg=$('msg');
+  try{
+    const r=await fetch('/diagnostics',{method:'POST'});
+    const j=await r.json();
+    if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
+    if(msg){ msg.className='ok'; msg.textContent='诊断信息已写入 '+(j.path||''); }
+  }catch(e){
+    if(msg){ msg.className='err'; msg.textContent='导出失败: '+(e&&e.message?e.message:e); }
+  }
+};
 $('peerTrust').onclick=()=>decidePeer('trust');
 $('peerReject').onclick=()=>decidePeer('reject');
 $('rescanBtn').onclick=async()=>{
@@ -944,6 +1322,81 @@ $('rescanBtn').onclick=async()=>{
     setTimeout(()=>{ btn.disabled=false; }, 1500);
   }
 };
+function renderManual(){
+  const ul=$('manualList');
+  if(!ul) return;
+  ul.innerHTML='';
+  if(!manuals.length){
+    const li=document.createElement('li');
+    li.className='hint';
+    li.textContent=t('还没有手动地址。','No manual addresses yet.');
+    ul.appendChild(li);
+    return;
+  }
+  manuals.forEach((p,i)=>{
+    const li=document.createElement('li');
+    li.textContent=p.address+(p.control_port?(' : '+p.control_port):'');
+    const b=document.createElement('button');
+    b.type='button';
+    b.className='btn danger';
+    b.textContent=t('移除','Remove');
+    b.onclick=()=>{ manuals.splice(i,1); renderManual(); scheduleSave(); };
+    li.appendChild(b);
+    ul.appendChild(li);
+  });
+}
+if($('manualAdd')) $('manualAdd').onclick=()=>{
+  const addr=$('manualAddr').value.trim();
+  const port=Math.max(0,Math.min(65535,Number($('manualPort').value)||0));
+  if(!addr){ $('msg').className='err'; $('msg').textContent=t('请填写地址','Enter an address'); return; }
+  if(manuals.some(p=>p.address===addr)){ $('msg').className='err'; $('msg').textContent=t('这个地址已经在列表里','That address is already listed'); return; }
+  manuals.push({address:addr,control_port:port});
+  $('manualAddr').value='';
+  renderManual();
+  scheduleSave();
+};
+function finishWizard(role){
+  wizardDone=true;
+  if($('wizard')) $('wizard').classList.remove('show');
+  setRole(role);
+  scheduleSave();
+}
+if($('wizardHost')) $('wizardHost').onclick=()=>finishWizard('server');
+if($('wizardClient')) $('wizardClient').onclick=()=>finishWizard('client');
+if($('checkUpdate')) $('checkUpdate').onclick=()=>{
+  $('msg').className='err';
+  $('msg').textContent=t('更新地址还没有配置','No update address is configured');
+};
+if($('pairOpen')) $('pairOpen').onclick=async()=>{
+  const r=await fetch('/pair-open',{method:'POST'});
+  const j=await r.json().catch(()=>null);
+  if(j&&j.ok){ $('msg').className='ok'; $('msg').textContent=t('已打开两分钟配对窗口','Pairing window open for two minutes'); refreshStatus(); }
+  else { $('msg').className='err'; $('msg').textContent=(j&&j.error)||t('打开失败','Could not open'); }
+};
+async function resetData(keep){
+  const ask=keep?t('重置本机设置，但保留已信任的电脑？','Reset settings on this computer and keep trusted computers?'):t('重置本机设置，并忘掉已信任的电脑？','Reset settings and forget trusted computers on this computer?');
+  if(!confirm(ask)) return;
+  const r=await fetch('/reset-data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keepPairing:keep})});
+  const j=await r.json().catch(()=>null);
+  if(j&&j.ok){ location.reload(); }
+  else { $('msg').className='err'; $('msg').textContent=(j&&j.error)||t('重置失败','Reset failed'); }
+}
+if($('resetKeep')) $('resetKeep').onclick=()=>resetData(true);
+if($('resetAll')) $('resetAll').onclick=()=>resetData(false);
+$('shareBtn').onclick=async()=>{
+  const paused=$('shareBtn').dataset.sharing!=='1';
+  const msg=$('msg');
+  try{
+    const r=await fetch('/sharing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:paused})});
+    let j=null;
+    try{ j=await r.json(); }catch(_){}
+    if(!r.ok||(j&&j.ok===false)) throw new Error((j&&j.error)||('HTTP '+r.status));
+    await refreshStatus();
+  }catch(e){
+    if(msg){ msg.className='err'; msg.textContent='切换共享失败: '+(e&&e.message?e.message:e); }
+  }
+};
+applyLang('auto');
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);
 </script>

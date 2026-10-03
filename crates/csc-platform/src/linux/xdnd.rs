@@ -23,8 +23,10 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-/// Placeholder marker inside a dragged folder (same name as the core uses).
-const FOLDER_MARKER: &str = ".csc-drag";
+/// Placeholder marker inside a dragged folder (Doc §14.6).
+const FOLDER_MARKER_PREFIX: &str = ".csc-drag-";
+/// 16-byte magic including the trailing NUL.
+const PLACEHOLDER_MAGIC: &[u8] = b"CSC-PLACEHOLDER\0";
 const XDND_VERSION: u32 = 5;
 /// How long file managers get to copy the placeholders after the drop.
 const FIND_TIMEOUT: Duration = Duration::from_secs(20);
@@ -106,18 +108,37 @@ pub fn start(desc: DragDesc, events: Sender<DragEvent>) -> bool {
 }
 
 /// One placeholder per top-level item, named like the real one.
-struct Top {
+#[derive(Clone)]
+pub(crate) struct Top {
+    #[allow(dead_code)]
     index: usize,
-    name: String,
-    is_dir: bool,
-    path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) is_dir: bool,
+    pub(crate) path: PathBuf,
+    token: [u8; 32],
 }
 
-fn marker(id: u64, index: usize) -> String {
-    format!("{{\"csc_drag\":{id},\"index\":{index}}}")
+fn folder_marker(id: u64) -> String {
+    format!("{FOLDER_MARKER_PREFIX}{id}")
 }
 
-fn make_placeholders(dir: &Path, id: u64, items: &[DragItem]) -> std::io::Result<Vec<Top>> {
+fn marker_bytes(token: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PLACEHOLDER_MAGIC.len() + 32);
+    out.extend_from_slice(PLACEHOLDER_MAGIC);
+    out.extend_from_slice(token);
+    out
+}
+
+fn fresh_token() -> [u8; 32] {
+    let mut token = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut token);
+    }
+    token
+}
+
+pub(crate) fn make_placeholders(dir: &Path, id: u64, items: &[DragItem]) -> std::io::Result<Vec<Top>> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
     let mut tops = Vec::new();
@@ -127,17 +148,20 @@ fn make_placeholders(dir: &Path, id: u64, items: &[DragItem]) -> std::io::Result
             continue;
         }
         let path = dir.join(&name);
+        let token = fresh_token();
+        let body = marker_bytes(&token);
         if it.is_directory {
             std::fs::create_dir_all(&path)?;
-            std::fs::write(path.join(FOLDER_MARKER), marker(id, index))?;
+            std::fs::write(path.join(folder_marker(id)), &body)?;
         } else {
-            std::fs::write(&path, marker(id, index))?;
+            std::fs::write(&path, &body)?;
         }
         tops.push(Top {
             index,
             name,
             is_dir: it.is_directory,
             path,
+            token,
         });
     }
     Ok(tops)
@@ -613,7 +637,7 @@ impl Drag {
     }
 }
 
-fn file_uri(path: &Path) -> String {
+pub(crate) fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut out = String::from("file://");
     for &b in path.as_os_str().as_bytes() {
@@ -652,19 +676,42 @@ fn path_of_uri(uri: &str) -> Option<PathBuf> {
 
 // ------------------------------------------------------------ finding copies
 
-fn is_marker(path: &Path, id: u64, index: usize) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|s| s.trim() == marker(id, index))
+fn is_marker(path: &Path, top: &Top) -> bool {
+    std::fs::read(path).is_ok_and(|b| b == marker_bytes(&top.token))
 }
 
-/// Search the places a file manager can drop into for copies of the placeholders.
-/// Only folders changed since `since` are looked into; the copy may be renamed.
+/// Copies of the placeholders, renamed into the same style as other receives.
+pub(crate) fn resolve_copies(id: u64, tops: &[Top], since: SystemTime) -> DragEvent {
+    info!("drag {id}: looking for the copied placeholders");
+    match find_copies(id, tops, since) {
+        Some(found) => {
+            let tops = found
+                .into_iter()
+                .zip(tops)
+                .map(|(path, top)| same_style_name(path, &top.name, top.is_dir))
+                .collect();
+            DragEvent::InPlace { id, tops }
+        }
+        None => DragEvent::Lost { id },
+    }
+}
+
 fn find_copies(id: u64, tops: &[Top], since: SystemTime) -> Option<Vec<PathBuf>> {
+    find_copies_until(id, tops, since, Instant::now() + FIND_TIMEOUT)
+}
+
+/// Search until `deadline` for copies of the placeholders.
+pub(crate) fn find_copies_until(
+    id: u64,
+    tops: &[Top],
+    since: SystemTime,
+    deadline: Instant,
+) -> Option<Vec<PathBuf>> {
     let staging = staging_root();
     let since_secs = since
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let deadline = Instant::now() + FIND_TIMEOUT;
     let mut found: Vec<Option<PathBuf>> = vec![None; tops.len()];
     loop {
         for dir in search_dirs(&staging, since_secs) {
@@ -682,9 +729,9 @@ fn find_copies(id: u64, tops: &[Top], since: SystemTime) -> Option<Vec<PathBuf>>
                         continue;
                     }
                     let hit = if top.is_dir {
-                        is_marker(&path.join(FOLDER_MARKER), id, top.index)
+                        is_marker(&path.join(folder_marker(id)), top)
                     } else {
-                        meta.len() < 256 && is_marker(&path, id, top.index)
+                        meta.len() < 256 && is_marker(&path, top)
                     };
                     if hit {
                         debug!("drag {id}: {} copied to {}", top.name, path.display());
@@ -772,7 +819,11 @@ fn search_dirs(staging: &Path, since_secs: i64) -> Vec<PathBuf> {
         if seen > MAX_DIRS {
             break;
         }
-        if dir.starts_with(staging) {
+        if dir.starts_with(staging)
+            || dir
+                .components()
+                .any(|c| c.as_os_str() == "csc-drag" || c.as_os_str() == "csc-paste")
+        {
             continue;
         }
         if std::fs::metadata(&dir).is_ok_and(|m| m.mtime() >= since_secs) {
@@ -792,6 +843,76 @@ fn search_dirs(staging: &Path, since_secs: i64) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+struct PasteHold {
+    gen: u64,
+    id: u64,
+    tops: Vec<Top>,
+}
+
+static PASTE_GEN: AtomicU64 = AtomicU64::new(1);
+static PASTE: std::sync::Mutex<Option<PasteHold>> = std::sync::Mutex::new(None);
+
+/// Placeholder files for a remote copy, so a file manager can paste them.
+/// Returns a generation and the placeholder paths to put on the clipboard.
+pub(crate) fn prepare_paste(id: u64, items: &[DragItem]) -> Option<(u64, Vec<PathBuf>)> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("csc-paste").join(id.to_string());
+    let tops = make_placeholders(&dir, id, items).ok()?;
+    if tops.is_empty() {
+        return None;
+    }
+    let paths = tops.iter().map(|t| t.path.clone()).collect();
+    let gen = PASTE_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Ok(mut slot) = PASTE.lock() {
+        *slot = Some(PasteHold { gen, id, tops });
+    }
+    Some((gen, paths))
+}
+
+/// Block until the file manager has copied the placeholders, or `wait` elapses.
+/// A newer [`prepare_paste`] cancels this wait.
+pub(crate) fn wait_paste(gen: u64, wait: Duration) -> Option<Vec<PathBuf>> {
+    let hold = PASTE.lock().ok()?.as_ref().filter(|h| h.gen == gen)?.clone();
+    let since = SystemTime::now() - Duration::from_secs(2);
+    let deadline = Instant::now() + wait;
+    loop {
+        let current = PASTE.lock().ok()?.as_ref().map(|h| h.gen);
+        if current != Some(gen) {
+            return None;
+        }
+        if let Some(found) = find_copies_until(
+            hold.id,
+            &hold.tops,
+            since,
+            Instant::now() + Duration::from_secs(1),
+        ) {
+            return Some(
+                found
+                    .into_iter()
+                    .zip(&hold.tops)
+                    .map(|(path, top)| same_style_name(path, &top.name, top.is_dir))
+                    .collect(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+impl Clone for PasteHold {
+    fn clone(&self) -> Self {
+        Self {
+            gen: self.gen,
+            id: self.id,
+            tops: self.tops.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -828,14 +949,17 @@ mod tests {
         let tops = make_placeholders(&base.join("stage"), 7, &items).unwrap();
         assert_eq!(tops.len(), 2);
         assert_eq!(tops[1].index, 1);
-        assert!(is_marker(&base.join("stage/a.txt"), 7, 0));
-        assert!(is_marker(&base.join("stage/d").join(FOLDER_MARKER), 7, 1));
+        assert!(is_marker(&base.join("stage/a.txt"), &tops[0]));
+        assert!(is_marker(
+            &base.join("stage/d").join(folder_marker(7)),
+            &tops[1]
+        ));
         let dest = base.join("dest");
         std::fs::create_dir_all(dest.join("d")).unwrap();
         std::fs::copy(base.join("stage/a.txt"), dest.join("a (1).txt")).unwrap();
         std::fs::copy(
-            base.join("stage/d").join(FOLDER_MARKER),
-            dest.join("d").join(FOLDER_MARKER),
+            base.join("stage/d").join(folder_marker(7)),
+            dest.join("d").join(folder_marker(7)),
         )
         .unwrap();
         let since_secs = SystemTime::now()
@@ -857,7 +981,7 @@ mod tests {
         std::fs::rename(dest.join("a (1).txt"), dest.join("a (副本).txt")).unwrap();
         let renamed = same_style_name(dest.join("a (副本).txt"), "a.txt", false);
         assert_eq!(renamed, dest.join("a (1).txt"));
-        assert!(is_marker(&renamed, 7, 0));
+        assert!(is_marker(&renamed, &tops[0]));
         assert_eq!(same_style_name(dest.join("d"), "d", true), dest.join("d"));
         let _ = std::fs::remove_dir_all(&base);
     }

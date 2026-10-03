@@ -21,7 +21,7 @@ use csc_proto::{
     SwitchPayload,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -354,7 +354,7 @@ pub async fn spawn_network(
             let snapshot = cfg2.read().await.clone();
             {
                 let mut s = app_status.write().await;
-                s.discovery_port = snapshot.control_port;
+                s.discovery_port = udp_port(&snapshot);
                 s.role = match snapshot.role {
                     Role::Server => "server".into(),
                     Role::Client => "client".into(),
@@ -520,8 +520,10 @@ async fn run_server(
     inbound: Wires,
 ) -> anyhow::Result<()> {
     let port = cfg.control_port;
+    let discover = udp_port(cfg);
     let bind = effective_bind(cfg);
-    let udp = bind_udp(parse_bind(&bind, port)).await?;
+    let udp = bind_udp(parse_bind(&bind, discover)).await?;
+    spawn_data_listener(identity, parse_bind(&bind, cfg.data_port), cfg.data_port).await;
     let listener = match TcpListener::bind(parse_bind(&bind, port)).await {
         Ok(l) => Some(l),
         Err(e) => {
@@ -530,10 +532,11 @@ async fn run_server(
         }
     };
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "全部本机网段".into());
-    info!("searching UDP port {port} on {subnet}");
-    let search = encode_search();
-    let search_unlinked = crate::discover::encode_search_unlinked();
-    let targets = scan_targets(cfg, port, local_ips);
+    info!("searching UDP port {discover} on {subnet}");
+    let search = encode_search(cfg.control_port, cfg.data_port, &cfg.name);
+    let search_unlinked =
+        crate::discover::encode_search_unlinked(cfg.control_port, cfg.data_port, &cfg.name);
+    let targets = scan_targets(cfg, discover, local_ips);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut buf = [0u8; 2048];
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -578,6 +581,43 @@ async fn run_server(
                         peers.clone(),
                         inbound.clone(),
                         status.clone(),
+                        app_status.clone(),
+                        inflight.clone(),
+                        stop_rx.clone(),
+                        key,
+                        ServerLink::Dial(addr),
+                    );
+                }
+                let manuals = live.read().await.network.manual_peers.clone();
+                for peer in manuals {
+                    let port = if peer.control_port == 0 {
+                        cfg.control_port
+                    } else {
+                        peer.control_port
+                    };
+                    let Ok(mut addrs) = (peer.address.as_str(), port).to_socket_addrs() else {
+                        continue;
+                    };
+                    let Some(addr) = addrs.next() else { continue };
+                    let key = addr.ip().to_string();
+                    if peers.contains(&key).await {
+                        redial.reset(&key);
+                        continue;
+                    }
+                    if !redial.due(&key, now) || inflight.lock().await.contains(&key) {
+                        continue;
+                    }
+                    debug!("dialing manual peer {addr}");
+                    inflight.lock().await.insert(key.clone());
+                    spawn_server_link(
+                        cfg.clone(),
+                        live.clone(),
+                        config_path.to_path_buf(),
+                        identity.clone(),
+                        peers.clone(),
+                        inbound.clone(),
+                        status.clone(),
+                        app_status.clone(),
                         inflight.clone(),
                         stop_rx.clone(),
                         key,
@@ -622,7 +662,7 @@ async fn run_server(
                 if inflight.lock().await.contains(&key) {
                     continue;
                 }
-                let tcp_port = if ann.tcp_port == 0 { port } else { ann.tcp_port };
+                let tcp_port = ann.control_port;
                 let peer_addr = SocketAddr::new(src.ip(), tcp_port);
                 inflight.lock().await.insert(key.clone());
                 spawn_server_link(
@@ -633,6 +673,7 @@ async fn run_server(
                     peers.clone(),
                     inbound.clone(),
                     status.clone(),
+                    app_status.clone(),
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
@@ -675,6 +716,7 @@ async fn run_server(
                     peers.clone(),
                     inbound.clone(),
                     status.clone(),
+                    app_status.clone(),
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
@@ -706,6 +748,7 @@ fn spawn_server_link(
     peers: PeerTable,
     inbound: Wires,
     status: Arc<RwLock<NetStatus>>,
+    app_status: Arc<RwLock<AppStatus>>,
     inflight: Arc<Mutex<HashSet<String>>>,
     mut stop: watch::Receiver<bool>,
     key: String,
@@ -741,6 +784,7 @@ fn spawn_server_link(
                 refresh_link_status(&status, &peers).await;
                 let kick = inbound.kick.clone();
                 let events = inbound.clone();
+                let data_token = export_client(&stream);
                 tokio::select! {
                     result = session(
                         &cfg,
@@ -749,11 +793,15 @@ fn spawn_server_link(
                         stream,
                         peer_cert,
                         &status,
+                        &app_status,
                         key.clone(),
                         rx,
                         inbound,
                         None,
                         None,
+                        peer_addr.ip(),
+                        &identity,
+                        data_token,
                     ) => {
                         if let Err(e) = result {
                             warn!("session {key} ended: {e:#}");
@@ -792,9 +840,11 @@ async fn run_client(
     inbound: Wires,
 ) -> anyhow::Result<()> {
     let port = cfg.control_port;
+    let discover = udp_port(cfg);
     let bind = effective_bind(cfg);
+    spawn_data_listener(identity, parse_bind(&bind, cfg.data_port), cfg.data_port).await;
     let listener = TcpListener::bind(parse_bind(&bind, port)).await?;
-    let udp = match bind_udp(parse_bind(&bind, port)).await {
+    let udp = match bind_udp(parse_bind(&bind, discover)).await {
         Ok(sock) => sock,
         Err(e) => {
             warn!("bind UDP {port} failed ({e:#}); announcing from an ephemeral port");
@@ -809,14 +859,15 @@ async fn run_client(
     let announce = encode_announce(&Announce {
         name: cfg.name.clone(),
         host_name,
-        tcp_port: port,
+        control_port: cfg.control_port,
+        data_port: cfg.data_port,
     });
     let (stop_tx, stop_rx) = watch::channel(false);
     let _stop = StopOnDrop(stop_tx);
     let rejected: Arc<Mutex<HashMap<String, RejectMark>>> = Arc::new(Mutex::new(HashMap::new()));
-    let targets = scan_targets(cfg, port, local_ips);
+    let targets = scan_targets(cfg, discover, local_ips);
     let subnet = subnet_label(&cfg.search_address).unwrap_or_else(|| "本机网段".into());
-    info!("announcing on UDP port {port} toward {subnet}");
+    info!("announcing on UDP port {discover} toward {subnet}");
     let ctx = ClientCtx {
         cfg: cfg.clone(),
         live: live.clone(),
@@ -837,12 +888,17 @@ async fn run_client(
     // Dialing at the same moment replaces the session that just came up.
     let mut host_wait: HashMap<String, (Instant, SocketAddr)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut manual_tick = 0u8;
     let mut buf = [0u8; 2048];
     let mut udp_fails = 0u32;
     let kick = inbound.kick.clone();
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                manual_tick = manual_tick.wrapping_add(1);
+                if manual_tick % 15 == 1 {
+                    dial_client_manual(&ctx, &dialing).await;
+                }
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &announce, &targets).await)?;
                 let due: Vec<(String, SocketAddr)> = host_wait
                     .iter()
@@ -874,18 +930,16 @@ async fn run_client(
                     }
                 }
                 let datagram = decode_datagram(&buf[..n]);
-                if matches!(datagram, Some(Datagram::Search | Datagram::SearchUnlinked)) {
+                if let Some(Datagram::Search(probe)) = datagram {
                     let _ = udp.send_to(&announce, src).await;
                     let key = src.ip().to_string();
-                    // A live session stays up. SearchUnlinked only means the host
-                    // has not registered one yet; dropping ours made the link flap.
                     let incoming_now = incoming.lock().await.contains_key(&key);
                     if incoming_now || peers.contains(&key).await {
                         host_wait.remove(&key);
                     } else {
                         host_wait.entry(key).or_insert((
                             Instant::now(),
-                            SocketAddr::new(src.ip(), port),
+                            SocketAddr::new(src.ip(), probe.control_port),
                         ));
                     }
                 }
@@ -930,6 +984,33 @@ struct ClientCtx {
     inbound: Wires,
     rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
     stop: watch::Receiver<bool>,
+}
+
+async fn dial_client_manual(ctx: &ClientCtx, dialing: &Arc<Mutex<HashSet<String>>>) {
+    let saved = ctx.live.read().await;
+    let manuals = saved.network.manual_peers.clone();
+    let control = saved.control_port;
+    drop(saved);
+    for peer in manuals {
+        let port = if peer.control_port == 0 {
+            control
+        } else {
+            peer.control_port
+        };
+        let Ok(mut addrs) = (peer.address.as_str(), port).to_socket_addrs() else {
+            warn!("manual address {} is not usable", peer.address);
+            continue;
+        };
+        let Some(addr) = addrs.next() else { continue };
+        let key = addr.ip().to_string();
+        if ctx.peers.contains(&key).await || dialing.lock().await.contains(&key) {
+            continue;
+        }
+        if dialing.lock().await.insert(key.clone()) {
+            info!("dialing manual address {addr}");
+            spawn_client_dial(ctx.clone(), dialing.clone(), key, addr);
+        }
+    }
 }
 
 fn spawn_client_dial(
@@ -978,6 +1059,7 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
         }
     };
     let mut stop = ctx.stop.clone();
+    let data_token = export_server(&stream);
     tokio::select! {
         result = session(
             &ctx.cfg,
@@ -986,11 +1068,15 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
             stream,
             peer_cert,
             &ctx.status,
+            &ctx.app_status,
             key.clone(),
             rx,
             ctx.inbound.clone(),
             Some(link),
             Some(admit),
+            peer.ip(),
+            &ctx.identity,
+            data_token,
         ) => {
             if let Err(e) = result {
                 warn!("client session {key} ended: {e:#}");
@@ -1069,6 +1155,24 @@ impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let _ = self.0.send(true);
     }
+}
+
+fn both_hosts(local: Role, remote_role: &str) -> bool {
+    local == Role::Server && remote_role.eq_ignore_ascii_case("server")
+}
+
+async fn note_role_conflict(app_status: &Arc<RwLock<AppStatus>>, peer: &str) {
+    warn!("both computers are keyboard hosts; not connecting to {peer}");
+    app_status.write().await.peer_note = format!("{peer} 也是键鼠主机，没有建立连接");
+    crate::notice::tell(
+        crate::notice::Kind::Error,
+        "Cross-SystemConnect",
+        &crate::notice::text(
+            &format!("{peer} 也是键鼠主机，请把其中一台改成被控端"),
+            &format!("{peer} is also a keyboard host. Make one of them controlled."),
+        ),
+        true,
+    );
 }
 
 fn effective_bind(cfg: &Config) -> String {
@@ -1254,26 +1358,51 @@ async fn session<S>(
     stream: S,
     peer_cert: Vec<u8>,
     status: &Arc<RwLock<NetStatus>>,
+    app_status: &Arc<RwLock<AppStatus>>,
     peer: String,
     mut outbound: LinkRx,
     mut inbound: Wires,
     link: Option<ClientLink>,
     admit: Option<Admit>,
+    remote_ip: std::net::IpAddr,
+    identity: &Arc<crate::tls::Identity>,
+    data_token: [u8; 32],
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let peer_fp = crate::tls::fingerprint(&peer_cert);
+    let _data_reg = DataReg::insert(DataSlot {
+        token: data_token,
+        peer: peer.clone(),
+        wires: inbound.clone(),
+        is_host: admit.is_none(),
+        status: status.clone(),
+        bulk: std::sync::Mutex::new(None),
+        fingerprint: peer_fp.clone(),
+    });
+    let is_host = admit.is_none();
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
 
     let size = csc_platform::create_screen_info().virtual_size();
     let hello = HelloPayload {
-        protocol_version: 1,
+        protocol_version: 2,
         host_name: cfg.name.clone(),
+        role: match cfg.role {
+            Role::Server => "server".into(),
+            Role::Client => "client".into(),
+        },
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        device_id: cfg.device_id.clone(),
         screen_width: size.width,
         screen_height: size.height,
         capabilities: local_capabilities(),
+        ports: csc_proto::HelloPorts {
+            control: cfg.control_port,
+            data: cfg.data_port,
+        },
+        ..HelloPayload::default()
     };
     let remember = |remote: &HelloPayload| {
         if let Ok(mut info) = outbound.info.lock() {
@@ -1289,6 +1418,7 @@ where
     }
 
     let mut buf = BytesMut::with_capacity(64 * 1024);
+    let peer_data_port;
     if let Some(admit) = admit {
         let (remote, _early) = match tokio::time::timeout(
             Duration::from_secs(5),
@@ -1308,18 +1438,88 @@ where
         };
         // Keep reading while the user decides, so the host's send buffer cannot fill.
         // Heartbeats tell the host this computer is still here and only waiting.
+        peer_data_port = remote.ports.data;
+        if both_hosts(cfg.role, &remote.role) {
+            let who = if remote.host_name.is_empty() {
+                admit.address.clone()
+            } else {
+                remote.host_name.clone()
+            };
+            note_role_conflict(app_status, &who).await;
+            return Ok(());
+        }
         let announced = remote.clone();
-        let mut decision = std::pin::pin!(allow_control(&admit, &remote, &peer_fp));
+        let name = if remote.host_name.is_empty() {
+            admit.address.clone()
+        } else {
+            remote.host_name.clone()
+        };
+        let trusted = {
+            let saved = admit.live.read().await;
+            saved.certificate_trusted(&name, &peer_fp)
+                || saved.certificate_trusted(&remote.host_name, &peer_fp)
+        };
+        let expect = if trusted {
+            None
+        } else if !pairing_window_open(app_status).await {
+            warn!("pairing window is closed on this computer");
+            return Ok(());
+        } else {
+            match client_sas(
+                &mut reader,
+                &writer,
+                &mut buf,
+                &remote.device_id,
+                &data_token,
+            )
+            .await
+            {
+                Ok(code) => Some(code),
+                Err(e) => {
+                    info!("pairing with {} failed: {e:#}", admit.address);
+                    return Ok(());
+                }
+            }
+        };
+        let mut decision = std::pin::pin!(allow_control(&admit, &remote, &peer_fp, expect.clone()));
         let mut discard = [0u8; 4096];
         let mut waiting = tokio::time::interval(HELLO_KEEPALIVE);
         loop {
             while try_decode_frame(&mut buf)?.is_some() {}
             tokio::select! {
                 allowed = &mut decision => {
-                    if !allowed {
-                        return Ok(());
+                    match allowed {
+                        Gate::Ok => {
+                            if expect.is_some() {
+                                let confirm = csc_proto::PairConfirmPayload { accepted: true };
+                                if let Ok(frame) = encode_json_frame(MsgType::PairConfirm, &confirm) {
+                                    let mut w = writer.lock().await;
+                                    w.write_all(&frame).await?;
+                                }
+                            }
+                            break;
+                        }
+                        Gate::Mismatch => {
+                            let result = csc_proto::PairResultPayload {
+                                status: "pair_code_mismatch".into(),
+                            };
+                            if let Ok(frame) = encode_json_frame(MsgType::PairResult, &result) {
+                                let mut w = writer.lock().await;
+                                let _ = w.write_all(&frame).await;
+                            }
+                            return Ok(());
+                        }
+                        Gate::Rejected => {
+                            let result = csc_proto::PairResultPayload {
+                                status: "rejected".into(),
+                            };
+                            if let Ok(frame) = encode_json_frame(MsgType::PairResult, &result) {
+                                let mut w = writer.lock().await;
+                                let _ = w.write_all(&frame).await;
+                            }
+                            return Ok(());
+                        }
                     }
-                    break;
                 }
                 _ = waiting.tick() => {
                     let mut w = writer.lock().await;
@@ -1344,13 +1544,27 @@ where
     } else {
         // The controlled computer sends heartbeats while its user decides, so
         // silence means the connection is dead, not that someone is thinking.
-        let (remote, early) = match read_until_hello_idle(&mut reader, &mut buf, HELLO_IDLE).await {
+        let (remote, early) = match host_wait_hello(
+            &mut reader,
+            &writer,
+            &mut buf,
+            app_status,
+            &cfg.device_id,
+            &data_token,
+        )
+        .await
+        {
             Ok(found) => found,
             Err(e) => {
                 info!("client {peer} did not accept control: {e:#}");
                 return Ok(());
             }
         };
+        peer_data_port = remote.ports.data;
+        if both_hosts(cfg.role, &remote.role) {
+            note_role_conflict(app_status, &remote.host_name).await;
+            return Ok(());
+        }
         remember(&remote);
         let name = if remote.host_name.is_empty() {
             peer.clone()
@@ -1368,9 +1582,21 @@ where
             }
         }
         for frame in early {
-            dispatch_frame(frame, &peer, status, &mut inbound).await?;
+            dispatch_frame(frame, &peer, status, &mut inbound, is_host).await?;
         }
         let _ = inbound.events.send(InboundEvent::Hello(remote)).await;
+    }
+
+    if is_host && peer_data_port != cfg.control_port {
+        let addr = SocketAddr::new(remote_ip, peer_data_port);
+        let identity = identity.clone();
+        let token = data_token;
+        let who = peer_fp.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dial_data(&identity, addr, &token, &who).await {
+                warn!("data connection to {addr}: {e:#}");
+            }
+        });
     }
 
     if let Some(link) = link {
@@ -1410,6 +1636,11 @@ where
     let idle_limit = Duration::from_millis(hb_ms * 4);
 
     let mut last_rx = tokio::time::Instant::now();
+    // One transfer stays on one connection: data port once it is up, otherwise control.
+    let mut held_bulk: Option<Vec<u8>> = None;
+    let mut bulk_on_control = false;
+    let mut bulk_on_data = false;
+    let bulk_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 
     let mut tmp = [0u8; 16 * 1024];
     loop {
@@ -1427,7 +1658,14 @@ where
                     match try_decode_frame(&mut buf)? {
                         None => break,
                         Some(frame) => {
-                            dispatch_frame(frame, &peer, status, &mut inbound).await?;
+                            if let Some(reply) = bench_answer(&frame) {
+                                let mut w = writer.lock().await;
+                                if w.write_all(&reply).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                dispatch_frame(frame, &peer, status, &mut inbound, is_host).await?;
+                            }
                         }
                     }
                 }
@@ -1446,10 +1684,35 @@ where
                     None => break,
                 }
             }
-            Some(frame) = outbound.bulk.recv() => {
-                let mut w = writer.lock().await;
-                if w.write_all(&frame).await.is_err() {
-                    break;
+            Some(frame) = outbound.bulk.recv(), if held_bulk.is_none() => {
+                if bulk_on_control {
+                    let mut w = writer.lock().await;
+                    if w.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                } else if bulk_on_data {
+                    if send_on_data(&peer_fp, frame).is_err() {
+                        break;
+                    }
+                } else {
+                    held_bulk = Some(frame);
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(40)), if held_bulk.is_some() => {
+                let frame = held_bulk.take().unwrap_or_default();
+                match send_on_data(&peer_fp, frame) {
+                    Ok(()) => bulk_on_data = true,
+                    Err(frame) => {
+                        if tokio::time::Instant::now() >= bulk_deadline {
+                            bulk_on_control = true;
+                            let mut w = writer.lock().await;
+                            if w.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            held_bulk = Some(frame);
+                        }
+                    }
                 }
             }
             _ = tokio::time::sleep_until(last_rx + idle_limit), if hb_enabled => {
@@ -1465,6 +1728,10 @@ fn local_capabilities() -> u32 {
     let mut caps = csc_proto::CAPABILITIES;
     if !csc_platform::vdrag::supported() {
         caps &= !csc_proto::CAP_VIRTUAL_DRAG;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        caps |= csc_proto::CAP_CLIP_PLACEHOLDER;
     }
     caps
 }
@@ -1526,7 +1793,216 @@ where
     }
 }
 
-async fn allow_control(admit: &Admit, hello: &HelloPayload, fingerprint: &str) -> bool {
+enum Gate {
+    Ok,
+    Rejected,
+    Mismatch,
+}
+
+fn udp_port(cfg: &Config) -> u16 {
+    if cfg.network.discovery_port == 0 {
+        cfg.control_port
+    } else {
+        cfg.network.discovery_port
+    }
+}
+
+async fn pairing_window_open(app_status: &Arc<RwLock<AppStatus>>) -> bool {
+    let until = app_status.read().await.pairing_open_until;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    until > now
+}
+
+fn random_nonce() -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    let _ = getrandom::getrandom(&mut buf);
+    buf
+}
+
+async fn write_locked<W>(writer: &Mutex<W>, frame: &[u8]) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut w = writer.lock().await;
+    w.write_all(frame).await?;
+    Ok(())
+}
+
+/// Read one frame, skipping heartbeats. `idle` with no bytes at all is a failure.
+async fn read_typed<R>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    idle: Duration,
+    want: MsgType,
+) -> anyhow::Result<csc_proto::Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tmp = [0u8; 4096];
+    let mut last = tokio::time::Instant::now();
+    loop {
+        if let Some(frame) = try_decode_frame(buf)? {
+            if frame.msg_type == MsgType::Heartbeat {
+                last = tokio::time::Instant::now();
+                continue;
+            }
+            if frame.msg_type == want {
+                return Ok(frame);
+            }
+            anyhow::bail!("expected {want:?}, got {:?}", frame.msg_type);
+        }
+        let left = idle.saturating_sub(last.elapsed());
+        if left.is_zero() {
+            anyhow::bail!("pairing timed out");
+        }
+        let n = tokio::time::timeout(left, reader.read(&mut tmp))
+            .await
+            .map_err(|_| anyhow::anyhow!("pairing timed out"))??;
+        if n == 0 {
+            anyhow::bail!("closed during pairing");
+        }
+        last = tokio::time::Instant::now();
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn client_sas<R, W>(
+    reader: &mut R,
+    writer: &Mutex<W>,
+    buf: &mut BytesMut,
+    host_device_id: &str,
+    exporter: &[u8; 32],
+) -> anyhow::Result<String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let req = csc_proto::PairRequestPayload {
+        device_id: String::new(),
+        name: String::new(),
+        role: "client".into(),
+        protocol_version: 2,
+    };
+    write_locked(writer, &encode_json_frame(MsgType::PairRequest, &req)?).await?;
+    let commit_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairCommit).await?;
+    let commit: csc_proto::PairCommitPayload = serde_json::from_slice(&commit_frame.payload)?;
+    let nb = random_nonce();
+    let nonce = csc_proto::PairNoncePayload {
+        nonce: hex_encode(&nb),
+    };
+    write_locked(
+        writer,
+        &encode_json_frame(MsgType::PairNonce, &nonce)?,
+    )
+    .await?;
+    let na_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairNonce).await?;
+    let na_msg: csc_proto::PairNoncePayload = serde_json::from_slice(&na_frame.payload)?;
+    let na = unhex(&na_msg.nonce).unwrap_or_default();
+    let got = unhex(&commit.commit).unwrap_or_default();
+    if !csc_proto::pair_commit_matches(&got, &na, host_device_id) {
+        anyhow::bail!("bad_commit");
+    }
+    let code = csc_proto::pair_code(exporter, &na, &nb);
+    Ok(format!("{code:06}"))
+}
+
+async fn host_wait_hello<R, W>(
+    reader: &mut R,
+    writer: &Mutex<W>,
+    buf: &mut BytesMut,
+    app_status: &Arc<RwLock<AppStatus>>,
+    device_id: &str,
+    exporter: &[u8; 32],
+) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut early = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut last = tokio::time::Instant::now();
+    let result = async {
+        loop {
+            if let Some(frame) = try_decode_frame(buf)? {
+                last = tokio::time::Instant::now();
+                if frame.msg_type == MsgType::Heartbeat {
+                    continue;
+                }
+                if frame.msg_type == MsgType::PairRequest {
+                    if !pairing_window_open(app_status).await {
+                        let result = csc_proto::PairResultPayload {
+                            status: "rejected".into(),
+                        };
+                        write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?).await?;
+                        anyhow::bail!("pairing window closed");
+                    }
+                    let na = random_nonce();
+                    let commit = csc_proto::PairCommitPayload {
+                        commit: hex_encode(&csc_proto::pair_commit(&na, device_id)),
+                    };
+                    write_locked(writer, &encode_json_frame(MsgType::PairCommit, &commit)?).await?;
+                    let nb_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairNonce).await?;
+                    let nb_msg: csc_proto::PairNoncePayload =
+                        serde_json::from_slice(&nb_frame.payload)?;
+                    let nb = unhex(&nb_msg.nonce).unwrap_or_default();
+                    let reveal = csc_proto::PairNoncePayload {
+                        nonce: hex_encode(&na),
+                    };
+                    write_locked(writer, &encode_json_frame(MsgType::PairNonce, &reveal)?).await?;
+                    let code = csc_proto::pair_code(exporter, &na, &nb);
+                    app_status.write().await.pairing_code = format!("{code:06}");
+                    info!("pairing code {code:06}");
+                    let confirm =
+                        read_typed(reader, buf, Duration::from_secs(120), MsgType::PairConfirm)
+                            .await?;
+                    let ok: csc_proto::PairConfirmPayload =
+                        serde_json::from_slice(&confirm.payload)?;
+                    app_status.write().await.pairing_code.clear();
+                    if !ok.accepted {
+                        anyhow::bail!("pair_code_mismatch");
+                    }
+                    last = tokio::time::Instant::now();
+                    continue;
+                }
+                if frame.msg_type == MsgType::PairResult {
+                    anyhow::bail!("pairing refused");
+                }
+                if frame.msg_type == MsgType::Hello {
+                    let hello = decode_hello_bin(&frame.payload)
+                        .ok_or_else(|| anyhow::anyhow!("bad hello"))?;
+                    return Ok((hello, early));
+                }
+                early.push(frame);
+                continue;
+            }
+            let left = HELLO_IDLE.saturating_sub(last.elapsed());
+            if left.is_zero() {
+                anyhow::bail!("no data for {}s", HELLO_IDLE.as_secs());
+            }
+            let n = tokio::time::timeout(left, reader.read(&mut tmp))
+                .await
+                .map_err(|_| anyhow::anyhow!("no data for {}s", HELLO_IDLE.as_secs()))??;
+            if n == 0 {
+                anyhow::bail!("closed before hello");
+            }
+            last = tokio::time::Instant::now();
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    .await;
+    app_status.write().await.pairing_code.clear();
+    result
+}
+
+async fn allow_control(
+    admit: &Admit,
+    hello: &HelloPayload,
+    fingerprint: &str,
+    expect_code: Option<String>,
+) -> Gate {
     let name = if hello.host_name.is_empty() {
         admit.address.clone()
     } else {
@@ -1537,7 +2013,7 @@ async fn allow_control(admit: &Admit, hello: &HelloPayload, fingerprint: &str) -
         if let Some(mark) = rejected.get_mut(&name) {
             if suppress_repeat(mark, Instant::now()) {
                 info!("ignoring {name} after cancel");
-                return false;
+                return Gate::Rejected;
             }
             rejected.remove(&name);
         }
@@ -1549,35 +2025,89 @@ async fn allow_control(admit: &Admit, hello: &HelloPayload, fingerprint: &str) -
     };
     if trusted {
         info!("trusted keyboard host {name}");
-        return true;
+        return Gate::Ok;
     }
     if admit.live.read().await.is_trusted_peer(&name) {
         info!("keyboard host {name} presented a new certificate; asking again");
     }
     info!("keyboard host {name} requested control");
-    let choice = admit
-        .prompt
-        .ask(&admit.app_status, &name, &name, &admit.address)
-        .await;
-    match choice {
-        Choice::Trust => {
-            let mut cfg = admit.live.write().await;
-            cfg.remember_peer(&name, fingerprint);
-            if let Err(e) = cfg.save(&admit.config_path) {
-                warn!("save trusted peer: {e:#}");
+    let mut misses = 0u8;
+    loop {
+        let choice = admit
+            .prompt
+            .ask(&admit.app_status, &name, &name, &admit.address)
+            .await;
+        match choice {
+            Choice::Trust { code } => {
+                if let Some(expect) = expect_code.as_deref() {
+                    if !code_matches(&code, expect) {
+                        misses += 1;
+                        info!("pairing code from {name} did not match ({misses}/3)");
+                        if misses >= 3 {
+                            return Gate::Mismatch;
+                        }
+                        continue;
+                    }
+                }
+                let mut cfg = admit.live.write().await;
+                cfg.remember_peer(&name, fingerprint);
+                if let Err(e) = cfg.save(&admit.config_path) {
+                    warn!("save trusted peer: {e:#}");
+                }
+                return Gate::Ok;
             }
-            true
-        }
-        Choice::Reject => {
-            info!("control from {name} cancelled");
-            admit
-                .rejected
-                .lock()
-                .await
-                .insert(name, reject_mark(Instant::now()));
-            false
+            Choice::Reject => {
+                info!("control from {name} cancelled");
+                admit
+                    .rejected
+                    .lock()
+                    .await
+                    .insert(name, reject_mark(Instant::now()));
+                return Gate::Rejected;
+            }
         }
     }
+}
+
+fn code_matches(typed: &str, expect: &str) -> bool {
+    let digits: String = typed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != expect.len() {
+        return false;
+    }
+    ct_eq(digits.as_bytes(), expect.as_bytes())
+}
+
+static BENCH_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_bench_enabled(on: bool) {
+    BENCH_ON.store(on, Ordering::Relaxed);
+}
+
+fn bench_answer(frame: &csc_proto::Frame) -> Option<Vec<u8>> {
+    if frame.msg_type != MsgType::BenchSync || !BENCH_ON.load(Ordering::Relaxed) {
+        return None;
+    }
+    let msg: csc_proto::BenchSyncPayload = serde_json::from_slice(&frame.payload).ok()?;
+    if msg.t2.is_some() {
+        return None;
+    }
+    let now = mono_ns();
+    let reply = csc_proto::BenchSyncPayload {
+        seq: msg.seq,
+        t1: msg.t1,
+        t2: Some(now),
+        t3: Some(now),
+    };
+    encode_json_frame(MsgType::BenchSync, &reply).ok()
+}
+
+fn mono_ns() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 async fn dispatch_frame(
@@ -1585,7 +2115,21 @@ async fn dispatch_frame(
     peer: &str,
     status: &Arc<RwLock<NetStatus>>,
     wires: &mut Wires,
+    is_host: bool,
 ) -> anyhow::Result<()> {
+    let role = if is_host {
+        csc_proto::SessionRole::Host
+    } else {
+        csc_proto::SessionRole::Controlled
+    };
+    if matches!(frame.msg_type, MsgType::BenchSync | MsgType::BenchEcho)
+        && !BENCH_ON.load(Ordering::Relaxed)
+    {
+        return Ok(());
+    }
+    if csc_proto::bad_direction(role, frame.msg_type) {
+        anyhow::bail!("bad_direction {:?}", frame.msg_type);
+    }
     let inbound = &wires.events;
     match frame.msg_type {
         // File frames go straight to the transfer engine, so a busy transfer
@@ -1594,6 +2138,7 @@ async fn dispatch_frame(
         | MsgType::FileRequest
         | MsgType::FileBegin
         | MsgType::FileData
+        | MsgType::FileBatch
         | MsgType::FileEnd
         | MsgType::FileDone
         | MsgType::FileError
@@ -1609,8 +2154,15 @@ async fn dispatch_frame(
         | MsgType::ClipData
         | MsgType::EdgeHit
         | MsgType::PasteRequest
+        | MsgType::PasteLocated
         | MsgType::DragBegin
-        | MsgType::LockScreen => {
+        | MsgType::DragRetarget
+        | MsgType::FocusInfo
+        | MsgType::PeerState
+        | MsgType::ControlPause
+        | MsgType::InputReset
+        | MsgType::LockScreen
+        | MsgType::Activity => {
             let _ = inbound
                 .send(InboundEvent::From {
                     peer: peer.to_string(),
@@ -1645,9 +2197,20 @@ async fn dispatch_frame(
                     _ => return Ok(()),
                 };
                 let pct = f32::from_le_bytes(frame.payload[1..5].try_into()?);
+                let locks = frame.payload.get(5).and_then(|flags| {
+                    if flags & 0x80 == 0 {
+                        return None;
+                    }
+                    Some(csc_proto::LockState {
+                        caps: flags & 1 != 0,
+                        num: flags & 2 != 0,
+                        scroll: flags & 4 != 0,
+                    })
+                });
                 let p = SwitchPayload {
                     edge,
                     position_pct: pct,
+                    locks,
                 };
                 if frame.msg_type == MsgType::SwitchEnter {
                     let _ = inbound.send(InboundEvent::SwitchEnter(p)).await;
@@ -1695,6 +2258,298 @@ async fn dispatch_frame(
         }
     }
     Ok(())
+}
+
+struct DataSlot {
+    fingerprint: String,
+    token: [u8; 32],
+    peer: String,
+    wires: Wires,
+    is_host: bool,
+    status: Arc<RwLock<NetStatus>>,
+    bulk: std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+}
+
+fn data_open() -> &'static std::sync::Mutex<HashMap<String, DataSlot>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<HashMap<String, DataSlot>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+struct DataReg(String);
+
+impl DataReg {
+    fn insert(slot: DataSlot) -> Self {
+        let fingerprint = slot.fingerprint.clone();
+        data_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fingerprint.clone(), slot);
+        DataReg(fingerprint)
+    }
+}
+
+/// Queue `frame` on the data connection. Gives it back when that connection is not up yet.
+fn send_on_data(fingerprint: &str, frame: Vec<u8>) -> Result<(), Vec<u8>> {
+    let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slot) = map.get(fingerprint) else {
+        return Err(frame);
+    };
+    let guard = slot.bulk.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(tx) => tx.send(frame).map_err(|e| e.0),
+        None => Err(frame),
+    }
+}
+
+fn attach_bulk(fingerprint: &str, tx: mpsc::UnboundedSender<Vec<u8>>) -> bool {
+    let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slot) = map.get(fingerprint) else {
+        return false;
+    };
+    *slot.bulk.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    true
+}
+
+fn detach_bulk(fingerprint: &str) {
+    let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = map.get(fingerprint) {
+        *slot.bulk.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl Drop for DataReg {
+    fn drop(&mut self) {
+        data_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+fn export_client(stream: &tokio_rustls::client::TlsStream<TcpStream>) -> [u8; 32] {
+    match stream
+        .get_ref()
+        .1
+        .export_keying_material([0u8; 32], b"EXPORTER-CSC-DATA-v1", None)
+    {
+        Ok(token) => token,
+        Err(e) => {
+            warn!("export data token: {e}");
+            [0u8; 32]
+        }
+    }
+}
+
+fn export_server(stream: &tokio_rustls::server::TlsStream<TcpStream>) -> [u8; 32] {
+    match stream
+        .get_ref()
+        .1
+        .export_keying_material([0u8; 32], b"EXPORTER-CSC-DATA-v1", None)
+    {
+        Ok(token) => token,
+        Err(e) => {
+            warn!("export data token: {e}");
+            [0u8; 32]
+        }
+    }
+}
+
+async fn spawn_data_listener(
+    identity: &Arc<crate::tls::Identity>,
+    addr: SocketAddr,
+    port: u16,
+) {
+    match TcpListener::bind(addr).await {
+        Ok(listener) => {
+            info!("data port {port} listening");
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, from)) = listener.accept().await else {
+                        break;
+                    };
+                    let identity = identity.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = take_data(&identity, tcp, port).await {
+                            debug!("data connection from {from}: {e:#}");
+                        }
+                    });
+                }
+            });
+        }
+        Err(e) => warn!("listen TCP data port {port} failed ({e:#})"),
+    }
+}
+
+async fn dial_data(
+    identity: &crate::tls::Identity,
+    addr: SocketAddr,
+    token: &[u8; 32],
+    fingerprint: &str,
+) -> anyhow::Result<()> {
+    let (mut stream, _) = connect_tls(identity, addr).await?;
+    let attach = csc_proto::DataAttachPayload {
+        device_id: fingerprint.to_string(),
+        session_token: hex_encode(token),
+        data_port: addr.port(),
+    };
+    let frame = encode_json_frame(MsgType::DataAttach, &attach)?;
+    stream.write_all(&frame).await?;
+    serve_data(stream, fingerprint, BytesMut::new()).await
+}
+
+/// File frames travel on this socket once DATA_ATTACH has succeeded.
+async fn serve_data<S>(mut stream: S, fingerprint: &str, mut buf: BytesMut) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    if !attach_bulk(fingerprint, tx) {
+        anyhow::bail!("no control session for data channel");
+    }
+    struct Detach<'a>(&'a str);
+    impl Drop for Detach<'_> {
+        fn drop(&mut self) {
+            detach_bulk(self.0);
+        }
+    }
+    let _detach = Detach(fingerprint);
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Some(frame) => stream.write_all(&frame).await?,
+                    None => break,
+                }
+            }
+            read = stream.read(&mut tmp) => {
+                let n = read?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                loop {
+                    match try_decode_frame(&mut buf)? {
+                        None => break,
+                        Some(frame) => {
+                            if let Some((peer, mut wires, is_host, status)) = data_target(fingerprint) {
+                                dispatch_frame(frame, &peer, &status, &mut wires, is_host).await?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn data_target(
+    fingerprint: &str,
+) -> Option<(String, Wires, bool, Arc<RwLock<NetStatus>>)> {
+    let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+    let slot = map.get(fingerprint)?;
+    Some((
+        slot.peer.clone(),
+        slot.wires.clone(),
+        slot.is_host,
+        slot.status.clone(),
+    ))
+}
+
+async fn take_data(
+    identity: &crate::tls::Identity,
+    tcp: TcpStream,
+    local_port: u16,
+) -> anyhow::Result<()> {
+    let (mut stream, der) = accept_tls(identity, tcp).await?;
+    let fp = crate::tls::fingerprint(&der);
+    let mut buf = BytesMut::new();
+    let mut tmp = [0u8; 2048];
+    let frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(frame) = try_decode_frame(&mut buf)? {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                anyhow::bail!("closed before DATA_ATTACH");
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake_timeout"))??;
+    if frame.msg_type != MsgType::DataAttach {
+        anyhow::bail!("expected DATA_ATTACH");
+    }
+    let attach: csc_proto::DataAttachPayload = serde_json::from_slice(&frame.payload)
+        .map_err(|_| anyhow::anyhow!("bad DATA_ATTACH"))?;
+    if attach.data_port != local_port {
+        anyhow::bail!("bad_data_port");
+    }
+    let expect = data_open()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&fp)
+        .map(|slot| slot.token);
+    let Some(expect) = expect else {
+        anyhow::bail!("fingerprint_mismatch");
+    };
+    let got = unhex(&attach.session_token).unwrap_or_default();
+    if !ct_eq(&got, &expect) {
+        anyhow::bail!("bad_session_token");
+    }
+    info!("data channel attached for {fp}");
+    serve_data(stream, &fp, buf).await
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_val(bytes[i])?;
+        let lo = hex_val(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[allow(dead_code)]
@@ -1769,11 +2624,12 @@ mod tests {
                     .unwrap();
             }
             let hello = HelloPayload {
-                protocol_version: 1,
+                protocol_version: 2,
                 host_name: "B".into(),
                 screen_width: 10,
                 screen_height: 10,
                 capabilities: csc_proto::CAPABILITIES,
+                ..HelloPayload::default()
             };
             a.write_all(&encode_hello_bin(&hello)).await.unwrap();
             a

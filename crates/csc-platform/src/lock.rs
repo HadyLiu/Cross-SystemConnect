@@ -6,6 +6,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static LOCK_KEY: AtomicU32 = AtomicU32::new(0);
 static LOCK_MODS: AtomicU32 = AtomicU32::new(0);
 static LOCK_HITS: AtomicU32 = AtomicU32::new(0);
+static STAY_KEY: AtomicU32 = AtomicU32::new(0);
+static STAY_MODS: AtomicU32 = AtomicU32::new(0);
+static STAY_HITS: AtomicU32 = AtomicU32::new(0);
+static PAUSE_KEY: AtomicU32 = AtomicU32::new(0);
+static PAUSE_MODS: AtomicU32 = AtomicU32::new(0);
+static PAUSE_HITS: AtomicU32 = AtomicU32::new(0);
+static HELD_MODS: AtomicU32 = AtomicU32::new(0);
 
 /// Count presses of `mods` + `key` (HID usages) while input belongs to this
 /// computer. The keys still reach the system. False when a part of `mods`
@@ -30,13 +37,62 @@ pub fn lock_hits() -> u32 {
     LOCK_HITS.swap(0, Ordering::AcqRel)
 }
 
+/// Watch the “stay on this screen” combination while input belongs here.
+pub fn stay_watch(mods: &[u32], key: u32) {
+    watch_into(mods, key, &STAY_MODS, &STAY_KEY);
+}
+
+pub fn stay_hits() -> u32 {
+    STAY_HITS.swap(0, Ordering::AcqRel)
+}
+
+/// Watch the local emergency-pause combination.
+pub fn pause_watch(mods: &[u32], key: u32) {
+    watch_into(mods, key, &PAUSE_MODS, &PAUSE_KEY);
+}
+
+pub fn pause_hits() -> u32 {
+    PAUSE_HITS.swap(0, Ordering::AcqRel)
+}
+
+/// Modifier bits currently held on this computer (`keymap::modifier_bit`).
+pub fn mods_held() -> u32 {
+    HELD_MODS.load(Ordering::Acquire)
+}
+
+fn watch_into(mods: &[u32], key: u32, mod_slot: &AtomicU32, key_slot: &AtomicU32) {
+    let mut bits = 0;
+    for m in mods {
+        let bit = modifier_bit(*m);
+        if bit == 0 {
+            key_slot.store(0, Ordering::Release);
+            return;
+        }
+        bits |= bit;
+    }
+    mod_slot.store(bits, Ordering::Release);
+    key_slot.store(fold_modifier(key), Ordering::Release);
+}
+
+fn count_hit(hid: u32, held: u32, key_slot: &AtomicU32, mod_slot: &AtomicU32, hits: &AtomicU32) {
+    let key = key_slot.load(Ordering::Acquire);
+    let mods = mod_slot.load(Ordering::Acquire);
+    if key != 0 && fold_modifier(hid) == key && held & mods == mods {
+        hits.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// A key went down on this computer; `held` is the `modifier_bit` set held with it.
 pub(crate) fn lock_key_down(hid: u32, held: u32) {
-    let key = LOCK_KEY.load(Ordering::Acquire);
-    let mods = LOCK_MODS.load(Ordering::Acquire);
-    if key != 0 && fold_modifier(hid) == key && held & mods == mods {
-        LOCK_HITS.fetch_add(1, Ordering::AcqRel);
-    }
+    HELD_MODS.store(held, Ordering::Release);
+    count_hit(hid, held, &LOCK_KEY, &LOCK_MODS, &LOCK_HITS);
+    count_hit(hid, held, &STAY_KEY, &STAY_MODS, &STAY_HITS);
+    count_hit(hid, held, &PAUSE_KEY, &PAUSE_MODS, &PAUSE_HITS);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn note_mods(held: u32) {
+    HELD_MODS.store(held, Ordering::Release);
 }
 
 /// Show the lock screen without blocking the caller.

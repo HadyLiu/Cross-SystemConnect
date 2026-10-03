@@ -7,9 +7,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    Trust,
+    /// `code` is what the user typed. Empty when this computer is not asking for one.
+    Trust { code: String },
     Reject,
 }
 

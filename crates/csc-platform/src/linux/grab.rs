@@ -544,6 +544,7 @@ fn run(mut api: Api) {
                                 if let Some(hid) = crate::keymap::hid_from_evdev(evdev) {
                                     let down = evtype == XI_RAW_KEY_PRESS;
                                     held_mods.set(hid, down);
+                                    crate::lock::note_mods(held_mods.bits());
                                     // While grabbed the core sees the keys itself.
                                     if down && grabbed.is_none() {
                                         lock_key_down(hid, held_mods.bits());

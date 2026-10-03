@@ -43,10 +43,19 @@ pub struct SwitchConfig {
     /// before it switches. 0 switches on contact.
     #[serde(default = "default_edge_push")]
     pub edge_push_px: i32,
+    /// `none`, `ctrl`, `shift`, or `alt`. Holding it stops edge switching.
+    #[serde(default = "default_block_modifier")]
+    pub block_modifier: String,
+    /// Do not switch while the foreground window is fullscreen.
+    #[serde(default = "default_true")]
+    pub block_when_fullscreen: bool,
 }
 
 fn default_edge_push() -> i32 {
     8
+}
+fn default_block_modifier() -> String {
+    "none".into()
 }
 fn default_double_tap_window() -> i32 {
     250
@@ -68,6 +77,8 @@ impl Default for SwitchConfig {
             relative_mouse_moves: false,
             diagonal_zone_px: default_diagonal_zone(),
             edge_push_px: default_edge_push(),
+            block_modifier: default_block_modifier(),
+            block_when_fullscreen: true,
         }
     }
 }
@@ -90,6 +101,9 @@ pub struct ClipboardConfig {
     pub files: bool,
     #[serde(default = "default_inline")]
     pub max_inline_mb: i32,
+    /// `immediate` = offer on every change; `on_switch` = only when entering/leaving a peer.
+    #[serde(default = "default_push_mode")]
+    pub push_mode: String,
 }
 
 fn default_true() -> bool {
@@ -97,6 +111,9 @@ fn default_true() -> bool {
 }
 fn default_inline() -> i32 {
     MAX_INLINE_MB
+}
+fn default_push_mode() -> String {
+    "immediate".into()
 }
 
 impl Default for ClipboardConfig {
@@ -107,6 +124,7 @@ impl Default for ClipboardConfig {
             image: true,
             files: true,
             max_inline_mb: MAX_INLINE_MB,
+            push_mode: default_push_mode(),
         }
     }
 }
@@ -130,6 +148,25 @@ pub struct FileTransferConfig {
     pub limit_speed: bool,
     #[serde(default = "default_speed")]
     pub max_speed_mibs: i32,
+    /// Minutes to keep a partial file after the link drops. 0 disables resume.
+    #[serde(default = "default_resume_min")]
+    pub resume_window_min: u32,
+    /// Linux to Linux: keep permission bits in 0o777.
+    #[serde(default = "default_true")]
+    pub preserve_mode: bool,
+    /// Keep the source modification time when receiving.
+    #[serde(default = "default_true")]
+    pub preserve_mtime: bool,
+    /// Drop executable bits when the file lands on the desktop.
+    #[serde(default = "default_true")]
+    pub strip_exec_on_desktop: bool,
+    /// Windows: write a Zone.Identifier stream so the file is “from another computer”.
+    #[serde(default = "default_true")]
+    pub mark_of_web: bool,
+}
+
+fn default_resume_min() -> u32 {
+    30
 }
 
 fn default_ft_max() -> i32 {
@@ -147,6 +184,66 @@ impl Default for FileTransferConfig {
             max_size_mb: 10240,
             limit_speed: false,
             max_speed_mibs: 4,
+            resume_window_min: default_resume_min(),
+            preserve_mode: true,
+            preserve_mtime: true,
+            strip_exec_on_desktop: true,
+            mark_of_web: true,
+        }
+    }
+}
+
+/// One physical key forwarded as another. Usages are HID keyboard usages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRemap {
+    pub from: u32,
+    pub to: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyboardConfig {
+    #[serde(default = "default_true")]
+    pub sync_locks: bool,
+    #[serde(default)]
+    pub remap: Vec<KeyRemap>,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            sync_locks: true,
+            remap: Vec::new(),
+        }
+    }
+}
+
+fn default_pointer_speed() -> f32 {
+    1.0
+}
+
+/// How fast the pointer moves on another computer. 1.0 matches this computer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerConfig {
+    #[serde(default = "default_pointer_speed")]
+    pub speed: f32,
+    /// Per-computer override, keyed by the other computer's name.
+    #[serde(default)]
+    pub peers: BTreeMap<String, f32>,
+    /// Scale moves by the ratio of display scales so physical speed matches.
+    #[serde(default = "default_true")]
+    pub match_physical_speed: bool,
+    /// Hide this computer's cursor while controlling another one.
+    #[serde(default = "default_true")]
+    pub hide_host_cursor: bool,
+}
+
+impl Default for PointerConfig {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            peers: BTreeMap::new(),
+            match_physical_speed: true,
+            hide_host_cursor: true,
         }
     }
 }
@@ -158,23 +255,57 @@ pub struct HotkeyConfig {
     pub lock_screen: String,
     #[serde(default = "default_return")]
     pub return_to_server: String,
+    /// Hold the pointer on the screen it is already on.
+    #[serde(default = "default_lock_to_screen")]
+    pub lock_to_screen: String,
+    /// Local keyboard on a controlled computer pauses sharing.
+    #[serde(default = "default_emergency_pause")]
+    pub emergency_pause: String,
 }
 
 fn default_lock() -> String {
-    "Win+L".into()
+    "Ctrl+Alt+Shift+L".into()
+}
+fn default_lock_to_screen() -> String {
+    "Ctrl+Alt+Shift+K".into()
 }
 fn default_return() -> String {
     "Ctrl+Alt+/".into()
 }
+fn default_emergency_pause() -> String {
+    "Ctrl+Alt+Shift+P".into()
+}
 /// Keys of earlier versions, replaced wherever they are still found.
 const RETIRED_RETURN_KEY: &str = "Ctrl+Alt+Home";
-const RETIRED_LOCK_KEY: &str = "ScrollLock";
+
+/// `Win+L`, `Ctrl+Alt+L`, `ScrollLock`, or empty — replaced once when moving to v5.
+fn retired_lock_key(key: &str) -> bool {
+    let k = key.replace(' ', "");
+    k.is_empty()
+        || k.eq_ignore_ascii_case("Win+L")
+        || k.eq_ignore_ascii_case("Ctrl+Alt+L")
+        || k.eq_ignore_ascii_case("ScrollLock")
+}
+
+fn new_device_id() -> String {
+    let mut b = [0u8; 16];
+    let _ = getrandom::getrandom(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+        b[14], b[15]
+    )
+}
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             lock_screen: default_lock(),
             return_to_server: default_return(),
+            lock_to_screen: default_lock_to_screen(),
+            emergency_pause: default_emergency_pause(),
         }
     }
 }
@@ -191,10 +322,63 @@ pub struct GuiConfig {
     pub auto_hide: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// `auto`, `zh-CN`, or `en-US`.
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// False only on a config this program just created.
+    #[serde(default = "default_true")]
+    pub wizard_done: bool,
+}
+
+fn default_language() -> String {
+    "auto".into()
 }
 
 fn default_theme() -> String {
     "dark".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsConfig {
+    /// Accept BENCH_SYNC / BENCH_ECHO only when this is on.
+    #[serde(default)]
+    pub bench_enabled: bool,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            bench_enabled: false,
+        }
+    }
+}
+
+/// Which desktop notices the core may show. Pairing always opens its own window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// A computer connected. Off unless the user asks.
+    #[serde(default)]
+    pub connect: bool,
+    /// A computer disconnected, or the keyboard host is about to sleep.
+    #[serde(default = "default_true")]
+    pub disconnect: bool,
+    /// A transfer finished, failed, or had nowhere to land.
+    #[serde(default = "default_true")]
+    pub transfer: bool,
+    /// Clipboard and file errors.
+    #[serde(default = "default_true")]
+    pub errors: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            connect: false,
+            disconnect: true,
+            transfer: true,
+            errors: true,
+        }
+    }
 }
 
 impl Default for GuiConfig {
@@ -205,6 +389,8 @@ impl Default for GuiConfig {
             prevent_sleep: false,
             auto_hide: true,
             close_to_tray: true,
+            language: default_language(),
+            wizard_done: false,
         }
     }
 }
@@ -218,6 +404,13 @@ pub struct LogConfig {
     /// Empty: `log.txt` in the program folder (see `default_log_path`).
     #[serde(default)]
     pub file: String,
+    /// Rotate by rewriting the file after this many kilobytes. 0 means the default.
+    #[serde(default = "default_max_kb")]
+    pub max_kb: u32,
+}
+
+fn default_max_kb() -> u32 {
+    1024
 }
 
 fn default_log_level() -> String {
@@ -230,6 +423,7 @@ impl Default for LogConfig {
             level: default_log_level(),
             to_file: true,
             file: String::new(),
+            max_kb: default_max_kb(),
         }
     }
 }
@@ -252,6 +446,20 @@ pub struct NetworkExtras {
     pub heartbeat_enabled: bool,
     #[serde(default = "default_hb")]
     pub heartbeat_ms: i32,
+    /// UDP discovery port. 0 means “not in the file yet”; migration copies `control_port`.
+    #[serde(default)]
+    pub discovery_port: u16,
+    /// Addresses dialed in addition to discovery. Empty port uses the control port.
+    #[serde(default)]
+    pub manual_peers: Vec<ManualPeer>,
+}
+
+/// A computer to dial even when it is outside the discovery subnet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualPeer {
+    pub address: String,
+    #[serde(default)]
+    pub control_port: u16,
 }
 
 fn default_hb() -> i32 {
@@ -263,6 +471,24 @@ impl Default for NetworkExtras {
         Self {
             heartbeat_enabled: true,
             heartbeat_ms: 5000,
+            // 0 means the file never had this field. Migration copies control_port.
+            discovery_port: 0,
+            manual_peers: Vec::new(),
+        }
+    }
+}
+
+/// Keep other computers awake while someone is using this set of machines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerConfig {
+    #[serde(default = "default_true")]
+    pub keep_peers_awake: bool,
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            keep_peers_awake: true,
         }
     }
 }
@@ -281,7 +507,7 @@ pub struct ScreenPlace {
 }
 
 /// Version written by this build. Files without the field are version 1.
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 
 fn default_config_version() -> u32 {
     1
@@ -295,6 +521,9 @@ pub struct Config {
     pub role: Role,
     #[serde(default)]
     pub name: String,
+    /// Stable identity. Generated once; not edited from the settings page.
+    #[serde(default)]
+    pub device_id: String,
     #[serde(default = "default_bind")]
     pub bind_address: String,
     /// Local IPv4 chosen for discovery. Search stays on that /24 (for example 10.10.10.10 → 10.10.10.0/24).
@@ -324,6 +553,16 @@ pub struct Config {
     pub hotkeys: HotkeyConfig,
     #[serde(default)]
     pub gui: GuiConfig,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
+    #[serde(default)]
+    pub power: PowerConfig,
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
+    #[serde(default)]
+    pub pointer: PointerConfig,
     #[serde(default)]
     pub log: LogConfig,
     #[serde(default)]
@@ -362,6 +601,7 @@ impl Default for Config {
             config_version: CONFIG_VERSION,
             role: Role::Client,
             name: local_computer_name(),
+            device_id: new_device_id(),
             bind_address: default_bind(),
             search_address: String::new(),
             server_address: String::new(),
@@ -375,8 +615,16 @@ impl Default for Config {
             file_transfer: FileTransferConfig::default(),
             hotkeys: HotkeyConfig::default(),
             gui: GuiConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
+            notify: NotifyConfig::default(),
+            power: PowerConfig::default(),
+            keyboard: KeyboardConfig::default(),
+            pointer: PointerConfig::default(),
             log: LogConfig::default(),
-            network: NetworkExtras::default(),
+            network: NetworkExtras {
+                discovery_port: default_control_port(),
+                ..NetworkExtras::default()
+            },
             enable_enter_command: false,
             enable_exit_command: false,
             enter_command: String::new(),
@@ -619,6 +867,30 @@ impl Config {
             self.log.level = default_log_level();
             self.log_level = default_log_level();
         }
+        if self.config_version < 5 {
+            // Version 5: name-keyed fingerprints are not trusted. Pair again.
+            self.peer_fingerprints.clear();
+            if self.device_id.is_empty() {
+                self.device_id = new_device_id();
+            }
+            if self.log.max_kb == 0 {
+                self.log.max_kb = default_max_kb();
+            }
+            if self.network.discovery_port == 0 {
+                self.network.discovery_port = self.control_port;
+            }
+            if retired_lock_key(&self.hotkeys.lock_screen) {
+                self.hotkeys.lock_screen = default_lock();
+            }
+            if self
+                .hotkeys
+                .lock_to_screen
+                .replace(' ', "")
+                .eq_ignore_ascii_case("Ctrl+Alt+K")
+            {
+                self.hotkeys.lock_to_screen = default_lock_to_screen();
+            }
+        }
         self.config_version = CONFIG_VERSION;
         true
     }
@@ -639,16 +911,30 @@ impl Config {
             RETIRED_RETURN_KEY,
             default_return,
         );
-        let lock = retire(
-            &mut self.hotkeys.lock_screen,
-            RETIRED_LOCK_KEY,
-            default_lock,
-        );
-        back || lock
+        let lock_empty = self.hotkeys.lock_screen.trim().is_empty();
+        if lock_empty {
+            self.hotkeys.lock_screen = default_lock();
+        }
+        let hold_empty = self.hotkeys.lock_to_screen.trim().is_empty();
+        if hold_empty {
+            self.hotkeys.lock_to_screen = default_lock_to_screen();
+        }
+        if self.hotkeys.emergency_pause.trim().is_empty() {
+            self.hotkeys.emergency_pause = default_emergency_pause();
+        }
+        let block = self.switch_cfg.block_modifier.trim().to_ascii_lowercase();
+        self.switch_cfg.block_modifier = match block.as_str() {
+            "ctrl" | "shift" | "alt" => block,
+            _ => "none".into(),
+        };
+        back || lock_empty || hold_empty
     }
 
     fn clamp_limits(&mut self) {
         self.clipboard.max_inline_mb = self.clipboard.max_inline_mb.clamp(1, MAX_INLINE_MB);
+        if self.clipboard.push_mode != "on_switch" {
+            self.clipboard.push_mode = "immediate".into();
+        }
         self.switch_cfg.edge_push_px = self.switch_cfg.edge_push_px.clamp(0, 200);
         self.retire_old_hotkeys();
     }
@@ -668,7 +954,11 @@ impl Config {
         let mut current = serde_json::to_value(&*self)?;
         if let (Some(base), Some(patch)) = (current.as_object_mut(), v.as_object()) {
             for (k, val) in patch {
-                if k == "trusted_peers" || k == "peer_fingerprints" || k == "config_version" {
+                if k == "trusted_peers"
+                    || k == "peer_fingerprints"
+                    || k == "config_version"
+                    || k == "device_id"
+                {
                     continue;
                 }
                 base.insert(k.clone(), val.clone());
@@ -759,6 +1049,21 @@ impl Config {
         self.peer_fingerprints.insert(host.to_string(), fp);
         Ok(())
     }
+
+    /// Drop a remembered computer. The next connection has to pair again.
+    pub fn forget_peer(&mut self, host_name: &str) -> bool {
+        let host = host_name.trim();
+        if host.is_empty() {
+            return false;
+        }
+        let peers = self.trusted_peers.len();
+        let prints = self.peer_fingerprints.len();
+        self.trusted_peers
+            .retain(|h| !h.eq_ignore_ascii_case(host));
+        self.peer_fingerprints
+            .retain(|name, _| !name.eq_ignore_ascii_case(host));
+        peers != self.trusted_peers.len() || prints != self.peer_fingerprints.len()
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +1110,28 @@ mod tests {
         assert!(cfg.pin_peer("Other", "cc").is_ok());
         assert!(cfg.pin_peer("other", "cc").is_ok());
         assert!(cfg.pin_peer("Other", "dd").is_err());
+    }
+
+    #[test]
+    fn missing_notify_block_uses_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"name":"Desk"}"#).unwrap();
+        assert!(!cfg.notify.connect);
+        assert!(cfg.notify.disconnect);
+        assert!(cfg.notify.transfer);
+        assert!(cfg.notify.errors);
+    }
+
+    #[test]
+    fn forget_peer_drops_name_and_fingerprint() {
+        let mut cfg = Config::default();
+        cfg.remember_peer("Desk", "aa");
+        cfg.pin_peer("Other", "bb").unwrap();
+        assert!(!cfg.forget_peer("  "));
+        assert!(cfg.forget_peer("desk"));
+        assert!(!cfg.is_trusted_peer("Desk"));
+        assert!(cfg.peer_fingerprint("Desk").is_none());
+        assert!(cfg.peer_fingerprint("Other").is_some());
+        assert!(!cfg.forget_peer("desk"));
     }
 
     #[test]
@@ -865,20 +1192,25 @@ mod tests {
         .unwrap();
         let cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
             .contains("toggle_enable"));
 
-        // A user's own lock key stays; the old return key never survives, even in a current file.
+        // v5 replaces the old lock keys once. After that the user can set one back.
         std::fs::write(
             &path,
-            r#"{"config_version":3,"name":"Desk","hotkeys":{"lock_screen":"Ctrl+Alt+L","return_to_server":"ctrl+alt+home"}}"#,
+            r#"{"config_version":3,"name":"Desk","control_port":25000,"peer_fingerprints":{"Desk":"ab"},"hotkeys":{"lock_screen":"Ctrl+Alt+L","return_to_server":"ctrl+alt+home"}}"#,
         )
         .unwrap();
         let mut cfg = Config::load_or_create(&path).unwrap();
+        assert_eq!(cfg.config_version, 5);
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
+        assert!(cfg.peer_fingerprints.is_empty());
+        assert!(!cfg.device_id.is_empty());
+        assert_eq!(cfg.network.discovery_port, 25000);
+        assert_eq!(cfg.log.max_kb, 1024);
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("Ctrl+Alt+/"));
@@ -888,13 +1220,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "scroll lock");
         cfg.merge_from_value(serde_json::json!({
             "hotkeys": {"lock_screen": "", "return_to_server": ""}
         }))
         .unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Win+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

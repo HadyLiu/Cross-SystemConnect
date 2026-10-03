@@ -23,6 +23,7 @@ pub enum ClipEvent {
 enum ClipCmd {
     SetText(String),
     SetImage(Vec<u8>),
+    SetFiles(Vec<PathBuf>),
 }
 
 /// Sets the local clipboard from remote content. Setting does not echo back as an event.
@@ -38,6 +39,11 @@ impl ClipHandle {
 
     pub fn set_image(&self, png: Vec<u8>) {
         let _ = self.tx.send(ClipCmd::SetImage(png));
+    }
+
+    /// Offer these paths as the clipboard files without reporting a new copy.
+    pub fn set_files(&self, paths: Vec<PathBuf>) {
+        let _ = self.tx.send(ClipCmd::SetFiles(paths));
     }
 }
 
@@ -94,6 +100,14 @@ fn run(rx: std_mpsc::Receiver<ClipCmd>, events: mpsc::Sender<ClipEvent>) {
                         }
                     }
                     Err(e) => warn!("received clipboard image is not a PNG: {e:#}"),
+                }
+                token = watch.token();
+                continue;
+            }
+            Ok(ClipCmd::SetFiles(paths)) => {
+                match clip.set_files(&paths) {
+                    Ok(()) => last = ClipContent::Files(paths),
+                    Err(e) => warn!("set clipboard files: {e:#}"),
                 }
                 token = watch.token();
                 continue;

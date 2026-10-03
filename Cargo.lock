@@ -401,6 +401,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "getrandom 0.2.17",
  "hostname",
  "serde",
  "serde_json",
@@ -417,6 +418,7 @@ dependencies = [
  "csc-platform",
  "csc-proto",
  "dirs",
+ "getrandom 0.2.17",
  "rcgen",
  "rustls",
  "serde",
@@ -437,6 +439,7 @@ dependencies = [
  "arboard",
  "csc-config",
  "dbus",
+ "gtk",
  "image",
  "libc",
  "tracing",
@@ -452,6 +455,7 @@ dependencies = [
  "bytes",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 

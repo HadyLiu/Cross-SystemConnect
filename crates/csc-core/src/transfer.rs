@@ -10,21 +10,21 @@
 //! controlled computers (see `relay`).
 
 use crate::net::NetHub;
-use crate::path_safe::{check_relative_path, name_problem};
+use crate::path_safe::{adapt_relative_path, check_relative_path, name_problem};
 use crate::progress::TransferBoard;
 use crate::relay::{self, Hop, Relay};
 use csc_config::{default_config_path, Config};
 use csc_platform::vdrag::StagedFeed;
 use csc_proto::{
-    decode_file_data, encode_file_data, encode_json_frame, DragBeginPayload, DragCancelPayload,
-    FileAckPayload, FileBeginPayload, FileDonePayload, FileEndPayload, FileEntry, FileErrorPayload,
-    FileOfferPayload, FileRequestPayload, MsgType, TransferConflict, TransferProgress,
-    TransferPurpose, TransferState, CAP_FILE_ACK,
+    decode_file_batch, decode_file_data, encode_file_batch, encode_file_data, encode_json_frame,
+    DragBeginPayload, DragCancelPayload, FileAckPayload, FileBeginPayload, FileDonePayload,
+    FileEndPayload, FileEntry, FileErrorPayload, FileOfferPayload, FileRequestPayload, FileResume,
+    MsgType, TransferConflict, TransferProgress, TransferPurpose, TransferState, CAP_FILE_ACK,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,8 +44,23 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const TITLE: &str = "Cross-SystemConnect 文件传输";
 /// Hidden temporary name used while replacing an existing file.
 const PART_SUFFIX: &str = ".csc-part";
-/// Placeholder marker inside a dragged folder copied by a file manager.
-pub const FOLDER_MARKER: &str = ".csc-drag";
+/// Placeholder marker prefix inside a dragged folder (Doc §14.6).
+pub const FOLDER_MARKER_PREFIX: &str = ".csc-drag-";
+
+fn clear_folder_markers(dir: &Path) {
+    let Ok(list) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in list.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else {
+            continue;
+        };
+        if s.starts_with(FOLDER_MARKER_PREFIX) || s.starts_with(".csc-paste-") || s == ".csc-drag" {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// What to do with a top-level name that already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -105,6 +120,15 @@ pub enum TransferCmd {
     AllowRelay {
         from: String,
         to: String,
+    },
+    /// Next paste offer overwrites these placeholder copies.
+    ExpectPaste {
+        paths: Vec<PathBuf>,
+    },
+    /// The drag's files stay offered, but the receiver is now `peer`.
+    RetargetSend {
+        id: u64,
+        peer: String,
     },
     Cancel {
         id: u64,
@@ -176,6 +200,15 @@ impl TransferHandle {
         self.cmd(TransferCmd::BindDrop { id, sink }).await;
     }
 
+    pub async fn expect_paste(&self, paths: Vec<PathBuf>) {
+        self.cmd(TransferCmd::ExpectPaste { paths }).await;
+    }
+
+    /// Keep offering drag `id`, to `peer` instead of the computer it left.
+    pub async fn retarget_send(&self, id: u64, peer: String) {
+        self.cmd(TransferCmd::RetargetSend { id, peer }).await;
+    }
+
     pub async fn cancel_drag(&self, id: u64, reason: &str) {
         self.cmd(TransferCmd::CancelDrag {
             id,
@@ -217,12 +250,12 @@ pub fn channel() -> (TransferHandle, mpsc::Receiver<TransferCmd>) {
 
 fn popup(body: impl Into<String>, error: bool) {
     let body = body.into();
-    if error {
-        warn!("{body}");
+    let kind = if error {
+        crate::notice::Kind::Error
     } else {
-        info!("{body}");
-    }
-    csc_platform::notify(TITLE, &body, error);
+        crate::notice::Kind::Transfer
+    };
+    crate::notice::tell(kind, TITLE, &body, error);
 }
 
 fn mib(bytes: u64) -> String {
@@ -239,6 +272,58 @@ pub fn receive_root(cfg: &Config) -> PathBuf {
         .or_else(dirs::download_dir)
         .or_else(|| default_config_path().parent().map(|p| p.join("received")))
         .unwrap_or_else(|| PathBuf::from("received"))
+}
+
+fn unix_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return meta.permissions().mode() & 0o777;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+fn apply_mode(preserve: bool, strip: bool, path: &Path, mode: u32) {
+    if mode == 0 || !preserve {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut bits = mode & 0o777;
+        if strip {
+            if let Some(desk) = dirs::desktop_dir() {
+                if path.starts_with(&desk) {
+                    bits &= !0o111;
+                }
+            }
+        }
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, strip);
+    }
+}
+
+fn mark_of_web(enabled: bool, path: &Path, peer: &str) {
+    if !enabled {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let zone = format!("{}:Zone.Identifier", path.display());
+        let body = format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=csc://{peer}\r\n");
+        let _ = std::fs::write(zone, body);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, peer);
+    }
 }
 
 // ---------------------------------------------------------------- planning
@@ -325,6 +410,7 @@ fn walk(
             size: 0,
             mtime_unix: mtime_of(&meta),
             is_directory: true,
+            mode: unix_mode(&meta),
         });
         plan.sources.push(None);
         let mut children: Vec<_> = std::fs::read_dir(path)
@@ -350,6 +436,7 @@ fn walk(
             size: meta.len(),
             mtime_unix: mtime_of(&meta),
             is_directory: false,
+            mode: unix_mode(&meta),
         });
         plan.sources.push(Some(path.to_path_buf()));
     }
@@ -489,6 +576,7 @@ enum Target {
 
 struct Incoming {
     peer: String,
+    origin_device_id: String,
     purpose: TransferPurpose,
     entries: Vec<FileEntry>,
     shape: Shape,
@@ -506,6 +594,8 @@ struct Incoming {
     requested: bool,
     received: u64,
     acked: u64,
+    /// Bytes already on disk for an entry, filled when a partial file matches.
+    resume: HashMap<u32, u64>,
     /// Waiting for the user to choose, by top-level entry index.
     conflicts: Vec<TransferConflict>,
 }
@@ -540,6 +630,10 @@ struct Engine {
     sending: HashMap<u64, Sending>,
     incoming: HashMap<u64, Incoming>,
     parked: HashMap<u64, Parked>,
+    /// Outgoing drags that must survive the computer they just left.
+    retain_send: HashSet<u64>,
+    /// Placeholder copies a file-manager paste already created.
+    expect_paste: Option<Vec<PathBuf>>,
     relay: Relay,
     next_id: u64,
 }
@@ -562,6 +656,8 @@ pub fn spawn(
         sending: HashMap::new(),
         incoming: HashMap::new(),
         parked: HashMap::new(),
+        retain_send: HashSet::new(),
+        expect_paste: None,
         relay: Relay::default(),
         next_id: seed << 12,
     };
@@ -584,6 +680,9 @@ fn id_of(payload: &[u8]) -> Option<u64> {
 impl Engine {
     async fn run(mut self, mut rx: mpsc::Receiver<TransferCmd>) {
         tokio::task::spawn_blocking(csc_platform::vdrag::cleanup_stale);
+        let window = self.config.read().await.file_transfer.resume_window_min;
+        let receive = self.config.read().await.file_transfer.receive_dir.clone();
+        tokio::task::spawn_blocking(move || cleanup_expired_parts(&receive, window));
         while let Some(cmd) = rx.recv().await {
             self.outgoing.retain(|_, o| o.created.elapsed() < OFFER_TTL);
             self.parked.retain(|_, p| p.at.elapsed() < OFFER_TTL);
@@ -628,6 +727,13 @@ impl Engine {
                     self.relay_drag(from, begin, to).await
                 }
                 TransferCmd::AllowRelay { from, to } => self.relay.allow(&from, &to),
+                TransferCmd::ExpectPaste { paths } => self.expect_paste = Some(paths),
+                TransferCmd::RetargetSend { id, peer } => {
+                    if let Some(out) = self.outgoing.get_mut(&id) {
+                        out.peer = peer;
+                        self.retain_send.insert(id);
+                    }
+                }
                 TransferCmd::Cancel { id } => self.cancel_incoming(id).await,
                 TransferCmd::Resolve { id, decisions } => self.resolve(id, decisions).await,
                 TransferCmd::Frame { peer, msg, payload } => {
@@ -725,6 +831,7 @@ impl Engine {
             total_bytes: total,
             origin: String::new(),
             relay_to,
+            origin_device_id: self.config.read().await.device_id.clone(),
         };
         self.send_json(&peer, MsgType::FileOffer, &offer).await;
     }
@@ -749,6 +856,8 @@ impl Engine {
     async fn on_frame(&mut self, peer: &str, msg: MsgType, payload: Vec<u8>) -> anyhow::Result<()> {
         let id = if msg == MsgType::FileData {
             decode_file_data(&payload).map(|(id, _, _)| id)
+        } else if msg == MsgType::FileBatch {
+            decode_file_batch(&payload).map(|(id, _)| id)
         } else {
             id_of(&payload)
         }
@@ -782,6 +891,16 @@ impl Engine {
                 }
             }
             MsgType::FileCancel | MsgType::DragCancel => {
+                let reason = parse::<DragCancelPayload>(&payload)
+                    .map(|c| c.reason)
+                    .unwrap_or_default();
+                if msg == MsgType::DragCancel && self.retain_send.contains(&id) {
+                    self.parked.remove(&id);
+                    if !matches!(reason.as_str(), "user" | "no target" | "error") {
+                        return Ok(());
+                    }
+                    self.retain_send.remove(&id);
+                }
                 if self.cancel_send(id) {
                     info!("{peer} cancelled transfer {id}");
                 } else if self.parked.remove(&id).is_some() {
@@ -820,6 +939,20 @@ impl Engine {
                     Ok(Some(ack)) => self.send_json(peer, MsgType::FileAck, &ack).await,
                     Ok(None) => {}
                     Err(msg) => self.fail_incoming(id, &msg).await,
+                }
+            }
+            MsgType::FileBatch => {
+                let (id, items) =
+                    decode_file_batch(&payload).ok_or_else(|| anyhow::anyhow!("bad batch"))?;
+                for item in items {
+                    match self.write_data(peer, id, item.index, item.data) {
+                        Ok(Some(ack)) => self.send_json(peer, MsgType::FileAck, &ack).await,
+                        Ok(None) => {}
+                        Err(msg) => {
+                            self.fail_incoming(id, &msg).await;
+                            break;
+                        }
+                    }
                 }
             }
             MsgType::FileEnd => {
@@ -948,15 +1081,48 @@ impl Engine {
         } else {
             self.label(peer).await
         };
+        let sink = if matches!(
+            purpose,
+            TransferPurpose::Paste | TransferPurpose::Clipboard
+        ) {
+            match self.expect_paste.take() {
+                Some(paths) if paths.is_empty() => Sink::Dir(receive_root(&cfg)),
+                Some(paths) => Sink::InPlace(paths),
+                None => Sink::Dir(csc_platform::paste_folder().unwrap_or_else(|| receive_root(&cfg))),
+            }
+        } else {
+            Sink::Dir(receive_root(&cfg))
+        };
+        let space_dir = match &sink {
+            Sink::Dir(dir) => dir.clone(),
+            Sink::InPlace(paths) => paths
+                .first()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| receive_root(&cfg)),
+            Sink::Staged(_) => receive_root(&cfg),
+        };
+        if let Some(free) = csc_platform::free_bytes(&space_dir) {
+            let need = offer.total_bytes.saturating_add(64 * 1024 * 1024);
+            if need > free {
+                let e = FileErrorPayload {
+                    transfer_id: id,
+                    message: format!("磁盘空间不足，需要 {need} 字节，可用 {free} 字节"),
+                };
+                popup(e.message.clone(), true);
+                self.send_json(peer, MsgType::FileError, &e).await;
+                return;
+            }
+        }
         self.receive(
             peer,
             id,
             purpose,
             offer.entries,
             offer.total_bytes,
-            Sink::Dir(receive_root(&cfg)),
+            sink,
             from,
             via,
+            offer.origin_device_id,
         )
         .await;
     }
@@ -988,6 +1154,7 @@ impl Engine {
             sink,
             from,
             via,
+            String::new(),
         )
         .await;
     }
@@ -1003,6 +1170,7 @@ impl Engine {
         sink: Sink,
         from: String,
         via: String,
+        origin_device_id: String,
     ) {
         let cfg = self.config.read().await.clone();
         let staged = match &sink {
@@ -1012,7 +1180,8 @@ impl Engine {
         let title = batch_title(&entries);
         let files_total = entries.iter().filter(|e| !e.is_directory).count() as u32;
         match prepare_incoming(peer, purpose, entries, total, sink, &cfg) {
-            Ok(inc) => {
+            Ok(mut inc) => {
+                inc.origin_device_id = origin_device_id;
                 info!(
                     "receiving {} entries ({}) from {from} into {}",
                     inc.entries.len(),
@@ -1083,6 +1252,7 @@ impl Engine {
         inc.requested = true;
         inc.conflicts.clear();
         let peer = inc.peer.clone();
+        let window_min = self.config.read().await.file_transfer.resume_window_min;
         let skip: Vec<u32> = inc
             .skip
             .iter()
@@ -1090,6 +1260,10 @@ impl Engine {
             .filter(|(_, s)| **s)
             .map(|(i, _)| i as u32)
             .collect();
+        let resume = resume_matches(inc, window_min);
+        let already: u64 = resume.iter().map(|r| r.offset).sum();
+        inc.resume = resume.iter().map(|r| (r.index, r.offset)).collect();
+        inc.received = already;
         let all_skipped = skip.len() == inc.entries.len();
         let wanted: u64 = inc
             .entries
@@ -1115,6 +1289,7 @@ impl Engine {
                 &FileRequestPayload {
                     transfer_id: id,
                     skip: Vec::new(),
+                    resume: Vec::new(),
                 },
             )
             .await;
@@ -1124,6 +1299,7 @@ impl Engine {
             p.state = TransferState::Running;
             p.conflicts.clear();
             p.bytes_total = wanted;
+            p.bytes_done = already;
             p.files_total = files;
             p.dest = dest;
         });
@@ -1133,6 +1309,7 @@ impl Engine {
             &FileRequestPayload {
                 transfer_id: id,
                 skip,
+                resume,
             },
         )
         .await;
@@ -1169,7 +1346,7 @@ impl Engine {
             }
             std::fs::create_dir_all(&path).map_err(|e| format!("{}：{e}", path.display()))?;
             if matches!(inc.target, Target::InPlace) && inc.shape.rest[i].is_none() {
-                let _ = std::fs::remove_file(path.join(FOLDER_MARKER));
+                clear_folder_markers(&path);
             }
             return Ok(());
         }
@@ -1177,14 +1354,14 @@ impl Engine {
         if let Some(parent) = write_to.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}：{e}", parent.display()))?;
         }
-        let file =
-            std::fs::File::create(&write_to).map_err(|e| format!("{}：{e}", write_to.display()))?;
+        let offset = inc.resume.get(&b.index).copied().unwrap_or(0);
+        let (file, hasher, written) = open_for_resume(&write_to, offset)?;
         inc.current = Some(Current {
             index: b.index,
             file: Some(file),
             path: write_to,
-            hasher: Xxh64::new(0),
-            written: 0,
+            hasher,
+            written,
         });
         Ok(())
     }
@@ -1231,6 +1408,18 @@ impl Engine {
 
     fn end_entry(&mut self, peer: &str, end: &FileEndPayload) -> Result<(), String> {
         let board = self.board.clone();
+        let (preserve, strip, motw, keep_mtime) = self
+            .config
+            .try_read()
+            .map(|c| {
+                (
+                    c.file_transfer.preserve_mode,
+                    c.file_transfer.strip_exec_on_desktop,
+                    c.file_transfer.mark_of_web,
+                    c.file_transfer.preserve_mtime,
+                )
+            })
+            .unwrap_or((true, true, true, true));
         let inc = self.incoming_of(peer, end.transfer_id)?;
         let i = end.index as usize;
         let size = inc.entries.get(i).map(|e| e.size).unwrap_or(0);
@@ -1254,12 +1443,23 @@ impl Engine {
             return Err(format!("{} 校验失败", cur.path.display()));
         }
         let _ = file.sync_all();
-        let mtime = inc.entries[i].mtime_unix;
+        let _ = std::fs::remove_file(meta_path(&cur.path));
+        // Apply mtime after the file is closed (below).
+        let mtime = if keep_mtime {
+            inc.entries[i].mtime_unix
+        } else {
+            0
+        };
         if mtime > 0 {
             let t = std::time::UNIX_EPOCH + Duration::from_secs(mtime as u64);
             let _ = file.set_modified(t);
         }
         drop(file);
+        let finished = if inc.temps[i].is_some() {
+            inc.targets[i].clone()
+        } else {
+            cur.path.clone()
+        };
         if inc.temps[i].is_some() {
             let target = &inc.targets[i];
             if std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
@@ -1269,6 +1469,9 @@ impl Engine {
             std::fs::rename(&cur.path, target)
                 .map_err(|e| format!("替换 {}：{e}", target.display()))?;
         }
+        let mode = inc.entries.get(i).map(|e| e.mode).unwrap_or(0);
+        apply_mode(preserve, strip, &finished, mode);
+        mark_of_web(motw, &finished, peer);
         if let Target::Staged(feed) = &inc.target {
             feed.complete(i);
         }
@@ -1339,6 +1542,7 @@ impl Engine {
             &FileRequestPayload {
                 transfer_id: id,
                 skip: Vec::new(),
+                resume: Vec::new(),
             },
         )
         .await;
@@ -1351,11 +1555,18 @@ impl Engine {
             .filter(|(_, i)| i.peer.eq_ignore_ascii_case(peer))
             .map(|(id, _)| *id)
             .collect();
+        let window_min = self.config.read().await.file_transfer.resume_window_min;
         for id in gone {
             if let Some(inc) = self.incoming.remove(&id) {
-                discard(inc);
-                self.board
-                    .finish(id, TransferState::Failed, "连接断开，文件未接收完");
+                if window_min == 0 {
+                    discard(inc);
+                    self.board
+                        .finish(id, TransferState::Failed, "连接断开，文件未接收完");
+                } else {
+                    park_partial(inc);
+                    self.board
+                        .finish(id, TransferState::Paused, "等待重连");
+                }
             }
         }
         self.parked
@@ -1419,6 +1630,7 @@ impl Engine {
         let net = self.net.clone();
         let config = self.config.clone();
         let skip: HashSet<u32> = req.skip.into_iter().collect();
+        let resume: HashMap<u32, u64> = req.resume.into_iter().map(|r| (r.index, r.offset)).collect();
         let label = self.label(peer).await;
         tokio::spawn(async move {
             let peer = out.peer.clone();
@@ -1429,7 +1641,7 @@ impl Engine {
                 acked,
                 wake,
             };
-            match stream(&net, &config, id, out, &skip, &flow).await {
+            match stream(&net, &config, id, out, &skip, &resume, &flow).await {
                 Ok(()) => info!("sent batch {id} ({purpose:?}) to {peer}"),
                 Err(_) if cancel.load(Ordering::Relaxed) => {
                     info!("transfer {id} to {peer} cancelled");
@@ -1539,6 +1751,22 @@ fn prepare_incoming(
     if sum != total {
         return Err("文件大小不一致".into());
     }
+    let mut renamed = 0u32;
+    let entries: Vec<FileEntry> = entries
+        .into_iter()
+        .map(|mut e| {
+            if let Ok(adapted) = adapt_relative_path(&e.relative_path) {
+                if adapted != e.relative_path {
+                    renamed += 1;
+                    e.relative_path = adapted;
+                }
+            }
+            e
+        })
+        .collect();
+    if renamed > 0 {
+        info!("renamed {renamed} received names so this computer can store them");
+    }
     let shape = shape(&entries, cfg)?;
     let n = entries.len();
     let (target, targets, conflicts) = match sink {
@@ -1586,6 +1814,7 @@ fn prepare_incoming(
     };
     Ok(Incoming {
         peer: peer.to_string(),
+        origin_device_id: String::new(),
         purpose,
         entries,
         shape,
@@ -1599,8 +1828,226 @@ fn prepare_incoming(
         requested: false,
         received: 0,
         acked: 0,
+        resume: HashMap::new(),
         conflicts,
     })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartMeta {
+    origin_device_id: String,
+    relative_path: String,
+    size: u64,
+    mtime_unix: i64,
+    /// xxh64(origin | path | size | mtime); identity for resume.
+    #[serde(default)]
+    transfer_key: u64,
+    written: u64,
+    saved_unix: u64,
+}
+
+fn transfer_key(origin: &str, relative_path: &str, size: u64, mtime_unix: i64) -> u64 {
+    let mut h = Xxh64::new(0);
+    h.update(origin.as_bytes());
+    h.update(&[0]);
+    h.update(relative_path.as_bytes());
+    h.update(&[0]);
+    h.update(&size.to_le_bytes());
+    h.update(&mtime_unix.to_le_bytes());
+    h.digest()
+}
+
+fn meta_path(part: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.json", part.display()))
+}
+
+fn read_meta(part: &Path) -> Option<PartMeta> {
+    let text = std::fs::read_to_string(meta_path(part)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_meta(part: &Path, meta: &PartMeta) {
+    if let Ok(text) = serde_json::to_string(meta) {
+        let _ = std::fs::write(meta_path(part), text);
+    }
+}
+
+/// Delete `.csc-part` files older than the resume window under the receive dir.
+fn cleanup_expired_parts(receive_dir: &str, window_min: u32) {
+    let root = if receive_dir.trim().is_empty() {
+        dirs::desktop_dir().or_else(dirs::home_dir)
+    } else {
+        Some(PathBuf::from(receive_dir))
+    };
+    let Some(root) = root else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let window = window_min as u64 * 60;
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".csc-part.json") {
+            continue;
+        }
+        let part = path.with_file_name(name.trim_end_matches(".json"));
+        let Some(meta) = read_meta(&part) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if window_min == 0 || now.saturating_sub(meta.saved_unix) > window {
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Open a new file, or the partial file at `offset` with its hash caught up.
+fn open_for_resume(path: &Path, offset: u64) -> Result<(std::fs::File, Xxh64, u64), String> {
+    if offset == 0 {
+        let file = std::fs::File::create(path).map_err(|e| format!("{}：{e}", path.display()))?;
+        return Ok((file, Xxh64::new(0), 0));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}：{e}", path.display()))?;
+    let mut hasher = Xxh64::new(0);
+    let mut written = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    while written < offset {
+        let want = ((offset - written) as usize).min(buf.len());
+        let n = file
+            .read(&mut buf[..want])
+            .map_err(|e| format!("{}：{e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        written += n as u64;
+    }
+    if written != offset {
+        file.set_len(0)
+            .map_err(|e| format!("{}：{e}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("{}：{e}", path.display()))?;
+        return Ok((file, Xxh64::new(0), 0));
+    }
+    Ok((file, hasher, written))
+}
+
+/// Partial files from the same source, still inside the resume window.
+fn resume_matches(inc: &mut Incoming, window_min: u32) -> Vec<FileResume> {
+    if window_min == 0 || inc.origin_device_id.is_empty() {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let window = window_min as u64 * 60;
+    let mut out = Vec::new();
+    for i in 0..inc.entries.len() {
+        if inc.skip[i] || inc.entries[i].is_directory {
+            continue;
+        }
+        let dest = &inc.targets[i];
+        if dest.as_os_str().is_empty() {
+            continue;
+        }
+        let part = part_path(dest);
+        let Some(meta) = read_meta(&part) else {
+            continue;
+        };
+        let fresh = now.saturating_sub(meta.saved_unix) <= window;
+        let key = transfer_key(
+            &inc.origin_device_id,
+            &inc.entries[i].relative_path,
+            inc.entries[i].size,
+            inc.entries[i].mtime_unix,
+        );
+        let identity = if meta.transfer_key != 0 {
+            meta.transfer_key == key
+        } else {
+            meta.origin_device_id == inc.origin_device_id
+                && meta.relative_path == inc.entries[i].relative_path
+                && meta.size == inc.entries[i].size
+                && meta.mtime_unix == inc.entries[i].mtime_unix
+        };
+        let same = identity && meta.written > 0 && meta.written < meta.size;
+        let len_ok = std::fs::metadata(&part).is_ok_and(|m| m.len() == meta.written);
+        if fresh && same && len_ok {
+            inc.temps[i] = Some(part);
+            out.push(FileResume {
+                index: i as u32,
+                offset: meta.written,
+            });
+        } else {
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(meta_path(&part));
+        }
+    }
+    out
+}
+
+/// Keep partial files so a later offer from the same computer can continue.
+fn park_partial(mut inc: Incoming) {
+    if let Some(cur) = inc.current.take() {
+        drop(cur.file);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for i in 0..inc.entries.len() {
+        if inc.skip.get(i).copied().unwrap_or(true) || inc.entries[i].is_directory {
+            continue;
+        }
+        let dest = &inc.targets[i];
+        if dest.as_os_str().is_empty() {
+            continue;
+        }
+        let writing = inc.temps[i].clone().unwrap_or_else(|| dest.clone());
+        let Ok(meta_len) = std::fs::metadata(&writing).map(|m| m.len()) else {
+            continue;
+        };
+        let size = inc.entries[i].size;
+        if meta_len == 0 || meta_len >= size {
+            continue;
+        }
+        let part = part_path(dest);
+        if writing != part {
+            if std::fs::rename(&writing, &part).is_err() {
+                continue;
+            }
+        }
+        write_meta(
+            &part,
+            &PartMeta {
+                origin_device_id: inc.origin_device_id.clone(),
+                relative_path: inc.entries[i].relative_path.clone(),
+                size,
+                mtime_unix: inc.entries[i].mtime_unix,
+                transfer_key: transfer_key(
+                    &inc.origin_device_id,
+                    &inc.entries[i].relative_path,
+                    size,
+                    inc.entries[i].mtime_unix,
+                ),
+                written: meta_len,
+                saved_unix: now,
+            },
+        );
+    }
 }
 
 /// Drop a failed or cancelled batch: the partial file, and every top-level
@@ -1688,6 +2135,7 @@ async fn stream(
     id: u64,
     out: Outgoing,
     skip: &HashSet<u32>,
+    resume: &HashMap<u32, u64>,
     flow: &Flow,
 ) -> Result<(), String> {
     let (limit, rate) = {
@@ -1726,7 +2174,45 @@ async fn stream(
             .await
             .map_err(|e| format!("{}：{e}", src.display()))?;
         let mut hasher = Xxh64::new(0);
-        let mut left = entry.size;
+        let offset = resume.get(&index).copied().unwrap_or(0).min(entry.size);
+        let mut hashed = 0u64;
+        while hashed < offset {
+            let want = ((offset - hashed) as usize).min(CHUNK);
+            let n = file
+                .read(&mut buf[..want])
+                .await
+                .map_err(|e| format!("{}：{e}", src.display()))?;
+            if n == 0 {
+                return Err(format!("{} 在续传时变小了", src.display()));
+            }
+            hasher.update(&buf[..n]);
+            hashed += n as u64;
+        }
+        let mut left = entry.size - offset;
+        // Whole small files ride in one FILE_BATCH frame (Doc §12.8).
+        if offset == 0 && entry.size > 0 && entry.size <= 64 * 1024 && left == entry.size {
+            let mut whole = vec![0u8; entry.size as usize];
+            file.read_exact(&mut whole)
+                .await
+                .map_err(|e| format!("{}：{e}", src.display()))?;
+            hasher.update(&whole);
+            let digest = hasher.digest();
+            let Some(frame) = encode_file_batch(id, &[(index, digest, whole.as_slice())]) else {
+                return Err("小文件打包失败".into());
+            };
+            flow.room(sent, &out.cancel).await?;
+            if !net.send_bulk(&out.peer, frame).await {
+                return Err("连接已断开".into());
+            }
+            sent += entry.size;
+            left = 0;
+            if limit {
+                let due = Duration::from_secs_f64(sent as f64 / bytes_per_sec);
+                if let Some(wait) = due.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
         while left > 0 {
             flow.room(sent, &out.cancel).await?;
             let want = (left as usize).min(CHUNK);
@@ -1795,6 +2281,7 @@ mod tests {
             size,
             mtime_unix: 0,
             is_directory: dir,
+            mode: 0,
         }
     }
 
@@ -1910,6 +2397,37 @@ mod tests {
         discard(inc);
         assert!(!part.exists());
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_partial_file_resumes() {
+        let dir = temp("resume");
+        let mut inc = incoming_in(&dir, vec![entry("a.txt", 10, false)]);
+        place(&mut inc, &HashMap::new()).unwrap();
+        inc.origin_device_id = "dev-1".into();
+        let part = part_path(&dir.join("a.txt"));
+        std::fs::write(&part, b"hello").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_meta(
+            &part,
+            &PartMeta {
+                origin_device_id: "dev-1".into(),
+                relative_path: "a.txt".into(),
+                size: 10,
+                mtime_unix: 0,
+                transfer_key: transfer_key("dev-1", "a.txt", 10, 0),
+                written: 5,
+                saved_unix: now,
+            },
+        );
+        let resume = resume_matches(&mut inc, 30);
+        assert_eq!(resume.len(), 1);
+        assert_eq!(resume[0].offset, 5);
+        assert_eq!(inc.temps[0].as_deref(), Some(part.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

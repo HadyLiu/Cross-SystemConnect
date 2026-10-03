@@ -6,6 +6,7 @@ mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod locale;
 mod log_picker;
 mod status_poller;
 mod transfer_window;
@@ -34,8 +35,12 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub(crate) enum UserEvent {
     ShowSettings,
+    PasteHere,
+    ToggleSharing,
     Quit,
     DropZone(Option<drop_zone::Zone>),
+    /// Settings language changed; Windows tray labels are updated on this thread.
+    TrayLanguage,
     /// Incoming batches from the core status.
     Transfers(Vec<serde_json::Value>),
     /// Settings page asked for the log file dialog, starting from this path.
@@ -109,6 +114,60 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
             .body(Cow::Owned(body))?);
     }
 
+    if path == "/pair-open" && method == Method::POST {
+        let (status, v) = match ipc_client::open_pairing() {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+        let body = serde_json::to_vec(&v)?;
+        return Ok(cors_headers(Response::builder())
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(body))?);
+    }
+
+    if path == "/reset-data" && method == Method::POST {
+        let parsed: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let keep = parsed
+            .get("keepPairing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (status, v) = match ipc_client::reset_data(keep) {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+        let body = serde_json::to_vec(&v)?;
+        return Ok(cors_headers(Response::builder())
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(body))?);
+    }
+
+    if path == "/sharing" && method == Method::POST {
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let (status, v) = match ipc_client::set_sharing_enabled(enabled) {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+        let body = serde_json::to_vec(&v)?;
+        return Ok(cors_headers(Response::builder())
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Cow::Owned(body))?);
+    }
+
     if path == "/rescan" && method == Method::POST {
         let (status, v) = match ipc_client::rescan() {
             Ok(v) => (StatusCode::OK, v),
@@ -159,12 +218,48 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
                     .body(Cow::Owned(body))?)
             }
         }
+    } else if path == "/forget-peer" && method == Method::POST {
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
+        let host = body.get("hostName").and_then(|v| v.as_str()).unwrap_or("");
+        match ipc_client::forget_peer(host) {
+            Ok(v) => {
+                let out = serde_json::to_vec(&v)?;
+                Ok(cors_headers(Response::builder())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(out))?)
+            }
+            Err(e) => {
+                let out = serde_json::to_vec(&json!({"ok": false, "error": e.to_string()}))?;
+                Ok(cors_headers(Response::builder())
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(out))?)
+            }
+        }
     } else if path == "/peer-decision" && method == Method::POST {
         let body: serde_json::Value =
             serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
         let host = body.get("hostName").and_then(|v| v.as_str()).unwrap_or("");
         let decision = body.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        match ipc_client::resolve_peer(host, decision) {
+        let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        match ipc_client::resolve_peer(host, decision, code) {
+            Ok(v) => {
+                let out = serde_json::to_vec(&v)?;
+                Ok(cors_headers(Response::builder())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(out))?)
+            }
+            Err(e) => {
+                let out = serde_json::to_vec(&json!({"ok": false, "error": e.to_string()}))?;
+                Ok(cors_headers(Response::builder())
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Cow::Owned(out))?)
+            }
+        }
+    } else if path == "/diagnostics" && method == Method::POST {
+        match ipc_client::export_diagnostics() {
             Ok(v) => {
                 let out = serde_json::to_vec(&v)?;
                 Ok(cors_headers(Response::builder())
@@ -230,6 +325,9 @@ fn build_webview(
         .with_ipc_handler(move |req| {
             if let Some(current) = req.body().strip_prefix("pick-log-file:") {
                 let _ = proxy.send_event(UserEvent::PickLogFile(current.to_string()));
+            } else if let Some(code) = req.body().strip_prefix("lang:") {
+                locale::apply(code);
+                let _ = proxy.send_event(UserEvent::TrayLanguage);
             }
         })
         .with_custom_protocol(
@@ -328,9 +426,18 @@ fn main() -> anyhow::Result<()> {
         // Continue so tray still appears; settings will show IPC errors
     }
     // The login entry follows the saved setting, which is off by default.
-    let launch = ipc_client::get_config()
-        .ok()
-        .and_then(|c| c.pointer("/gui/launch_at_login").and_then(|v| v.as_bool()));
+    let saved = ipc_client::get_config().ok();
+    if let Some(lang) = saved
+        .as_ref()
+        .and_then(|c| c.pointer("/gui/language"))
+        .and_then(|v| v.as_str())
+    {
+        locale::apply(lang);
+    }
+    let launch = saved
+        .as_ref()
+        .and_then(|c| c.pointer("/gui/launch_at_login"))
+        .and_then(|v| v.as_bool());
     if let Some(Err(e)) = launch.map(autostart::apply) {
         tracing::warn!("launch at login: {e:#}");
     }
@@ -339,11 +446,29 @@ fn main() -> anyhow::Result<()> {
     let proxy = event_loop.create_proxy();
 
     #[cfg(not(target_os = "linux"))]
-    let mut tray_icon = {
+    let (mut tray_icon, tray_settings, tray_paste, tray_share, tray_quit) = {
+        use tray_icon::menu::CheckMenuItem;
         let tray_menu = Menu::new();
-        let item_settings = MenuItem::new("设置", true, None);
-        let item_quit = MenuItem::new("退出", true, None);
+        let item_settings = MenuItem::new(locale::settings(), true, None);
+        let item_paste = MenuItem::new(locale::paste(), true, None);
+        let sharing_on = ipc_client::get_status()
+            .ok()
+            .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        let item_share = CheckMenuItem::new(
+            if sharing_on {
+                locale::pause_sharing()
+            } else {
+                locale::resume_sharing()
+            },
+            true,
+            !sharing_on,
+            None,
+        );
+        let item_quit = MenuItem::new(locale::quit(), true, None);
         tray_menu.append(&item_settings)?;
+        tray_menu.append(&item_paste)?;
+        tray_menu.append(&item_share)?;
         tray_menu.append(&item_quit)?;
 
         let tray_icon_img = icon::app_tray_icon();
@@ -355,6 +480,8 @@ fn main() -> anyhow::Result<()> {
             .context("create tray icon")?;
 
         let settings_id = item_settings.id().clone();
+        let paste_id = item_paste.id().clone();
+        let share_id = item_share.id().clone();
         let quit_id = item_quit.id().clone();
 
         MenuEvent::set_event_handler(Some({
@@ -362,6 +489,10 @@ fn main() -> anyhow::Result<()> {
             move |event: MenuEvent| {
                 if event.id == settings_id {
                     let _ = proxy.send_event(UserEvent::ShowSettings);
+                } else if event.id == paste_id {
+                    let _ = proxy.send_event(UserEvent::PasteHere);
+                } else if event.id == share_id {
+                    let _ = proxy.send_event(UserEvent::ToggleSharing);
                 } else if event.id == quit_id {
                     let _ = proxy.send_event(UserEvent::Quit);
                 }
@@ -376,7 +507,13 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }));
-        Some(tray_icon)
+        (
+            Some(tray_icon),
+            item_settings,
+            item_paste,
+            item_share,
+            item_quit,
+        )
     };
     #[cfg(target_os = "linux")]
     {
@@ -512,6 +649,48 @@ fn main() -> anyhow::Result<()> {
                         let js = json!(path.display().to_string());
                         let _ = wv.evaluate_script(&format!("window.onLogFilePicked({js});"));
                     }
+                }
+            }
+            Event::UserEvent(UserEvent::TrayLanguage) => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tray_settings.set_text(locale::settings());
+                    tray_paste.set_text(locale::paste());
+                    tray_quit.set_text(locale::quit());
+                    let sharing_on = ipc_client::get_status()
+                        .ok()
+                        .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
+                        .unwrap_or(true);
+                    tray_share.set_text(if sharing_on {
+                        locale::pause_sharing()
+                    } else {
+                        locale::resume_sharing()
+                    });
+                    tray_share.set_checked(!sharing_on);
+                }
+            }
+            Event::UserEvent(UserEvent::PasteHere) => {
+                if let Err(e) = ipc_client::call("paste_remote_files", serde_json::json!({})) {
+                    tracing::warn!("paste remote files: {e:#}");
+                }
+            }
+            Event::UserEvent(UserEvent::ToggleSharing) => {
+                let sharing_on = ipc_client::get_status()
+                    .ok()
+                    .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
+                    .unwrap_or(true);
+                if let Err(e) = ipc_client::set_sharing_enabled(!sharing_on) {
+                    tracing::warn!("toggle sharing: {e:#}");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let now = !sharing_on;
+                    tray_share.set_text(if now {
+                        locale::pause_sharing()
+                    } else {
+                        locale::resume_sharing()
+                    });
+                    tray_share.set_checked(!now);
                 }
             }
             Event::UserEvent(UserEvent::Quit) => {

@@ -1,4 +1,4 @@
-use crate::frame::{encode_frame, MsgType, FLAG_JSON_PAYLOAD};
+use crate::frame::{encode_frame, MsgType, FLAG_BINARY, FLAG_JSON_PAYLOAD};
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 
@@ -57,19 +57,103 @@ impl Edge {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Monitor {
+    pub id: u32,
+    pub rect: Rect,
+    pub scale: f32,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelloPorts {
+    pub control: u16,
+    pub data: u16,
+}
+
+impl Default for HelloPorts {
+    fn default() -> Self {
+        Self {
+            control: 24900,
+            data: 24901,
+        }
+    }
+}
+
+/// `HELLO` on the control connection. Field names match architecture §10.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloPayload {
+    #[serde(rename = "proto")]
     pub protocol_version: u16,
+    #[serde(default = "proto_floor")]
+    pub proto_min: u16,
+    #[serde(default = "proto_floor")]
+    pub proto_max: u16,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(rename = "name")]
     pub host_name: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
     pub screen_width: i32,
+    #[serde(default)]
     pub screen_height: i32,
+    #[serde(default)]
+    pub monitors: Vec<Monitor>,
+    #[serde(rename = "caps")]
     pub capabilities: u32,
+    #[serde(default)]
+    pub ports: HelloPorts,
+}
+
+fn proto_floor() -> u16 {
+    2
+}
+
+impl Default for HelloPayload {
+    fn default() -> Self {
+        Self {
+            protocol_version: 2,
+            proto_min: 2,
+            proto_max: 2,
+            app_version: String::new(),
+            device_id: String::new(),
+            host_name: String::new(),
+            role: String::new(),
+            screen_width: 0,
+            screen_height: 0,
+            monitors: Vec::new(),
+            capabilities: 0,
+            ports: HelloPorts::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwitchPayload {
     pub edge: Edge,
     pub position_pct: f32,
+    /// Host lock lights to copy onto the computer being entered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locks: Option<LockState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockState {
+    pub caps: bool,
+    pub num: bool,
+    pub scroll: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +187,9 @@ pub struct FileEntry {
     pub size: u64,
     pub mtime_unix: i64,
     pub is_directory: bool,
+    /// Permission bits in 0o777. 0 means the sender did not provide them.
+    #[serde(default)]
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +240,16 @@ pub struct FileOfferPayload {
     /// Sender to keyboard host: pass this batch on to that computer.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub relay_to: String,
+    /// Stable id of the computer the bytes come from. Resume checks this.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_device_id: String,
+}
+
+/// One file the receiver already has some bytes of.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileResume {
+    pub index: u32,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +258,9 @@ pub struct FileRequestPayload {
     /// Entry indexes the receiver does not want (name conflicts it skips).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<u32>,
+    /// Bytes already stored for these entries. The sender continues from each offset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume: Vec<FileResume>,
 }
 
 /// Receiver to sender: this many bytes of the batch are written.
@@ -181,6 +281,9 @@ pub struct EdgeHitPayload {
     /// Corner zone the pointer is in; the host prefers it when the layout has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner: Option<Edge>,
+    /// Drag being carried across this edge. 0 when the pointer is not dragging.
+    #[serde(default)]
+    pub transfer_id: u64,
 }
 
 /// Keyboard host to the computer that copied files: send them to `to` for pasting.
@@ -209,9 +312,115 @@ pub struct DragBeginPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DragCancelPayload {
     pub transfer_id: u64,
-    /// `user`, `no_target`, `pointer_left` or `unsupported`.
+    /// `user`, `no_target`, `pointer_left`, `retarget`, `esc`, or `unsupported`.
     #[serde(default)]
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRequestPayload {
+    pub device_id: String,
+    pub name: String,
+    pub role: String,
+    #[serde(rename = "proto", default = "proto_floor")]
+    pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairConfirmPayload {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairResultPayload {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairCommitPayload {
+    /// Hex SHA-256 of the commitment.
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairNoncePayload {
+    /// Hex of the 32-byte nonce.
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataAttachPayload {
+    pub device_id: String,
+    /// Base64 of the 32-byte exporter token.
+    pub session_token: String,
+    pub data_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatePayload {
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusInfoPayload {
+    pub file_target: bool,
+    pub fullscreen: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenUpdatePayload {
+    pub monitors: Vec<Monitor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPausePayload {
+    pub paused: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasteLocatedPayload {
+    pub paste_id: u64,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DragRetargetPayload {
+    pub transfer_id: u64,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipRequestPayload {
+    pub clip_id: u64,
+    pub fmt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipEndPayload {
+    pub clip_id: u64,
+    pub xxh64: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockScreenPayload {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchSyncPayload {
+    pub seq: u64,
+    pub t1: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t2: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchEchoPayload {
+    pub seq: u64,
+    pub t1: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,7 +453,7 @@ pub fn encode_file_data(transfer_id: u64, index: u32, data: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&transfer_id.to_le_bytes());
     body.extend_from_slice(&index.to_le_bytes());
     body.extend_from_slice(data);
-    encode_frame(MsgType::FileData, &body, 0)
+    encode_frame(MsgType::FileData, &body, FLAG_BINARY)
 }
 
 /// Rewrite the transfer id at the front of a FileData payload, for relaying.
@@ -265,6 +474,83 @@ pub fn decode_file_data(payload: &[u8]) -> Option<(u64, u32, &[u8])> {
     Some((id, index, &payload[12..]))
 }
 
+/// One complete small file inside a `FILE_BATCH` frame.
+#[derive(Debug, Clone)]
+pub struct FileBatchItem<'a> {
+    pub index: u32,
+    pub xxhash64: u64,
+    pub data: &'a [u8],
+}
+
+/// Binary: `transfer_id u64 | count u16 | [index u32 | len u32 | xxh64 u64 | bytes]×count`.
+pub fn encode_file_batch(transfer_id: u64, items: &[(u32, u64, &[u8])]) -> Option<Vec<u8>> {
+    if items.is_empty() || items.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut body = Vec::with_capacity(10 + items.iter().map(|(_, _, d)| 16 + d.len()).sum::<usize>());
+    body.extend_from_slice(&transfer_id.to_le_bytes());
+    body.extend_from_slice(&(items.len() as u16).to_le_bytes());
+    for &(index, xxh, data) in items {
+        if data.len() > u32::MAX as usize {
+            return None;
+        }
+        body.extend_from_slice(&index.to_le_bytes());
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&xxh.to_le_bytes());
+        body.extend_from_slice(data);
+    }
+    // Same ceiling as FileData (64 KiB + framing).
+    if body.len() > crate::DATA_BLOCK_MAX {
+        return None;
+    }
+    Some(encode_frame(MsgType::FileBatch, &body, FLAG_BINARY))
+}
+
+pub fn decode_file_batch(payload: &[u8]) -> Option<(u64, Vec<FileBatchItem<'_>>)> {
+    if payload.len() < 10 {
+        return None;
+    }
+    let id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let count = u16::from_le_bytes(payload[8..10].try_into().ok()?) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut off = 10usize;
+    for _ in 0..count {
+        if payload.len() < off + 16 {
+            return None;
+        }
+        let index = u32::from_le_bytes(payload[off..off + 4].try_into().ok()?);
+        let len = u32::from_le_bytes(payload[off + 4..off + 8].try_into().ok()?) as usize;
+        let xxhash64 = u64::from_le_bytes(payload[off + 8..off + 16].try_into().ok()?);
+        off += 16;
+        if payload.len() < off + len {
+            return None;
+        }
+        out.push(FileBatchItem {
+            index,
+            xxhash64,
+            data: &payload[off..off + len],
+        });
+        off += len;
+    }
+    if off != payload.len() {
+        return None;
+    }
+    Some((id, out))
+}
+
+/// Rewrite the transfer id at the front of a FileBatch payload, for relaying.
+pub fn set_file_batch_id(payload: &mut [u8], transfer_id: u64) -> bool {
+    if payload.len() < 10 {
+        return false;
+    }
+    payload[0..8].copy_from_slice(&transfer_id.to_le_bytes());
+    true
+}
+
+pub fn encode_activity() -> Vec<u8> {
+    encode_frame(MsgType::Activity, &[], 0)
+}
+
 pub fn encode_json_frame<T: Serialize>(
     msg_type: MsgType,
     value: &T,
@@ -273,59 +559,17 @@ pub fn encode_json_frame<T: Serialize>(
     Ok(encode_frame(msg_type, &payload, FLAG_JSON_PAYLOAD))
 }
 
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
-    out.extend_from_slice(b);
-}
-
-fn read_str(data: &[u8], off: &mut usize) -> Option<String> {
-    if *off + 2 > data.len() {
-        return None;
-    }
-    let n = u16::from_le_bytes([data[*off], data[*off + 1]]) as usize;
-    *off += 2;
-    if *off + n > data.len() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&data[*off..*off + n]).into_owned();
-    *off += n;
-    Some(s)
-}
-
-/// Compact binary HELLO: version, host name, screen size, capabilities.
+/// `HELLO` as JSON (protocol 2).
 pub fn encode_hello_bin(h: &HelloPayload) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&h.protocol_version.to_le_bytes());
-    write_str(&mut body, &h.host_name);
-    body.extend_from_slice(&h.screen_width.to_le_bytes());
-    body.extend_from_slice(&h.screen_height.to_le_bytes());
-    body.extend_from_slice(&h.capabilities.to_le_bytes());
-    encode_frame(MsgType::Hello, &body, 0)
+    encode_json_frame(MsgType::Hello, h).unwrap_or_default()
 }
 
 pub fn decode_hello_bin(payload: &[u8]) -> Option<HelloPayload> {
-    if payload.len() < 2 {
+    let hello: HelloPayload = serde_json::from_slice(payload).ok()?;
+    if hello.protocol_version != 2 || hello.ports.control == hello.ports.data {
         return None;
     }
-    let mut off = 2;
-    let protocol_version = u16::from_le_bytes([payload[0], payload[1]]);
-    let host_name = read_str(payload, &mut off)?;
-    if off + 12 > payload.len() {
-        return None;
-    }
-    let screen_width = i32::from_le_bytes(payload[off..off + 4].try_into().ok()?);
-    off += 4;
-    let screen_height = i32::from_le_bytes(payload[off..off + 4].try_into().ok()?);
-    off += 4;
-    let capabilities = u32::from_le_bytes(payload[off..off + 4].try_into().ok()?);
-    Some(HelloPayload {
-        protocol_version,
-        host_name,
-        screen_width,
-        screen_height,
-        capabilities,
-    })
+    Some(hello)
 }
 
 pub fn encode_switch_bin(s: &SwitchPayload) -> Vec<u8> {
@@ -345,7 +589,7 @@ pub fn encode_clip_image_bin(seq: u64, png: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(8 + png.len());
     body.extend_from_slice(&seq.to_le_bytes());
     body.extend_from_slice(png);
-    encode_frame(MsgType::ClipData, &body, 0)
+    encode_frame(MsgType::ClipData, &body, FLAG_BINARY)
 }
 
 pub fn decode_clip_image_bin(payload: &[u8]) -> Option<(u64, &[u8])> {
@@ -367,21 +611,34 @@ fn encode_switch_msg(msg_type: MsgType, s: &SwitchPayload) -> Vec<u8> {
     };
     let mut body = vec![edge];
     body.extend_from_slice(&s.position_pct.to_le_bytes());
-    encode_frame(msg_type, &body, 0)
+    if let Some(locks) = s.locks {
+        let mut flags = 0x80u8;
+        if locks.caps {
+            flags |= 1;
+        }
+        if locks.num {
+            flags |= 2;
+        }
+        if locks.scroll {
+            flags |= 4;
+        }
+        body.push(flags);
+    }
+    encode_frame(msg_type, &body, FLAG_BINARY)
 }
 
 pub fn encode_mouse_move_bin(m: &MouseMovePayload) -> Vec<u8> {
     let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&m.dx.to_le_bytes());
     body.extend_from_slice(&m.dy.to_le_bytes());
-    encode_frame(MsgType::MouseMove, &body, 0)
+    encode_frame(MsgType::MouseMove, &body, FLAG_BINARY)
 }
 
 pub fn encode_mouse_button_bin(m: &MouseButtonPayload) -> Vec<u8> {
     let mut body = Vec::with_capacity(5);
     body.extend_from_slice(&m.button.to_le_bytes());
     body.push(m.down);
-    encode_frame(MsgType::MouseButton, &body, 0)
+    encode_frame(MsgType::MouseButton, &body, FLAG_BINARY)
 }
 
 pub fn decode_mouse_button_bin(payload: &[u8]) -> Option<MouseButtonPayload> {
@@ -398,7 +655,7 @@ pub fn encode_mouse_wheel_bin(m: &MouseWheelPayload) -> Vec<u8> {
     let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&m.wheel_v.to_le_bytes());
     body.extend_from_slice(&m.wheel_h.to_le_bytes());
-    encode_frame(MsgType::MouseWheel, &body, 0)
+    encode_frame(MsgType::MouseWheel, &body, FLAG_BINARY)
 }
 
 pub fn decode_mouse_wheel_bin(payload: &[u8]) -> Option<MouseWheelPayload> {
@@ -416,5 +673,5 @@ pub fn encode_key_bin(k: &KeyPayload) -> Vec<u8> {
     body.extend_from_slice(&k.hid_usage.to_le_bytes());
     body.push(k.down);
     body.extend_from_slice(&k.modifiers.to_le_bytes());
-    encode_frame(MsgType::Key, &body, 0)
+    encode_frame(MsgType::Key, &body, FLAG_BINARY)
 }

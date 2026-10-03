@@ -5,6 +5,7 @@ mod ipc;
 mod layout;
 mod logging;
 mod net;
+mod notice;
 mod paste;
 mod path_safe;
 mod progress;
@@ -29,11 +30,12 @@ use crate::transfer::TransferHandle;
 use csc_config::{default_config_path, Config};
 use csc_platform::{create_input_injector, create_screen_info, query_host_net_info, Captured};
 use csc_proto::{
-    encode_json_frame, encode_switch_leave_bin, AppStatus, ClipOfferPayload, DragBeginPayload,
-    DragCancelPayload, EdgeHitPayload, FileEntry, LocalNic, MsgType, PasteRequestPayload,
-    SwitchPayload, CAP_EDGE_REPORT, CAP_VIRTUAL_DRAG,
+    encode_activity, encode_frame, encode_json_frame, encode_switch_leave_bin, AppStatus,
+    ClipOfferPayload, ControlPausePayload, DragBeginPayload, DragCancelPayload, EdgeHitPayload,
+    FileEntry, LocalNic, LockState, MsgType, PasteLocatedPayload, PasteRequestPayload,
+    PeerStatePayload, SwitchPayload, CAP_CLIP_PLACEHOLDER, CAP_EDGE_REPORT, CAP_VIRTUAL_DRAG,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,6 +184,7 @@ fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
         return;
     }
     *grab = false;
+    csc_platform::set_host_cursor_hidden(false);
     csc_platform::capture_set_grab(false, None);
     if let Some((x, y)) = target {
         let (ox, oy) = csc_platform::virtual_origin();
@@ -371,12 +374,12 @@ fn nics_of(host: csc_platform::HostNetInfo) -> (String, Vec<String>, Vec<LocalNi
 }
 
 fn popup(body: &str, error: bool) {
-    if error {
-        warn!("{body}");
-    } else {
-        info!("{body}");
-    }
-    csc_platform::notify("Cross-SystemConnect", body, error);
+    notice::tell(
+        notice::Kind::Error,
+        "Cross-SystemConnect",
+        body,
+        error,
+    );
 }
 
 /// Where the edge window came from, and what happens once a file drag enters it.
@@ -395,6 +398,14 @@ struct DragRoute {
     /// None: the keyboard host itself.
     to: Option<String>,
     at: Instant,
+}
+
+/// A file manager pasted the placeholder copies of another computer's files.
+struct LocatedPaste {
+    peer: String,
+    seq: u64,
+    gen: u64,
+    paths: Vec<PathBuf>,
 }
 
 /// Result of checking files dragged into the edge window.
@@ -434,6 +445,9 @@ struct Core {
     injected: HeldInput,
     return_hotkey: Option<Hotkey>,
     lock_hotkey: Option<Hotkey>,
+    stay_hotkey: Option<Hotkey>,
+    pause_hotkey: Option<Hotkey>,
+    stay_on: bool,
     last_lock: Instant,
     last_miss: Instant,
     next_nic: Instant,
@@ -444,13 +458,19 @@ struct Core {
     zone_blocked: bool,
     drag_pending: bool,
     drag_route: Option<DragRoute>,
-    /// Controlled side: a drag from this computer (the sender) is on this screen.
-    incoming_drag: Option<String>,
+    /// Drag the keyboard host last sent, so it can be handed to another computer.
+    live_drag: Option<DragBeginPayload>,
+    /// Controlled side: a drag from `peer` (transfer id) is on this screen.
+    incoming_drag: Option<(String, u64)>,
+    paste_gen: u64,
+    paste_tx: mpsc::Sender<LocatedPaste>,
     clip_seq: u64,
     last_remote_clip: u64,
     shared: SharedClip,
     /// Files copied on this computer, by copy sequence number.
     my_files: Option<(u64, Vec<PathBuf>)>,
+    /// Files copied on `peer`, still available to paste here.
+    remote_files: Option<(String, u64)>,
     /// Controlled computer: push through its own edges, and the last pointer position.
     probe: EdgePush,
     last_real: Option<(i32, i32)>,
@@ -459,6 +479,40 @@ struct Core {
     /// Ignore edge-leave until this moment, so the crossing itself does not bounce back.
     control_ready: Instant,
     last_edge_sent: Instant,
+    power_rx: std::sync::mpsc::Receiver<csc_platform::PowerEvent>,
+    /// Computers that paused sharing, or are on a secure desktop.
+    paused_peers: HashSet<String>,
+    sharing_announced: bool,
+    remap: Vec<(u32, u32)>,
+    sync_locks: bool,
+    block_fullscreen: bool,
+    pointer_speed: f32,
+    pointer_peers: HashMap<String, f32>,
+    carry_x: f32,
+    carry_y: f32,
+    /// Lock lights the host remembers while its own keys are grabbed.
+    virtual_locks: Option<(bool, bool, bool)>,
+    /// Last moment this computer had user input (for ACTIVITY / keep-awake).
+    last_local_activity: Instant,
+    last_activity_sent: Instant,
+    /// Latest local clipboard offer when `push_mode=on_switch`.
+    pending_clip: Option<ClipOfferPayload>,
+}
+
+fn file_entries(paths: &[PathBuf]) -> Vec<FileEntry> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name().and_then(|n| n.to_str())?;
+            Some(FileEntry {
+                relative_path: name.to_string(),
+                size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                mtime_unix: 0,
+                is_directory: p.is_dir(),
+                mode: 0,
+            })
+        })
+        .collect()
 }
 
 fn hotkey_of(text: &str, what: &str) -> Option<Hotkey> {
@@ -489,6 +543,29 @@ fn hotkeys_of(cfg: &Config) -> (Option<Hotkey>, Option<Hotkey>) {
     (back, lock)
 }
 
+fn watch_local(cfg: &Config) -> (Option<Hotkey>, Option<Hotkey>) {
+    let stay = hotkey_of(&cfg.hotkeys.lock_to_screen, "stay");
+    match &stay {
+        Some(k) => csc_platform::stay_watch(&k.mods, k.key),
+        None => csc_platform::stay_watch(&[], 0),
+    }
+    let pause = hotkey_of(&cfg.hotkeys.emergency_pause, "pause");
+    match &pause {
+        Some(k) => csc_platform::pause_watch(&k.mods, k.key),
+        None => csc_platform::pause_watch(&[], 0),
+    }
+    (stay, pause)
+}
+
+fn block_bit(name: &str) -> u32 {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => 1,
+        "shift" => 2,
+        "alt" => 4,
+        _ => 0,
+    }
+}
+
 impl Core {
     async fn is_host(&self) -> bool {
         self.status.read().await.role == "server"
@@ -496,6 +573,144 @@ impl Core {
 
     async fn local_name(&self) -> String {
         self.status.read().await.local_name.clone()
+    }
+
+    fn load_input_prefs(&mut self, cfg: &Config) {
+        self.remap = cfg
+            .keyboard
+            .remap
+            .iter()
+            .map(|r| (r.from, r.to))
+            .collect();
+        self.sync_locks = cfg.keyboard.sync_locks;
+        self.block_fullscreen = cfg.switch_cfg.block_when_fullscreen;
+        self.pointer_speed = cfg.pointer.speed.clamp(0.25, 4.0);
+        self.pointer_peers = cfg
+            .pointer
+            .peers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clamp(0.25, 4.0)))
+            .collect();
+        notice::set_language(&cfg.gui.language);
+    }
+
+    fn mapped(&self, hid: u32) -> u32 {
+        self.remap
+            .iter()
+            .find(|(from, _)| *from == hid)
+            .map(|(_, to)| *to)
+            .unwrap_or(hid)
+    }
+
+    fn scale_delta(&mut self, dx: i32, dy: i32) -> (i32, i32) {
+        let peer = self.switch.active_remote();
+        let factor = self
+            .pointer_peers
+            .get(peer)
+            .copied()
+            .unwrap_or(self.pointer_speed);
+        self.carry_x += dx as f32 * factor;
+        self.carry_y += dy as f32 * factor;
+        let ox = self.carry_x.trunc();
+        let oy = self.carry_y.trunc();
+        self.carry_x -= ox;
+        self.carry_y -= oy;
+        (ox as i32, oy as i32)
+    }
+
+    fn enter_payload(&self, edge: csc_proto::Edge, position_pct: f32) -> SwitchPayload {
+        let locks = if self.sync_locks {
+            let (caps, num, scroll) = self.virtual_locks.unwrap_or_else(csc_platform::lock_leds);
+            Some(LockState { caps, num, scroll })
+        } else {
+            None
+        };
+        SwitchPayload {
+            edge,
+            position_pct,
+            locks,
+        }
+    }
+
+    fn note_virtual_lock(&mut self, hid: u32, down: bool) {
+        if !down {
+            return;
+        }
+        let Some(locks) = self.virtual_locks.as_mut() else {
+            return;
+        };
+        match hid {
+            0x39 => locks.0 = !locks.0,
+            0x53 => locks.1 = !locks.1,
+            0x47 => locks.2 = !locks.2,
+            _ => {}
+        }
+    }
+
+    fn match_locks(&mut self, want: (bool, bool, bool)) {
+        if !self.sync_locks {
+            return;
+        }
+        let have = csc_platform::lock_leds();
+        for (hid, on, now) in [(0x39u32, want.0, have.0), (0x53, want.1, have.1), (0x47, want.2, have.2)]
+        {
+            if on != now {
+                self.injector.key(hid, true);
+                self.injector.key(hid, false);
+            }
+        }
+    }
+
+    async fn announce_sharing(&mut self) {
+        let (sharing, role, peers) = {
+            let s = self.status.read().await;
+            (s.sharing_enabled, s.role.clone(), s.peer_name.clone())
+        };
+        if sharing == self.sharing_announced {
+            return;
+        }
+        self.sharing_announced = sharing;
+        if !sharing && self.grab {
+            self.return_home("sharing paused").await;
+        }
+        if role == "server" {
+            return;
+        }
+        let Ok(frame) = encode_json_frame(
+            MsgType::ControlPause,
+            &ControlPausePayload {
+                paused: !sharing,
+                reason: "user".into(),
+            },
+        ) else {
+            return;
+        };
+        for peer in peers.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            self.net.send_control(peer, frame.clone()).await;
+        }
+    }
+
+    async fn activity_tick(&mut self) {
+        let keep = self.config.read().await.power.keep_peers_awake;
+        if !keep {
+            return;
+        }
+        if self.grab || csc_platform::primary_button_down() {
+            self.last_local_activity = Instant::now();
+        }
+        if self.last_local_activity.elapsed() > Duration::from_secs(60) {
+            return;
+        }
+        if self.last_activity_sent.elapsed() < Duration::from_secs(30) {
+            return;
+        }
+        self.last_activity_sent = Instant::now();
+        csc_platform::note_user_activity();
+        let frame = encode_activity();
+        let peers = self.share_peers().await;
+        for peer in peers {
+            self.net.send_control(&peer, frame.clone()).await;
+        }
     }
 
     async fn set_active_screen(&self, name: Option<&str>) {
@@ -527,9 +742,12 @@ impl Core {
     // ------------------------------------------------------------ tick
 
     async fn tick(&mut self) {
+        while let Ok(ev) = self.power_rx.try_recv() {
+            self.on_power(ev).await;
+        }
         if self.layout_rx.has_changed().unwrap_or(false) {
             let _ = self.layout_rx.borrow_and_update();
-            let cfg = self.config.read().await;
+            let cfg = self.config.read().await.clone();
             self.switch.configure(
                 cfg.name.clone(),
                 self.screen,
@@ -538,10 +756,37 @@ impl Core {
             );
             self.switch.set_screen(self.screen, self.monitors.clone());
             (self.return_hotkey, self.lock_hotkey) = hotkeys_of(&cfg);
+            (self.stay_hotkey, self.pause_hotkey) = watch_local(&cfg);
+            self.load_input_prefs(&cfg);
         }
         if csc_platform::lock_hits() > 0 && !self.grab {
             self.lock_all(None).await;
         }
+        if csc_platform::stay_hits() > 0 {
+            self.stay_on = !self.stay_on;
+            info!(stay = self.stay_on, "stay on this screen");
+            if self.stay_on && self.grab {
+                self.return_home("stay on this screen").await;
+            }
+        }
+        if csc_platform::pause_hits() > 0 {
+            let on = {
+                let mut s = self.status.write().await;
+                s.sharing_enabled = !s.sharing_enabled;
+                s.sharing_enabled
+            };
+            info!(sharing = on, "emergency pause");
+            if !on && self.grab {
+                self.return_home("emergency pause").await;
+            }
+        }
+        let block = block_bit(&self.config.read().await.switch_cfg.block_modifier);
+        let held = csc_platform::mods_held();
+        self.switch
+            .set_blocked(self.stay_on || (block != 0 && held & block != 0));
+        csc_platform::set_keep_awake(self.config.read().await.power.keep_peers_awake);
+        self.announce_sharing().await;
+        self.activity_tick().await;
         if self.grab && !self.net.has_peer(self.switch.active_remote()).await {
             warn!(
                 "session to {} is gone; returning input to this computer",
@@ -555,6 +800,7 @@ impl Core {
         }
         if Instant::now() >= self.next_nic {
             self.next_nic = Instant::now() + Duration::from_secs(3);
+            crate::net::set_bench_enabled(self.config.read().await.diagnostics.bench_enabled);
             self.poll_system().await;
         }
         {
@@ -719,14 +965,35 @@ impl Core {
                 self.return_home("return hotkey").await;
                 return true;
             }
+            if hit(&self.stay_hotkey) {
+                self.stay_on = true;
+                self.return_home("stay on this screen").await;
+                return true;
+            }
+            if hit(&self.pause_hotkey) {
+                self.status.write().await.sharing_enabled = false;
+                self.return_home("emergency pause").await;
+                return true;
+            }
             if hid == HID_V && self.held.ctrl() {
                 let target = self.switch.active_remote().to_string();
-                if self.paste(target).await {
+                // Linux pastes by copying placeholders itself. Swallowing Ctrl+V
+                // would steal the key from the file manager and from other windows.
+                let own_paste = self.net.peer_caps(&target).await & CAP_CLIP_PLACEHOLDER != 0;
+                if !own_paste && self.paste(target).await {
                     // Never forwarded, so its release is dropped below as well.
                     return false;
                 }
             }
         }
+        let step = match step {
+            Captured::Key { hid, down } => {
+                let hid = self.mapped(hid);
+                self.note_virtual_lock(hid, down);
+                Captured::Key { hid, down }
+            }
+            other => other,
+        };
         if let Captured::Key { hid, down: false } = step {
             if !self.held.keys.contains(&hid) {
                 // Release of a key the remote never saw (hotkey, caught Ctrl+V).
@@ -738,6 +1005,7 @@ impl Core {
             self.net.send_captured(step).await;
             return false;
         };
+        let (dx, dy) = self.scale_delta(dx, dy);
         let dx = dx.clamp(-300, 300);
         let dy = dy.clamp(-300, 300);
         let current = self.switch.active_remote().to_string();
@@ -756,9 +1024,13 @@ impl Core {
     async fn return_home(&mut self, why: &str) {
         let current = self.switch.active_remote().to_string();
         self.held.release_all(&self.net).await;
+        if let Some(want) = self.virtual_locks.take() {
+            self.match_locks(want);
+        }
         let leave_msg = SwitchPayload {
             edge: csc_proto::Edge::Left,
             position_pct: 0.5,
+            locks: None,
         };
         self.net
             .send_to(&current, encode_switch_leave_bin(&leave_msg))
@@ -814,15 +1086,13 @@ impl Core {
         let leave_msg = SwitchPayload {
             edge: leave.edge,
             position_pct: leave.position_pct,
+            locks: None,
         };
         if let Some(next) = hop.cloned() {
             self.net
                 .send_to(&current, encode_switch_leave_bin(&leave_msg))
                 .await;
-            let enter = SwitchPayload {
-                edge: leave.edge.opposite(),
-                position_pct: leave.position_pct,
-            };
+            let enter = self.enter_payload(leave.edge.opposite(), leave.position_pct);
             self.net
                 .send_to(&next, csc_proto::encode_switch_bin(&enter))
                 .await;
@@ -891,10 +1161,20 @@ impl Core {
         let x = ax - ox;
         let y = ay - oy;
         let dragging = csc_platform::primary_button_down();
+        if self.block_fullscreen && !dragging && csc_platform::foreground_fullscreen() {
+            return;
+        }
         let Some(mut dec) = self.switch.on_local_cursor(x, y, raw, Instant::now()) else {
             return;
         };
         dec.neighbor = self.session_name(&dec.neighbor).await;
+        if self
+            .paused_peers
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&dec.neighbor))
+        {
+            return;
+        }
         let known_screen = self.peer_screens.iter().any(|(k, size)| {
             k.eq_ignore_ascii_case(&dec.neighbor) && size.width > 1 && size.height > 1
         });
@@ -956,10 +1236,7 @@ impl Core {
     async fn enter_remote(&mut self, dec: EnterDecision, x: i32, y: i32) {
         let (ox, oy) = csc_platform::virtual_origin();
         let entry = dec.edge.opposite();
-        let payload = SwitchPayload {
-            edge: entry,
-            position_pct: dec.position_pct,
-        };
+        let payload = self.enter_payload(entry, dec.position_pct);
         self.drag.pointer_left().await;
         self.net
             .send_to(&dec.neighbor, csc_proto::encode_switch_bin(&payload))
@@ -991,8 +1268,14 @@ impl Core {
             csc_platform::warp_cursor(ox + self.park_x, oy + self.park_y);
         }
         self.grab = true;
+        self.virtual_locks = Some(csc_platform::lock_leds());
+        if self.config.read().await.pointer.hide_host_cursor {
+            csc_platform::set_host_cursor_hidden(true);
+        }
         self.grab_armed = false;
         self.set_active_screen(Some(&dec.neighbor)).await;
+        self.flush_pending_clip(&dec.neighbor).await;
+        self.last_local_activity = Instant::now();
         info!(
             "switch enter -> {} at {:?} {:.2} from ({x},{y}) on {:?}, pushed {} px{}",
             dec.neighbor,
@@ -1010,10 +1293,30 @@ impl Core {
 
     // ------------------------------------------------------------ clipboard
 
+    async fn share_peers(&self) -> Vec<String> {
+        let names = self.net.peer_names().await;
+        let layout = ScreenLayout::load(&self.config.read().await.layout);
+        let scoped: Vec<_> = names
+            .iter()
+            .filter(|n| layout.in_share_scope(n))
+            .cloned()
+            .collect();
+        // Until the user places anyone, keep clipping among connected peers.
+        if scoped.is_empty() {
+            names
+        } else {
+            scoped
+        }
+    }
+
     async fn on_clip(&mut self, ev: ClipEvent) {
-        let peers = self.net.peer_names().await;
+        if !self.status.read().await.sharing_enabled {
+            return;
+        }
+        let peers = self.share_peers().await;
         let c = self.config.read().await.clipboard.clone();
         let host = self.is_host().await;
+        let on_switch = c.push_mode == "on_switch";
         self.clip_seq += 1;
         let seq = self.clip_seq;
         match ev {
@@ -1043,7 +1346,11 @@ impl Core {
                     text: Some(text),
                     files: Vec::new(),
                 };
-                self.send_clip_offer(&offer, &peers, None).await;
+                if on_switch {
+                    self.pending_clip = Some(offer);
+                } else {
+                    self.send_clip_offer(&offer, &peers, None).await;
+                }
             }
             ClipEvent::Files(paths) => {
                 info!(
@@ -1058,6 +1365,18 @@ impl Core {
                 if host {
                     self.shared.copied("", seq, true);
                     csc_platform::paste_watch(false);
+                    let files = file_entries(&paths);
+                    let offer = ClipOfferPayload {
+                        seq,
+                        formats: vec!["files".into()],
+                        text: None,
+                        files,
+                    };
+                    if on_switch {
+                        self.pending_clip = Some(offer);
+                    } else {
+                        self.send_clip_offer(&offer, &peers, None).await;
+                    }
                     return;
                 }
                 if peers.is_empty() || !c.files {
@@ -1073,6 +1392,7 @@ impl Core {
                         size: 0,
                         mtime_unix: 0,
                         is_directory: false,
+                        mode: 0,
                     })
                     .collect();
                 let offer = ClipOfferPayload {
@@ -1081,7 +1401,11 @@ impl Core {
                     text: None,
                     files,
                 };
-                self.send_clip_offer(&offer, &peers, None).await;
+                if on_switch {
+                    self.pending_clip = Some(offer);
+                } else {
+                    self.send_clip_offer(&offer, &peers, None).await;
+                }
             }
             ClipEvent::Image(img) => {
                 info!(
@@ -1109,10 +1433,20 @@ impl Core {
                     );
                     return;
                 }
+                if on_switch {
+                    // Images still push immediately; no pending image buffer.
+                }
                 let frame = csc_proto::encode_clip_image_bin(seq, &img.png);
                 self.send_clip_frame(frame, &peers, None).await;
             }
         }
+    }
+
+    async fn flush_pending_clip(&mut self, peer: &str) {
+        let Some(offer) = self.pending_clip.clone() else {
+            return;
+        };
+        self.send_clip_offer(&offer, &[peer.to_string()], None).await;
     }
 
     async fn send_clip_frame(&self, frame: Vec<u8>, peers: &[String], except: Option<&str>) {
@@ -1162,9 +1496,13 @@ impl Core {
     }
 
     async fn on_clip_offer(&mut self, peer: &str, offer: ClipOfferPayload) {
+        if !self.status.read().await.sharing_enabled {
+            return;
+        }
         let host = self.is_host().await;
         let c = self.config.read().await.clipboard.clone();
         if offer.formats.iter().any(|f| f == "files") {
+            self.remote_files = Some((peer.to_string(), offer.seq));
             if host && c.files {
                 info!(
                     "{peer} copied {} file(s); Ctrl+V on another computer fetches them",
@@ -1172,17 +1510,20 @@ impl Core {
                 );
                 self.shared.copied(peer, offer.seq, true);
                 csc_platform::paste_watch(true);
+            } else if !host && c.files {
+                self.arm_paste_placeholders(peer, &offer);
             }
             return;
         }
         let Some(text) = offer.text.clone() else {
             return;
         };
+        self.remote_files = None;
         if host {
             self.shared.copied(peer, offer.seq, false);
             csc_platform::paste_watch(false);
             // Pass it on, so every controlled computer can paste it too.
-            let peers = self.net.peer_names().await;
+            let peers = self.share_peers().await;
             self.send_clip_offer(&offer, &peers, Some(peer)).await;
         }
         if c.enabled && c.text && offer.seq != self.last_remote_clip {
@@ -1192,6 +1533,98 @@ impl Core {
                 text.chars().count()
             );
             self.clip.set_text(text);
+        }
+    }
+
+    fn arm_paste_placeholders(&mut self, peer: &str, offer: &ClipOfferPayload) {
+        let items: Vec<csc_platform::vdrag::DragItem> = offer
+            .files
+            .iter()
+            .map(|e| csc_platform::vdrag::DragItem {
+                relative_path: e.relative_path.clone(),
+                size: e.size,
+                mtime_unix: e.mtime_unix,
+                is_directory: e.is_directory,
+            })
+            .collect();
+        let Some((gen, paths)) = csc_platform::prepare_paste(offer.seq, &items) else {
+            return;
+        };
+        info!(
+            "offering {} placeholder(s) so a paste here can name the folder",
+            paths.len()
+        );
+        self.clip.set_files(paths);
+        self.paste_gen = gen;
+        let tx = self.paste_tx.clone();
+        let peer = peer.to_string();
+        let seq = offer.seq;
+        tokio::task::spawn_blocking(move || {
+            let found = csc_platform::wait_paste(gen, Duration::from_secs(10 * 60));
+            if let Some(paths) = found {
+                let _ = tx.blocking_send(LocatedPaste {
+                    peer,
+                    seq,
+                    gen,
+                    paths,
+                });
+            }
+        });
+    }
+
+    async fn on_located_paste(&mut self, found: LocatedPaste) {
+        if found.gen != self.paste_gen {
+            return;
+        }
+        info!(
+            "paste landed in {} item path(s); asking {} for the files",
+            found.paths.len(),
+            found.peer
+        );
+        self.transfer.expect_paste(found.paths).await;
+        // The computer that was pasted on tells the keyboard host. The host sends the files.
+        let located = PasteLocatedPayload {
+            paste_id: found.seq,
+            ok: true,
+        };
+        if let Ok(frame) = encode_json_frame(MsgType::PasteLocated, &located) {
+            self.net.send_control(&found.peer, frame).await;
+        }
+    }
+
+    /// Tray: save another computer's copied files into the fallback folder.
+    async fn paste_remote_here(&mut self) {
+        if self.is_host().await {
+            if !self.shared.remote_files() {
+                notice::tell(
+                    notice::Kind::Transfer,
+                    "Cross-SystemConnect 文件传输",
+                    "没有其他电脑复制的文件。",
+                    false,
+                );
+                return;
+            }
+            self.transfer.expect_paste(Vec::new()).await;
+            let _ = self.paste(String::new()).await;
+            return;
+        }
+        let Some((peer, seq)) = self.remote_files.clone() else {
+            notice::tell(
+                notice::Kind::Transfer,
+                "Cross-SystemConnect 文件传输",
+                "没有其他电脑复制的文件。",
+                false,
+            );
+            return;
+        };
+        self.transfer.expect_paste(Vec::new()).await;
+        info!("tray paste: telling {peer} the files were pasted here");
+        let located = PasteLocatedPayload {
+            paste_id: seq,
+            ok: true,
+        };
+        if let Ok(frame) = encode_json_frame(MsgType::PasteLocated, &located) {
+            self.net.send_control(&peer, frame).await;
         }
     }
 
@@ -1283,6 +1716,7 @@ impl Core {
         let Ok(begin_frame) = encode_json_frame(MsgType::DragBegin, &begin) else {
             return;
         };
+        self.live_drag = Some(begin.clone());
         match origin {
             ZoneOrigin::Local { dec, x, y } => {
                 self.enter_remote(dec, x, y).await;
@@ -1299,6 +1733,7 @@ impl Core {
                     position_pct: report.position_pct,
                     dragging: true,
                     corner: report.corner,
+                    transfer_id: 0,
                 };
                 if let Ok(frame) = encode_json_frame(MsgType::EdgeHit, &hit) {
                     self.net.send_control(&ready.peer, frame).await;
@@ -1323,10 +1758,11 @@ impl Core {
             }
             return;
         }
-        // The hand is still holding the button. Windows and Wayland need that
-        // press here; the X11 drag source presses it after it grabs the pointer.
-        // The release is what drops the files into the folder under the pointer.
-        if cfg!(windows) || csc_platform::wayland_session() {
+        // The hand is still holding the button. Windows needs that press here.
+        // The X11 source presses after it grabs the pointer. On Wayland the
+        // drag source presses once its popup is under the pointer, so the
+        // press is the one that starts the system drag.
+        if cfg!(windows) {
             self.injector.mouse_button(0, true);
         }
         if !self.is_host().await {
@@ -1334,7 +1770,7 @@ impl Core {
                 button: 0,
                 down: true,
             });
-            self.incoming_drag = Some(peer.to_string());
+            self.incoming_drag = Some((peer.to_string(), begin.transfer_id));
         }
         self.drag.begin(peer.to_string(), begin).await;
     }
@@ -1456,12 +1892,7 @@ impl Core {
             self.show_zone(zone, ZoneOrigin::Controlled(report)).await;
             return;
         }
-        if let Some(from) = self.incoming_drag.take() {
-            info!(
-                "pointer pushed {:?} during the drag from {from}; that drag is cancelled",
-                report.edge
-            );
-        }
+        let carried = self.incoming_drag.as_ref().map(|(_, id)| *id);
         info!(
             "pointer at {:?} pushed {:?} {:.2} (corner {:?})",
             real, report.edge, report.position_pct, report.corner
@@ -1469,8 +1900,9 @@ impl Core {
         let hit = EdgeHitPayload {
             edge: report.edge,
             position_pct: report.position_pct,
-            dragging: false,
+            dragging: carried.is_some(),
             corner: report.corner,
+            transfer_id: carried.unwrap_or(0),
         };
         if let Ok(frame) = encode_json_frame(MsgType::EdgeHit, &hit) {
             self.net.send_control(&host, frame).await;
@@ -1496,8 +1928,59 @@ impl Core {
             "{peer} reports its pointer at {:?} {:.2}; host estimate ({},{})",
             leave.edge, leave.position_pct, self.remote_x, self.remote_y
         );
+        if hit.dragging {
+            if let Some(begin) = self
+                .live_drag
+                .clone()
+                .filter(|b| hit.transfer_id == 0 || b.transfer_id == hit.transfer_id)
+            {
+                self.retarget_drag(peer, leave, begin).await;
+                return;
+            }
+        }
         let dragging = hit.dragging.then(|| peer.to_string());
         self.leave_remote(leave, dragging).await;
+    }
+
+    /// The drag on `peer` crossed an edge. Back to the computer the files came
+    /// from cancels it. Any other computer receives the same drag.
+    async fn retarget_drag(&mut self, peer: &str, leave: EnterDecision, begin: DragBeginPayload) {
+        let local = self.local_name().await;
+        let next = self.switch.neighbor_from_active(leave.edge);
+        let destination = next.clone().unwrap_or_else(|| local.clone());
+        let origin_here = begin.origin.is_empty() || begin.origin.eq_ignore_ascii_case(&local);
+        let back_to_source = if origin_here {
+            destination.eq_ignore_ascii_case(&local)
+        } else {
+            destination.eq_ignore_ascii_case(&begin.origin)
+        };
+        if back_to_source {
+            info!("drag {} returned to its source; cancelling", begin.transfer_id);
+            self.live_drag = None;
+            self.leave_remote(leave, None).await;
+            return;
+        }
+        info!(
+            "drag {} retargeted from {peer} to {destination}",
+            begin.transfer_id
+        );
+        let cancel = DragCancelPayload {
+            transfer_id: begin.transfer_id,
+            reason: "retarget".into(),
+        };
+        if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &cancel) {
+            self.net.send_control(peer, frame).await;
+        }
+        self.transfer
+            .retarget_send(begin.transfer_id, destination.clone())
+            .await;
+        self.leave_remote(leave, None).await;
+        self.live_drag = Some(begin.clone());
+        if destination.eq_ignore_ascii_case(&local) {
+            self.start_drag_here(peer, begin).await;
+        } else if let Ok(frame) = encode_json_frame(MsgType::DragBegin, &begin) {
+            self.net.send_control(&destination, frame).await;
+        }
     }
 
     async fn on_paste_request(&mut self, peer: &str, req: PasteRequestPayload) {
@@ -1520,6 +2003,105 @@ impl Core {
         }
     }
 
+    async fn on_power(&mut self, ev: csc_platform::PowerEvent) {
+        if matches!(
+            ev,
+            csc_platform::PowerEvent::Locked
+                | csc_platform::PowerEvent::Unlocked
+                | csc_platform::PowerEvent::SecureDesktop
+        ) {
+            let state = match ev {
+                csc_platform::PowerEvent::Locked => "locked",
+                csc_platform::PowerEvent::SecureDesktop => "secure_desktop",
+                _ => "normal",
+            };
+            self.send_peer_state(state).await;
+            return;
+        }
+        if ev == csc_platform::PowerEvent::Resumed {
+            info!("woke from sleep; refreshing discovery");
+            self.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            return;
+        }
+        let state = if ev == csc_platform::PowerEvent::ShuttingDown {
+            "shutting_down"
+        } else {
+            "suspending"
+        };
+        info!("power: {state}");
+        self.injected.release_injected(self.injector.as_mut());
+        if self.grab {
+            self.switch.unlock_to_local();
+            release_pointer(&mut self.grab, Some(self.home_point));
+            self.grab_armed = false;
+        }
+        let peers = self.status.read().await.peer_name.clone();
+        let notice = PeerStatePayload {
+            state: state.into(),
+        };
+        let reset = encode_frame(MsgType::InputReset, &[], 0);
+        for peer in peers.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if let Ok(frame) = encode_json_frame(MsgType::PeerState, &notice) {
+                self.net.send_control(peer, frame).await;
+            }
+            self.net.send_control(peer, reset.clone()).await;
+        }
+    }
+
+    async fn send_peer_state(&mut self, state: &str) {
+        let peers = self.status.read().await.peer_name.clone();
+        let Ok(frame) = encode_json_frame(
+            MsgType::PeerState,
+            &PeerStatePayload {
+                state: state.into(),
+            },
+        ) else {
+            return;
+        };
+        for peer in peers.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            self.net.send_control(peer, frame.clone()).await;
+        }
+    }
+
+    async fn on_peer_state(&mut self, peer: &str, state: &str) {
+        info!("peer {peer} state {state}");
+        if state == "locked" || state == "secure_desktop" || state == "normal" {
+            let note = match state {
+                "locked" => format!("{peer} 已锁屏"),
+                "secure_desktop" => format!("{peer} 在安全桌面"),
+                _ => String::new(),
+            };
+            self.status.write().await.peer_note = note;
+            if state == "secure_desktop" {
+                self.paused_peers.insert(peer.to_string());
+                if self.grab && self.switch.active_remote().eq_ignore_ascii_case(peer) {
+                    self.return_home("secure desktop").await;
+                }
+            } else if state == "normal" {
+                self.paused_peers
+                    .retain(|n| !n.eq_ignore_ascii_case(peer));
+            }
+            return;
+        }
+        if state == "suspending" || state == "shutting_down" {
+            self.injected.release_injected(self.injector.as_mut());
+            if self.grab && self.switch.active_remote().eq_ignore_ascii_case(peer) {
+                self.switch.unlock_to_local();
+                release_pointer(&mut self.grab, Some(self.home_point));
+                self.grab_armed = false;
+            }
+            if self.status.read().await.role != "server" {
+                self.status.write().await.host_state = "host_sleeping".into();
+            }
+            notice::tell(
+                notice::Kind::Disconnect,
+                "Cross-SystemConnect",
+                "对方电脑即将休眠",
+                false,
+            );
+        }
+    }
+
     async fn on_from(&mut self, peer: String, msg: MsgType, payload: Vec<u8>) {
         match msg {
             MsgType::ClipOffer => match serde_json::from_slice::<ClipOfferPayload>(&payload) {
@@ -1537,12 +2119,61 @@ impl Core {
                     self.on_paste_request(&peer, req).await;
                 }
             }
+            MsgType::PasteLocated => {
+                if let Ok(located) = serde_json::from_slice::<PasteLocatedPayload>(&payload) {
+                    if located.ok {
+                        self.on_paste_request(
+                            &peer,
+                            PasteRequestPayload {
+                                seq: located.paste_id,
+                                to: String::new(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
             MsgType::DragBegin => {
                 if let Ok(begin) = serde_json::from_slice(&payload) {
                     self.on_drag_begin(peer, begin).await;
                 }
             }
             MsgType::LockScreen => self.lock_all(Some(&peer)).await,
+            MsgType::Activity => {
+                csc_platform::note_user_activity();
+                self.last_local_activity = Instant::now();
+            }
+            MsgType::InputReset => {
+                self.injected.release_injected(self.injector.as_mut());
+            }
+            MsgType::ControlPause => {
+                let Ok(pause) = serde_json::from_slice::<ControlPausePayload>(&payload) else {
+                    return;
+                };
+                if pause.paused {
+                    self.paused_peers.insert(peer.clone());
+                    notice::tell(
+                        notice::Kind::Disconnect,
+                        "Cross-SystemConnect",
+                        &notice::text(
+                            &format!("{peer} 暂停了共享"),
+                            &format!("{peer} paused sharing"),
+                        ),
+                        false,
+                    );
+                    if self.grab && self.switch.active_remote().eq_ignore_ascii_case(&peer) {
+                        self.return_home("peer paused sharing").await;
+                    }
+                } else {
+                    self.paused_peers
+                        .retain(|n| !n.eq_ignore_ascii_case(&peer));
+                }
+            }
+            MsgType::PeerState => {
+                if let Ok(state) = serde_json::from_slice::<PeerStatePayload>(&payload) {
+                    self.on_peer_state(&peer, &state.state).await;
+                }
+            }
             _ => {}
         }
     }
@@ -1580,7 +2211,23 @@ impl Core {
                     .collect();
                 s.peer_name = left.join(", ");
                 s.connected = !s.peer_name.is_empty();
+                if s.role != "server" && s.host_state != "host_sleeping" {
+                    s.host_state = if s.connected {
+                        "connected".into()
+                    } else {
+                        "host_lost".into()
+                    };
+                }
+                let sleeping = s.host_state == "host_sleeping";
                 drop(s);
+                if !sleeping {
+                    notice::tell(
+                        notice::Kind::Disconnect,
+                        "Cross-SystemConnect",
+                        &format!("与 {peer} 断开"),
+                        false,
+                    );
+                }
                 self.shared.peer_gone(&peer);
                 csc_platform::paste_watch(self.shared.remote_files());
                 self.transfer.peer_gone(peer).await;
@@ -1590,6 +2237,17 @@ impl Core {
                     "HELLO from {} ({}x{}, capabilities {:#x})",
                     h.host_name, h.screen_width, h.screen_height, h.capabilities
                 );
+                if self.status.read().await.role != "server" {
+                    self.status.write().await.host_state = "connected".into();
+                }
+                if !h.host_name.is_empty() {
+                    notice::tell(
+                        notice::Kind::Connect,
+                        "Cross-SystemConnect",
+                        &format!("已连接 {}", h.host_name),
+                        false,
+                    );
+                }
                 if h.screen_width > 1 && h.screen_height > 1 {
                     self.peer_screens.insert(
                         h.host_name,
@@ -1630,13 +2288,21 @@ impl Core {
                     self.remote_y,
                 );
                 csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
+                if let Some(locks) = p.locks {
+                    self.match_locks((locks.caps, locks.num, locks.scroll));
+                }
+                csc_platform::set_controlled_hint(Some(
+                    "Controlled  ·  Ctrl+Alt+Shift+P".into(),
+                ));
                 info!(
                     "pointer entered this screen from {:?} at ({}, {})",
                     p.edge, self.remote_x, self.remote_y
                 );
             }
             Some(InboundEvent::SwitchLeave(p)) => {
+                csc_platform::set_controlled_hint(None);
                 debug!(edge = ?p.edge, "switch leave");
+                self.incoming_drag = None;
                 csc_platform::vdrag::cancel_follow();
                 self.drag.pointer_left().await;
                 if !self.grab {
@@ -1647,10 +2313,7 @@ impl Core {
                 let next = self.switch.neighbor_from_active(p.edge);
                 if let Some(next) = next {
                     if !next.eq_ignore_ascii_case(&local) && !next.eq_ignore_ascii_case(&current) {
-                        let enter = SwitchPayload {
-                            edge: p.edge.opposite(),
-                            position_pct: p.position_pct,
-                        };
+                        let enter = self.enter_payload(p.edge.opposite(), p.position_pct);
                         self.net
                             .send_to(&next, csc_proto::encode_switch_bin(&enter))
                             .await;
@@ -1688,6 +2351,9 @@ impl Core {
             }
             Some(InboundEvent::MouseButton { button, down }) => {
                 if !self.grab {
+                    if button == 0 && !down {
+                        csc_platform::vdrag::note_local_release();
+                    }
                     self.injected.track(Captured::Button { button, down });
                     self.injector.mouse_button(button, down);
                 }
@@ -1699,6 +2365,19 @@ impl Core {
             }
             Some(InboundEvent::Key { hid, down }) => {
                 if !self.grab {
+                    if down && hid == HID_ESC && self.incoming_drag.is_some() {
+                        if let Some((peer, id)) = self.incoming_drag.take() {
+                            info!("esc cancels drag {id} from {peer}");
+                            self.drag.pointer_left().await;
+                            let c = DragCancelPayload {
+                                transfer_id: id,
+                                reason: "user".into(),
+                            };
+                            if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &c) {
+                                self.net.send_control(&peer, frame).await;
+                            }
+                        }
+                    }
                     self.injected.track(Captured::Key { hid, down });
                     self.injector.key(hid, down);
                 }
@@ -1714,7 +2393,73 @@ impl Core {
     }
 }
 
+fn uninstall(purge: bool) -> anyhow::Result<()> {
+    if let Some(dir) = dirs::config_dir() {
+        let desk = dir.join("autostart").join("cross-systemconnect.desktop");
+        let _ = std::fs::remove_file(desk);
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let rt = PathBuf::from(runtime);
+        let _ = std::fs::remove_file(rt.join("cross-systemconnect-core.sock"));
+        let _ = std::fs::remove_file(rt.join("cross-systemconnect-core.lock"));
+    }
+    if purge {
+        if let Some(parent) = default_config_path().parent() {
+            for name in ["config.json", "log.txt", "log.txt.1"] {
+                let _ = std::fs::remove_file(parent.join(name));
+            }
+            let _ = std::fs::remove_dir_all(parent.join("crash"));
+        }
+    }
+    eprintln!(
+        "{}",
+        if purge {
+            "removed login entry, config, and logs"
+        } else {
+            "removed login entry; config kept"
+        }
+    );
+    Ok(())
+}
+
+fn install_panic_hook(log_path: Option<PathBuf>) {
+    let dir = log_path
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| default_config_path().parent().map(|p| p.to_path_buf()));
+    let Some(dir) = dir else {
+        return;
+    };
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let crash = dir.join("crash");
+        let _ = std::fs::create_dir_all(&crash);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let body = format!("{info}\n\n{:?}", std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write(crash.join(format!("core-{stamp}.txt")), body);
+        if let Ok(list) = std::fs::read_dir(&crash) {
+            let mut files: Vec<_> = list
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .collect();
+            files.sort_by_key(|e| e.file_name());
+            while files.len() > 5 {
+                let _ = std::fs::remove_file(files.remove(0).path());
+            }
+        }
+        prev(info);
+    }));
+}
+
 pub async fn run() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--uninstall") {
+        let purge = std::env::args().any(|a| a == "--purge");
+        uninstall(purge)?;
+        return Ok(());
+    }
     let config_path = std::env::args()
         .position(|a| a == "--config")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -1725,11 +2470,14 @@ pub async fn run() -> anyhow::Result<()> {
         eprintln!("config load failed, using defaults: {e:#}");
         Config::default()
     });
+    notice::apply(&cfg.notify);
+    notice::set_language(&cfg.gui.language);
     let log = LogControl::init(&cfg.log);
     match log.path() {
         Some(path) => info!("logging to {}", path.display()),
         None => eprintln!("not writing a log file"),
     }
+    install_panic_hook(log.path().map(|p| p.to_path_buf()));
     let _lock = match single_instance_lock() {
         Ok(file) => Some(file),
         Err(e) => {
@@ -1778,6 +2526,10 @@ pub async fn run() -> anyhow::Result<()> {
             csc_config::Role::Client => "announcing".into(),
         },
         pending_peer: None,
+        pairing_code: String::new(),
+        pairing_open_until: 0,
+        peer_note: String::new(),
+        host_state: "no_host".into(),
         discovered: Vec::new(),
         search_subnet: crate::discover::subnet_label(&cfg.search_address).unwrap_or_default(),
         drop_zone: None,
@@ -1785,6 +2537,7 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let (return_hotkey, lock_hotkey) = hotkeys_of(&cfg);
+    let (stay_hotkey, pause_hotkey) = watch_local(&cfg);
     let config = Arc::new(RwLock::new(cfg));
     let status = Arc::new(RwLock::new(status));
     let (quit_tx, mut quit_rx) = watch::channel(false);
@@ -1794,11 +2547,13 @@ pub async fn run() -> anyhow::Result<()> {
     let (transfer, transfer_rx) = crate::transfer::channel();
     let board = crate::progress::TransferBoard::default();
     let (drag_enter_tx, mut drag_enter_rx) = mpsc::channel::<(String, Vec<PathBuf>)>(4);
+    let (paste_here_tx, mut paste_here_rx) = mpsc::channel::<()>(2);
 
     let state = Arc::new(AppState {
         transfer: transfer.clone(),
         board: board.clone(),
         drag_enter: drag_enter_tx,
+        paste_here: paste_here_tx,
         config: config.clone(),
         config_path: config_path.clone(),
         status: status.clone(),
@@ -1876,6 +2631,7 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .await?;
 
+    let (paste_tx, mut paste_rx) = mpsc::channel::<LocatedPaste>(4);
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
     let clip = crate::clipboard::spawn(clip_tx);
     crate::transfer::spawn(transfer_rx, net.clone(), config.clone(), board);
@@ -1916,6 +2672,22 @@ pub async fn run() -> anyhow::Result<()> {
         injected: HeldInput::default(),
         return_hotkey,
         lock_hotkey,
+        stay_hotkey,
+        pause_hotkey,
+        stay_on: false,
+        paused_peers: HashSet::new(),
+        sharing_announced: true,
+        remap: Vec::new(),
+        sync_locks: true,
+        block_fullscreen: true,
+        pointer_speed: 1.0,
+        pointer_peers: HashMap::new(),
+        carry_x: 0.0,
+        carry_y: 0.0,
+        virtual_locks: None,
+        last_local_activity: Instant::now(),
+        last_activity_sent: Instant::now() - Duration::from_secs(30),
+        pending_clip: None,
         last_lock: Instant::now() - LOCK_REPEAT,
         last_miss: Instant::now() - Duration::from_secs(5),
         next_nic: Instant::now(),
@@ -1925,16 +2697,21 @@ pub async fn run() -> anyhow::Result<()> {
         zone_blocked: false,
         drag_pending: false,
         drag_route: None,
+        live_drag: None,
         incoming_drag: None,
+        paste_gen: 0,
+        paste_tx: paste_tx.clone(),
         clip_seq,
         last_remote_clip: 0,
         shared: SharedClip::default(),
         my_files: None,
+        remote_files: None,
         probe: EdgePush::default(),
         last_real: None,
         commanded: None,
         control_ready: Instant::now(),
         last_edge_sent: Instant::now() - Duration::from_secs(5),
+        power_rx: csc_platform::spawn_power_watch(),
     };
     let mut tick = tokio::time::interval(Duration::from_millis(8));
 
@@ -1950,7 +2727,9 @@ pub async fn run() -> anyhow::Result<()> {
             }
             _ = tick.tick() => core.tick().await,
             Some(ev) = clip_rx.recv() => core.on_clip(ev).await,
+            Some(found) = paste_rx.recv() => core.on_located_paste(found).await,
             Some((peer, paths)) = drag_enter_rx.recv() => core.on_drag_enter(peer, paths).await,
+            Some(()) = paste_here_rx.recv() => core.paste_remote_here().await,
             Some(ready) = drag_ready_rx.recv() => core.on_drag_ready(ready).await,
             ev = inbound_rx.recv() => {
                 if !core.on_inbound(ev).await {

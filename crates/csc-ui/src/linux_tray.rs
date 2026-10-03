@@ -36,9 +36,20 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        let sharing = crate::ipc_client::get_status()
+            .ok()
+            .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        let pause_label = if sharing {
+            crate::locale::pause_sharing()
+        } else {
+            crate::locale::resume_sharing()
+        };
         vec![
-            item("设置", UserEvent::ShowSettings),
-            item("退出", UserEvent::Quit),
+            item(crate::locale::settings(), UserEvent::ShowSettings),
+            item(crate::locale::paste(), UserEvent::PasteHere),
+            item(pause_label, UserEvent::ToggleSharing),
+            item(crate::locale::quit(), UserEvent::Quit),
         ]
     }
 }

@@ -28,6 +28,8 @@ pub struct AppState {
     pub board: crate::progress::TransferBoard,
     /// Files dragged into the edge window: (peer, paths).
     pub drag_enter: tokio::sync::mpsc::Sender<(String, Vec<PathBuf>)>,
+    /// Tray asked to paste another computer's files into the fallback folder.
+    pub paste_here: tokio::sync::mpsc::Sender<()>,
 }
 
 fn param_u64(params: &serde_json::Value, keys: &[&str]) -> Option<u64> {
@@ -260,14 +262,24 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             let mut cfg = state.config.write().await;
             let before_role = cfg.role;
             let before_port = cfg.control_port;
+            let before_data = cfg.data_port;
             let before_bind = cfg.bind_address.clone();
             let before_name = cfg.name.clone();
             let before_search = cfg.search_address.clone();
+            let before_manual = cfg.network.manual_peers.clone();
             let before_layout = cfg.layout.clone();
             let before_screens = cfg.screens.clone();
             let before_log = cfg.log.clone();
             match cfg.merge_from_value(req.params) {
-                Ok(()) => match cfg.save(&state.config_path) {
+                Ok(()) => {
+                    if (before_port != cfg.control_port && !port_free(cfg.control_port))
+                        || (before_data != cfg.data_port && !port_free(cfg.data_port))
+                    {
+                        cfg.control_port = before_port;
+                        cfg.data_port = before_data;
+                        return IpcResponse::err(req.id, "端口已被占用");
+                    }
+                    match cfg.save(&state.config_path) {
                     Ok(()) => {
                         if before_log != cfg.log {
                             state.log.apply(&cfg.log);
@@ -276,9 +288,12 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                             || before_port != cfg.control_port
                             || before_bind != cfg.bind_address
                             || before_name != cfg.name
-                            || before_search != cfg.search_address;
+                            || before_search != cfg.search_address
+                            || before_manual != cfg.network.manual_peers;
                         let layout_changed =
                             before_layout != cfg.layout || before_screens != cfg.screens;
+                        crate::notice::apply(&cfg.notify);
+                        crate::notice::set_language(&cfg.gui.language);
                         refresh_status_from_config(state, &cfg).await;
                         drop(cfg);
                         if restart {
@@ -292,7 +307,8 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                         IpcResponse::ok(req.id, json!({"ok": true}))
                     }
                     Err(e) => IpcResponse::err(req.id, e.to_string()),
-                },
+                }
+                }
                 Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
         }
@@ -307,14 +323,38 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .get("hostName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let code = req
+                .params
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let choice = match decision {
-                "trust" => Choice::Trust,
+                "trust" => Choice::Trust { code },
                 "reject" | "cancel" | "once" => Choice::Reject,
                 _ => return IpcResponse::err(req.id, "decision must be trust or reject"),
             };
             match state.prompt.resolve(&state.status, host, choice).await {
                 Ok(()) => IpcResponse::ok(req.id, json!({"ok": true})),
                 Err(e) => IpcResponse::err(req.id, e),
+            }
+        }
+        "forget_peer" => {
+            let host = req
+                .params
+                .get("hostName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if host.is_empty() {
+                return IpcResponse::err(req.id, "hostName is required");
+            }
+            let mut cfg = state.config.write().await;
+            let removed = cfg.forget_peer(&host);
+            match cfg.save(&state.config_path) {
+                Ok(()) => IpcResponse::ok(req.id, json!({"ok": true, "removed": removed})),
+                Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
         }
         "send_files" => {
@@ -393,6 +433,43 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             info!("rescan requested from UI");
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
+        "open_pairing" => {
+            let until = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_add(120);
+            state.status.write().await.pairing_open_until = until;
+            info!("pairing window open until {until}");
+            IpcResponse::ok(req.id, json!({"ok": true, "until": until}))
+        }
+        "reset_data" => {
+            let keep = req
+                .params
+                .get("keepPairing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut cfg = state.config.write().await;
+            let peers = cfg.trusted_peers.clone();
+            let prints = cfg.peer_fingerprints.clone();
+            let device = cfg.device_id.clone();
+            *cfg = csc_config::Config::default();
+            cfg.device_id = device;
+            if keep {
+                cfg.trusted_peers = peers;
+                cfg.peer_fingerprints = prints;
+            }
+            if let Err(e) = cfg.save(&state.config_path) {
+                return IpcResponse::err(req.id, e.to_string());
+            }
+            crate::notice::apply(&cfg.notify);
+            refresh_status_from_config(state, &cfg).await;
+            drop(cfg);
+            state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
+            info!("settings reset (keep pairing: {keep})");
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
         "set_sharing_enabled" => {
             let enabled = req
                 .params
@@ -416,6 +493,20 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 json!({"text": text, "path": shown, "to_file": true}),
             )
         }
+        "export_diagnostics" => {
+            let cfg = state.config.read().await.clone();
+            let log = state.log.path();
+            match export_diagnostics(&cfg, log.as_deref()) {
+                Ok(path) => IpcResponse::ok(req.id, json!({"ok": true, "path": path.display().to_string()})),
+                Err(e) => IpcResponse::err(req.id, e),
+            }
+        }
+        "paste_remote_files" => {
+            if state.paste_here.try_send(()).is_err() {
+                return IpcResponse::err(req.id, "paste is busy");
+            }
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
         "quit" => {
             let quit_tx = state.quit_tx.clone();
             tokio::spawn(async move {
@@ -431,6 +522,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
         }
         other => IpcResponse::err(req.id, format!("unknown method: {other}")),
     }
+}
+
+fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
 fn read_log_tail(path: &std::path::Path, max: u64) -> String {
@@ -457,6 +552,91 @@ fn read_log_tail(path: &std::path::Path, max: u64) -> String {
         }
     }
     text
+}
+
+/// Zip the log and a redacted config. Fingerprints are cut to 8 characters.
+fn export_diagnostics(cfg: &Config, log: Option<&std::path::Path>) -> Result<PathBuf, String> {
+    let mut redacted = cfg.clone();
+    for fp in redacted.peer_fingerprints.values_mut() {
+        if fp.len() > 8 {
+            fp.truncate(8);
+        }
+    }
+    let config_text = serde_json::to_vec_pretty(&redacted).map_err(|e| e.to_string())?;
+    let mut files = vec![("config.json".to_string(), config_text)];
+    if let Some(path) = log {
+        if let Ok(bytes) = std::fs::read(path) {
+            files.push(("log.txt".into(), bytes));
+        }
+    }
+    let parent = log
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = parent.join(format!("diagnostics-{stamp}.zip"));
+    write_store_zip(&dest, &files)?;
+    Ok(dest)
+}
+
+fn write_store_zip(path: &std::path::Path, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    fn u16(n: usize) -> [u8; 2] {
+        (n as u16).to_le_bytes()
+    }
+    fn u32(n: u32) -> [u8; 4] {
+        n.to_le_bytes()
+    }
+    let mut body = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in files {
+        let name = name.as_bytes();
+        let local_at = body.len() as u32;
+        body.extend_from_slice(&u32(0x04034b50));
+        body.extend_from_slice(&u16(20));
+        body.extend_from_slice(&u16(0));
+        body.extend_from_slice(&u16(0));
+        body.extend_from_slice(&u16(0));
+        body.extend_from_slice(&u16(0));
+        body.extend_from_slice(&u32(0));
+        body.extend_from_slice(&u32(data.len() as u32));
+        body.extend_from_slice(&u32(data.len() as u32));
+        body.extend_from_slice(&u16(name.len()));
+        body.extend_from_slice(&u16(0));
+        body.extend_from_slice(name);
+        body.extend_from_slice(data);
+        central.extend_from_slice(&u32(0x02014b50));
+        central.extend_from_slice(&u16(20));
+        central.extend_from_slice(&u16(20));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u32(0));
+        central.extend_from_slice(&u32(data.len() as u32));
+        central.extend_from_slice(&u32(data.len() as u32));
+        central.extend_from_slice(&u16(name.len()));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u16(0));
+        central.extend_from_slice(&u32(0));
+        central.extend_from_slice(&u32(local_at));
+        central.extend_from_slice(name);
+    }
+    let central_at = body.len() as u32;
+    body.extend_from_slice(&central);
+    body.extend_from_slice(&u32(0x06054b50));
+    body.extend_from_slice(&u16(0));
+    body.extend_from_slice(&u16(0));
+    body.extend_from_slice(&u16(files.len()));
+    body.extend_from_slice(&u16(files.len()));
+    body.extend_from_slice(&u32(central.len() as u32));
+    body.extend_from_slice(&u32(central_at));
+    body.extend_from_slice(&u16(0));
+    std::fs::write(path, body).map_err(|e| e.to_string())
 }
 
 async fn refresh_status_from_config(state: &AppState, cfg: &Config) {

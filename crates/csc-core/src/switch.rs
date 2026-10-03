@@ -86,6 +86,8 @@ pub struct SwitchController {
     /// Host currently receiving the pointer, when `state` is remote.
     active_remote: String,
     enabled: bool,
+    /// A held modifier, or “stay on this screen”, is blocking an edge crossing.
+    blocked: bool,
     pending_edge: Option<Edge>,
     pending_since: Option<Instant>,
     pending_second_tap: bool,
@@ -113,6 +115,7 @@ impl Default for SwitchController {
             state: SwitchState::Local,
             active_remote: String::new(),
             enabled: true,
+            blocked: false,
             pending_edge: None,
             pending_since: None,
             pending_second_tap: false,
@@ -193,6 +196,14 @@ impl SwitchController {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    pub fn set_blocked(&mut self, blocked: bool) {
+        if blocked && !self.blocked {
+            self.push.reset();
+            self.pending_edge = None;
+        }
+        self.blocked = blocked;
     }
 
     pub fn enabled(&self) -> bool {
@@ -437,7 +448,7 @@ impl SwitchController {
         raw: Option<(i32, i32)>,
         now: Instant,
     ) -> Option<EnterDecision> {
-        if !self.enabled || self.state != SwitchState::Local {
+        if !self.enabled || self.blocked || self.state != SwitchState::Local {
             return None;
         }
         let moved = self

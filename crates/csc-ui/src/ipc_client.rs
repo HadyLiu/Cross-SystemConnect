@@ -4,8 +4,11 @@ use csc_proto::{encode_ipc_message, try_decode_ipc_message, IpcRequest, IpcRespo
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(windows))]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Set before the kernel is asked to exit, so status polling does not start a new one.
@@ -13,6 +16,7 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 pub const CORE_PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
+#[cfg(not(windows))]
 pub const CORE_BIN: &str = "Cross-SystemConnect-core";
 
 fn ipc_endpoint() -> String {
@@ -121,11 +125,13 @@ pub fn try_connect() -> bool {
         .is_ok()
 }
 
+#[cfg(not(windows))]
 struct StartFailure {
     at: Instant,
     message: String,
 }
 
+#[cfg(not(windows))]
 fn start_failure() -> &'static Mutex<Option<StartFailure>> {
     static SLOT: Mutex<Option<StartFailure>> = Mutex::new(None);
     &SLOT
@@ -259,14 +265,34 @@ pub fn rescan() -> anyhow::Result<Value> {
     call("rescan", json!({}))
 }
 
+pub fn open_pairing() -> anyhow::Result<Value> {
+    call("open_pairing", json!({}))
+}
+
+pub fn reset_data(keep_pairing: bool) -> anyhow::Result<Value> {
+    call("reset_data", json!({"keepPairing": keep_pairing}))
+}
+
+pub fn set_sharing_enabled(enabled: bool) -> anyhow::Result<Value> {
+    call("set_sharing_enabled", json!({"enabled": enabled}))
+}
+
+pub fn export_diagnostics() -> anyhow::Result<Value> {
+    call("export_diagnostics", json!({}))
+}
+
 pub fn get_logs() -> anyhow::Result<Value> {
     call("get_logs", json!({}))
 }
 
-pub fn resolve_peer(host_name: &str, decision: &str) -> anyhow::Result<Value> {
+pub fn forget_peer(host_name: &str) -> anyhow::Result<Value> {
+    call("forget_peer", json!({"hostName": host_name}))
+}
+
+pub fn resolve_peer(host_name: &str, decision: &str, code: &str) -> anyhow::Result<Value> {
     call(
         "resolve_peer",
-        json!({"hostName": host_name, "decision": decision}),
+        json!({"hostName": host_name, "decision": decision, "code": code}),
     )
 }
 

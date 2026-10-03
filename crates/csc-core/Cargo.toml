@@ -14,6 +14,7 @@ path = "src/bin_main.rs"
 
 [dependencies]
 anyhow.workspace = true
+getrandom = "0.2.17"
 bytes.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

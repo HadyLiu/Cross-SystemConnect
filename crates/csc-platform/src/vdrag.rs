@@ -79,6 +79,9 @@ impl DragEvent {
 static POINTER_X: AtomicI32 = AtomicI32::new(0);
 static POINTER_Y: AtomicI32 = AtomicI32::new(0);
 static FOLLOW_CANCEL: AtomicBool = AtomicBool::new(false);
+/// Set when the local left button goes up. A drag that has not pressed yet
+/// must not press afterwards and leave the button stuck.
+static EARLY_RELEASE: AtomicBool = AtomicBool::new(false);
 
 /// Latest pointer position on this screen, in the same pixels as the monitors.
 pub fn note_pointer(x: i32, y: i32) {
@@ -86,6 +89,7 @@ pub fn note_pointer(x: i32, y: i32) {
     POINTER_Y.store(y, Ordering::Relaxed);
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn pointed() -> (i32, i32) {
     (
         POINTER_X.load(Ordering::Relaxed),
@@ -96,6 +100,17 @@ pub(crate) fn pointed() -> (i32, i32) {
 /// Allow the next drag-follow to run.
 pub fn arm_follow() {
     FOLLOW_CANCEL.store(false, Ordering::Release);
+    EARLY_RELEASE.store(false, Ordering::Release);
+}
+
+/// The left button was released on this computer.
+pub fn note_local_release() {
+    EARLY_RELEASE.store(true, Ordering::Release);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn released_early() -> bool {
+    EARLY_RELEASE.load(Ordering::Acquire)
 }
 
 /// The pointer left this screen; a button release must not count as a drop.
@@ -103,6 +118,7 @@ pub fn cancel_follow() {
     FOLLOW_CANCEL.store(true, Ordering::Release);
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn follow_cancelled() -> bool {
     FOLLOW_CANCEL.load(Ordering::Acquire)
 }
@@ -159,7 +175,11 @@ pub fn start(desc: DragDesc, events: std::sync::mpsc::Sender<DragEvent>) -> bool
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        crate::linux::xdnd::start(desc, events)
+        if crate::linux::wayland_session() {
+            crate::linux::gtkdrag::start(desc, events)
+        } else {
+            crate::linux::xdnd::start(desc, events)
+        }
     }
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
@@ -173,7 +193,13 @@ pub fn cancel(id: u64) {
     #[cfg(windows)]
     crate::win::dragsrc::cancel(id);
     #[cfg(all(unix, not(target_os = "macos")))]
-    crate::linux::xdnd::cancel(id);
+    {
+        if crate::linux::wayland_session() {
+            crate::linux::gtkdrag::cancel(id);
+        } else {
+            crate::linux::xdnd::cancel(id);
+        }
+    }
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     let _ = id;
 }

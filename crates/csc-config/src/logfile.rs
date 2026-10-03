@@ -1,11 +1,12 @@
-//! Log files that never grow past `LOG_CAP_BYTES`: once full, the file is emptied and starts over.
+//! Log files that never grow past `LOG_CAP_BYTES`. Once full, the current file
+//! is copied to `stem.1.ext` (for `log.txt` → `log.1.txt`) and the live file starts over.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub const LOG_CAP_BYTES: u64 = 100 * 1024;
+pub const LOG_CAP_BYTES: u64 = 1024 * 1024;
 
 pub struct CappedLog {
     path: PathBuf,
@@ -33,7 +34,7 @@ impl CappedLog {
             size,
         };
         if log.size >= LOG_CAP_BYTES {
-            log.clear()?;
+            log.rotate()?;
         }
         Ok(log)
     }
@@ -49,16 +50,39 @@ impl CappedLog {
         Ok(())
     }
 
+    /// Keep one previous file as `stem.1.ext` (e.g. `log.1.txt`), then empty the live file.
+    fn rotate(&mut self) -> io::Result<()> {
+        let previous = std::fs::read(&self.path).unwrap_or_default();
+        let bak = backup_path(&self.path);
+        let _ = std::fs::remove_file(&bak);
+        if !previous.is_empty() {
+            std::fs::write(&bak, previous)?;
+        }
+        self.clear()?;
+        let note = b"-- previous log moved aside --\n";
+        self.file.write_all(note)?;
+        self.size = note.len() as u64;
+        Ok(())
+    }
+
     pub fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.size + buf.len() as u64 > LOG_CAP_BYTES {
-            self.clear()?;
-            let note = b"-- log reached 100 KB and was cleared --\n";
-            self.file.write_all(note)?;
-            self.size = note.len() as u64;
+            self.rotate()?;
         }
         self.file.write_all(buf)?;
         self.size += buf.len() as u64;
         Ok(())
+    }
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("log");
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => path.with_file_name(format!("{stem}.1.{ext}")),
+        None => path.with_file_name(format!("{stem}.1")),
     }
 }
 
@@ -105,19 +129,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut log = CappedLog::open(&path).unwrap();
         let line = vec![b'x'; 1000];
-        for _ in 0..102 {
-            log.write(&line).unwrap();
-        }
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 102_000);
         log.write(&line).unwrap();
-        let len = std::fs::metadata(&path).unwrap().len();
-        assert!(len < 2_000, "log was not cleared: {len}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1000);
         drop(log);
 
         std::fs::write(&path, vec![b'y'; LOG_CAP_BYTES as usize + 10]).unwrap();
         let mut log = CappedLog::open(&path).unwrap();
         log.write(b"new\n").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        let bak = backup_path(&path);
+        assert!(std::fs::metadata(&bak).unwrap().len() > LOG_CAP_BYTES);
+        assert_eq!(bak.file_name().and_then(|n| n.to_str()), Some("log.1.txt"));
+        let live = std::fs::read(&path).unwrap();
+        assert!(live.ends_with(b"new\n"), "{live:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

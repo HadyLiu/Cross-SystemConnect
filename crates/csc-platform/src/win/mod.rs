@@ -1,4 +1,6 @@
 mod capture;
+pub mod power;
+mod paste_dir;
 pub mod dragsrc;
 pub mod hook;
 mod host_net;
@@ -14,6 +16,7 @@ pub use screen::primary_button_down;
 pub use screen::set_cursor_visible;
 pub use screen::virtual_origin;
 pub use screen::warp_cursor;
+pub use paste_dir::paste_folder;
 pub use screen::WinScreenInfo;
 
 pub fn disable_udp_connreset(raw: std::os::windows::io::RawSocket) {

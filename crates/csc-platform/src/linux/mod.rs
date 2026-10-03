@@ -1,6 +1,12 @@
 pub(crate) mod badge;
+pub(crate) mod fullscreen;
+pub(crate) mod cursor;
+pub(crate) mod hint;
+pub(crate) mod leds;
+pub(crate) mod power;
 pub(crate) mod drop_folder;
 pub mod grab;
+pub(crate) mod gtkdrag;
 mod uinput;
 pub mod xdnd;
 mod xdo;
@@ -97,6 +103,11 @@ impl InputInjector for LinuxInputInjector {
             xdo::key(code as u32 + 8, down);
         }
     }
+}
+
+/// Folder to paste files into, when the focus is a file manager or the desktop.
+pub(crate) fn paste_folder() -> Option<std::path::PathBuf> {
+    drop_folder::paste_folder()
 }
 
 /// Wayland turns XTest into a Remote Desktop prompt. Inject with uinput instead.

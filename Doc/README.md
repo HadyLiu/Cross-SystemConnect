@@ -58,10 +58,10 @@
 bash scripts/package-docker.sh
 ```
 
-产物在 `dist/linux/` 与 `dist/windows/`（界面与内核各一个，另有两个压缩包）。开发与测试：
+产物在 `dist/linux/` 与 `dist/windows/`（界面与内核各一个，另有两个压缩包）。单元测试与静态检查同样在该镜像内：
 
 ```bash
-cargo test --workspace
+bash scripts/check-docker.sh
 ```
 
 性能测量（延迟 P50/P99、吞吐）：两端开启测量模式后运行 `Cross-SystemConnect-core --bench latency --peer <名字>`，方法见 [架构设计](架构设计.md) §12.15。

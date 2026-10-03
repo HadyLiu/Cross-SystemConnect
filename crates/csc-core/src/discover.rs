@@ -9,24 +9,25 @@ use std::time::{Duration, Instant};
 pub const REPROMPT_GAP: Duration = Duration::from_secs(4);
 
 const MAGIC: &[u8] = b"CSCD";
-const VERSION: u8 = 1;
-const KIND_ANNOUNCE: u8 = 1;
-const KIND_SEARCH: u8 = 2;
+const VERSION: u8 = 2;
+const KIND_PROBE: u8 = 1;
+const KIND_REPLY: u8 = 2;
+const KIND_ANNOUNCE: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Announce {
     pub name: String,
+    /// Same as `name`. Kept so callers can match the computer name.
     pub host_name: String,
-    pub tcp_port: u16,
+    pub control_port: u16,
+    pub data_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Datagram {
     Announce(Announce),
-    Search,
-    /// A search sent straight to one client by a host that has no session with it.
-    /// A client that still believes it is linked to that host holds a dead session.
-    SearchUnlinked,
+    /// Host scan. Carries the host's control and data ports.
+    Search(Announce),
 }
 
 #[derive(Debug, Clone)]
@@ -46,58 +47,76 @@ pub fn suppress_repeat(mark: &mut RejectMark, now: Instant) -> bool {
     gap < REPROMPT_GAP
 }
 
-pub fn encode_search() -> Vec<u8> {
-    let mut out = Vec::with_capacity(6);
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.push(KIND_SEARCH);
-    out
+pub fn encode_search(control_port: u16, data_port: u16, name: &str) -> Vec<u8> {
+    encode_packet(KIND_PROBE, control_port, data_port, name)
 }
 
-/// Search with a trailing "not linked" flag. Older builds read it as a plain search.
-pub fn encode_search_unlinked() -> Vec<u8> {
-    let mut out = encode_search();
-    out.push(1);
-    out
+/// A probe. The controlled computer answers with a reply.
+pub fn encode_search_unlinked(control_port: u16, data_port: u16, name: &str) -> Vec<u8> {
+    encode_search(control_port, data_port, name)
 }
 
 pub fn encode_announce(a: &Announce) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + a.name.len() + a.host_name.len() + 6);
+    let name = if a.name.is_empty() { &a.host_name } else { &a.name };
+    encode_packet(KIND_REPLY, a.control_port, a.data_port, name)
+}
+
+#[cfg(test)]
+pub fn encode_port_announce(a: &Announce) -> Vec<u8> {
+    let name = if a.name.is_empty() { &a.host_name } else { &a.name };
+    encode_packet(KIND_ANNOUNCE, a.control_port, a.data_port, name)
+}
+
+fn encode_packet(kind: u8, control_port: u16, data_port: u16, name: &str) -> Vec<u8> {
+    let name = clip_name(name);
+    let mut out = Vec::with_capacity(11 + name.len());
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
-    out.push(KIND_ANNOUNCE);
-    write_str(&mut out, &a.name);
-    write_str(&mut out, &a.host_name);
-    out.extend_from_slice(&a.tcp_port.to_le_bytes());
+    out.push(kind);
+    out.extend_from_slice(&control_port.to_le_bytes());
+    out.extend_from_slice(&data_port.to_le_bytes());
+    out.push(name.len() as u8);
+    out.extend_from_slice(name);
     out
 }
 
 pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
-    if buf.len() < 6 || &buf[0..4] != MAGIC || buf[4] != VERSION {
+    if buf.len() < 11 || &buf[0..4] != MAGIC || buf[4] != VERSION {
         return None;
     }
+    let control_port = u16::from_le_bytes([buf[6], buf[7]]);
+    let data_port = u16::from_le_bytes([buf[8], buf[9]]);
+    if control_port == 0 || data_port == 0 || control_port == data_port {
+        return None;
+    }
+    let name_len = buf[10] as usize;
+    if name_len > 63 || buf.len() < 11 + name_len {
+        return None;
+    }
+    let name = std::str::from_utf8(&buf[11..11 + name_len]).ok()?.to_string();
+    let ann = Announce {
+        host_name: name.clone(),
+        name,
+        control_port,
+        data_port,
+    };
     match buf[5] {
-        KIND_SEARCH if buf.get(6) == Some(&1) => Some(Datagram::SearchUnlinked),
-        KIND_SEARCH => Some(Datagram::Search),
-        KIND_ANNOUNCE => {
-            let mut off = 6;
-            let name = read_str(buf, &mut off)?;
-            let host_name = read_str(buf, &mut off)?;
-            if off + 2 > buf.len() {
-                return None;
-            }
-            let tcp_port = u16::from_le_bytes([buf[off], buf[off + 1]]);
-            if name.is_empty() && host_name.is_empty() {
-                return None;
-            }
-            Some(Datagram::Announce(Announce {
-                name,
-                host_name,
-                tcp_port,
-            }))
-        }
+        KIND_PROBE => Some(Datagram::Search(ann)),
+        KIND_REPLY | KIND_ANNOUNCE => Some(Datagram::Announce(ann)),
         _ => None,
     }
+}
+
+fn clip_name(name: &str) -> &[u8] {
+    let bytes = name.as_bytes();
+    if bytes.len() <= 63 {
+        return bytes;
+    }
+    let mut n = 63;
+    while n > 0 && !name.is_char_boundary(n) {
+        n -= 1;
+    }
+    &bytes[..n]
 }
 
 pub fn ipv4_octets(ip: &str) -> Option<[u8; 4]> {
@@ -189,28 +208,6 @@ fn slash24_broadcast(ip: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(p[0], p[1], p[2], 255))
 }
 
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    let n = u16::try_from(b.len()).unwrap_or(u16::MAX) as usize;
-    let n = n.min(b.len());
-    out.extend_from_slice(&(n as u16).to_le_bytes());
-    out.extend_from_slice(&b[..n]);
-}
-
-fn read_str(buf: &[u8], off: &mut usize) -> Option<String> {
-    if *off + 2 > buf.len() {
-        return None;
-    }
-    let n = u16::from_le_bytes([buf[*off], buf[*off + 1]]) as usize;
-    *off += 2;
-    if n > 512 || *off + n > buf.len() {
-        return None;
-    }
-    let s = std::str::from_utf8(&buf[*off..*off + n]).ok()?.to_string();
-    *off += n;
-    Some(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,21 +217,45 @@ mod tests {
         let a = Announce {
             name: "Desk".into(),
             host_name: "OFFICE-PC".into(),
-            tcp_port: 24900,
+            control_port: 24900,
+            data_port: 24901,
         };
         match decode_datagram(&encode_announce(&a)) {
-            Some(Datagram::Announce(got)) => assert_eq!(got, a),
+            Some(Datagram::Announce(got)) => {
+                assert_eq!(got.control_port, a.control_port);
+                assert_eq!(got.data_port, a.data_port);
+                assert_eq!(got.name, "Desk");
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
 
     #[test]
     fn search_packet() {
-        assert_eq!(decode_datagram(&encode_search()), Some(Datagram::Search));
-        assert_eq!(
-            decode_datagram(&encode_search_unlinked()),
-            Some(Datagram::SearchUnlinked)
-        );
+        let raw = encode_search(24900, 24901, "host");
+        match decode_datagram(&raw) {
+            Some(Datagram::Search(a)) => {
+                assert_eq!(a.control_port, 24900);
+                assert_eq!(a.data_port, 24901);
+                assert_eq!(a.name, "host");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(decode_datagram(&encode_search(24900, 24900, "host")).is_none());
+    }
+
+    #[test]
+    fn port_change_announce_is_accepted() {
+        let a = Announce {
+            name: "Desk".into(),
+            host_name: String::new(),
+            control_port: 25000,
+            data_port: 25001,
+        };
+        match decode_datagram(&encode_port_announce(&a)) {
+            Some(Datagram::Announce(got)) => assert_eq!(got.control_port, 25000),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
