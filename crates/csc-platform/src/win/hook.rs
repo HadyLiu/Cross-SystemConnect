@@ -218,8 +218,9 @@ fn hook_thread(ready: std::sync::mpsc::Sender<bool>) {
 }
 
 /// Start or stop swallowing input. `park` is the absolute screen point the
-/// cursor is held at while grabbed. With raw input the cursor is clipped to
-/// that point, so the screen edge cannot stop the pointer on the other computer.
+/// cursor is held at while grabbed. Clip to a pad around that point so a fast
+/// flick cannot reach the desktop edge and stop, while hook deltas still work
+/// when raw input is silent.
 pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     if let Some((x, y)) = park {
         PARK_X.store(x, Ordering::SeqCst);
@@ -231,14 +232,15 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     crate::keyrepeat::reset();
     GRAB.store(grab, Ordering::SeqCst);
     unsafe {
-        if grab && RAW_OK.load(Ordering::Relaxed) {
+        if grab {
             let x = PARK_X.load(Ordering::SeqCst);
             let y = PARK_Y.load(Ordering::SeqCst);
+            const PAD: i32 = 96;
             let _ = ClipCursor(Some(&RECT {
-                left: x,
-                top: y,
-                right: x + 1,
-                bottom: y + 1,
+                left: x - PAD,
+                top: y - PAD,
+                right: x + PAD + 1,
+                bottom: y + PAD + 1,
             }));
         } else {
             let _ = ClipCursor(None);
@@ -284,11 +286,11 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     let dx = info.pt.x - park_x;
                     let dy = info.pt.y - park_y;
                     if dx != 0 || dy != 0 {
-                        // Without raw input the cursor itself is the measurement.
-                        // Put it back before it reaches the screen edge and stops.
-                        if !RAW_OK.load(Ordering::Relaxed) {
-                            let _ = SetCursorPos(park_x, park_y);
-                        }
+                        // Put it back before it reaches the clip pad or the
+                        // screen edge and stops. Needed even with raw input:
+                        // some devices report raw as zero, and a 1 px clip then
+                        // leaves the remote pointer unable to cover the screen.
+                        let _ = SetCursorPos(park_x, park_y);
                     }
                     (dx != 0 || dy != 0).then_some(Captured::Move { dx, dy })
                 }

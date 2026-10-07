@@ -14,9 +14,11 @@ cargo build --release --locked --target x86_64-pc-windows-gnu -p csc-core -p csc
 mkdir -p dist/linux dist/windows
 cp -f target/release/Cross-SystemConnect \
       target/release/Cross-SystemConnect-core \
+      resources/app.png \
       dist/linux/
 cp -f target/x86_64-pc-windows-gnu/release/Cross-SystemConnect.exe \
       target/x86_64-pc-windows-gnu/release/Cross-SystemConnect-core.exe \
+      resources/app.ico \
       dist/windows/
 rm -f dist/Cross-SystemConnect-linux-x86_64.tar.gz \
       dist/Cross-SystemConnect-windows-x86_64.zip

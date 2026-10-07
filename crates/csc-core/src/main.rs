@@ -108,21 +108,29 @@ fn inject_controlled_delta(
 }
 
 /// Place the pointer when control arrives. On Linux this is one relative jump
-/// from wherever the pointer already is. On Wayland the X cursor does not follow
-/// the virtual device, so later jumps continue from the last position we sent.
+/// from wherever the pointer already is. On Wayland the compositor cursor cannot
+/// be read, so a jump from a guessed origin lands short and later moves cannot
+/// cover the rest of the screen. Pin to the top-left of the desktop first.
 fn inject_controlled_jump(
     injector: &mut dyn csc_platform::InputInjector,
     commanded: &mut Option<(i32, i32)>,
     x: i32,
     y: i32,
+    screen: csc_platform::ScreenSize,
 ) {
-    if cfg!(target_os = "linux") {
-        let origin = if csc_platform::wayland_session() {
-            (*commanded).or_else(x11_pointer)
-        } else {
-            x11_pointer()
-        };
-        if let Some((cx, cy)) = origin {
+    #[cfg(target_os = "linux")]
+    {
+        if csc_platform::wayland_session() {
+            let (pin_x, pin_y) = wayland_pin_delta(screen);
+            injector.mouse_move_rel(pin_x, pin_y);
+            injector.mouse_move_rel(pin_x, pin_y);
+            if x != 0 || y != 0 {
+                injector.mouse_move_rel(x, y);
+            }
+            *commanded = Some((x, y));
+            return;
+        }
+        if let Some((cx, cy)) = x11_pointer() {
             let dx = x.saturating_sub(cx);
             let dy = y.saturating_sub(cy);
             if dx != 0 || dy != 0 {
@@ -131,14 +139,25 @@ fn inject_controlled_jump(
         } else {
             injector.mouse_move_abs(x, y);
         }
-        if csc_platform::wayland_session() {
-            *commanded = Some((x, y));
-        }
         return;
     }
-    injector.mouse_move_abs(x, y);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (commanded, screen);
+        injector.mouse_move_abs(x, y);
+    }
 }
 
+/// Large enough to hit the top-left of any desktop from an unknown cursor.
+#[cfg(target_os = "linux")]
+fn wayland_pin_delta(screen: csc_platform::ScreenSize) -> (i32, i32) {
+    (
+        -screen.width.max(1).saturating_mul(2).max(4096),
+        -screen.height.max(1).saturating_mul(2).max(4096),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn x11_pointer() -> Option<(i32, i32)> {
     let (ax, ay) = csc_platform::cursor_pos()?;
     let (ox, oy) = csc_platform::virtual_origin();
@@ -2286,6 +2305,7 @@ impl Core {
                     &mut self.commanded,
                     self.remote_x,
                     self.remote_y,
+                    screen,
                 );
                 csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
                 if let Some(locks) = p.locks {
@@ -2301,6 +2321,7 @@ impl Core {
             }
             Some(InboundEvent::SwitchLeave(p)) => {
                 csc_platform::set_controlled_hint(None);
+                self.commanded = None;
                 debug!(edge = ?p.edge, "switch leave");
                 self.incoming_drag = None;
                 csc_platform::vdrag::cancel_follow();
@@ -2800,6 +2821,22 @@ mod tests {
         let right_win: HashSet<u32> = [0xE7].into_iter().collect();
         assert!(lock.completes(0x0F, &right_win));
         assert!(!lock.completes(0x0F, &ctrl_alt));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_pin_covers_the_desktop() {
+        let d = super::wayland_pin_delta(csc_platform::ScreenSize {
+            width: 1920,
+            height: 1080,
+        });
+        assert!(d.0 <= -3840);
+        assert!(d.1 <= -2160);
+        let small = super::wayland_pin_delta(csc_platform::ScreenSize {
+            width: 800,
+            height: 600,
+        });
+        assert_eq!(small, (-4096, -4096));
     }
 
     #[test]
