@@ -837,7 +837,12 @@ impl Core {
             }
         }
         if !self.grab && csc_platform::paste_hits() > 0 {
-            self.paste(String::new()).await;
+            if self.is_host().await {
+                self.paste(String::new()).await;
+            } else {
+                // Windows client: paste_watch caught Ctrl+V; tell the host.
+                self.paste_remote_here().await;
+            }
         }
         self.zone_upkeep().await;
 
@@ -913,13 +918,21 @@ impl Core {
         if self.drag_pending {
             return;
         }
-        let near = csc_platform::cursor_pos().is_some_and(|(x, y)| {
-            x >= zone.x - 48
-                && x < zone.x + zone.width + 48
-                && y >= zone.y - 48
-                && y < zone.y + zone.height + 48
-        });
-        if !dragging || !near {
+        // Wayland controlled: X cursor_pos does not track the uinput pointer, so
+        // a failed/stale read must not clear the zone before DropEnter arrives.
+        let near = match csc_platform::cursor_pos() {
+            Some((x, y)) => {
+                x >= zone.x - 48
+                    && x < zone.x + zone.width + 48
+                    && y >= zone.y - 48
+                    && y < zone.y + zone.height + 48
+            }
+            None => true,
+        };
+        let keep_controlled = matches!(self.zone_origin, Some(ZoneOrigin::Controlled(_)))
+            && dragging
+            && csc_platform::wayland_session();
+        if !dragging || !(near || keep_controlled) {
             self.clear_zone().await;
         }
     }
@@ -1016,6 +1029,17 @@ impl Core {
         if let Captured::Key { hid, down: false } = step {
             if !self.held.keys.contains(&hid) {
                 // Release of a key the remote never saw (hotkey, caught Ctrl+V).
+                return false;
+            }
+        }
+        if let Captured::Button {
+            button,
+            down: false,
+        } = step
+        {
+            if !self.held.buttons.contains(&button) {
+                // Spurious up after Esc-cancel / grab start must not abort the
+                // remote virtual drag that just pressed its own button.
                 return false;
             }
         }
@@ -1402,18 +1426,8 @@ impl Core {
                     info!("copied files are not offered: no keyboard host, or file copying is off");
                     return;
                 }
-                // Only names go out; the files are sent when someone pastes them.
-                let files = paths
-                    .iter()
-                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-                    .map(|n| FileEntry {
-                        relative_path: n.to_string(),
-                        size: 0,
-                        mtime_unix: 0,
-                        is_directory: false,
-                        mode: 0,
-                    })
-                    .collect();
+                // Full entries so the paste side can build correct placeholders.
+                let files = file_entries(&paths);
                 let offer = ClipOfferPayload {
                     seq,
                     formats: vec!["files".into()],
@@ -1522,15 +1536,27 @@ impl Core {
         let c = self.config.read().await.clipboard.clone();
         if offer.formats.iter().any(|f| f == "files") {
             self.remote_files = Some((peer.to_string(), offer.seq));
-            if host && c.files {
+            if !c.files {
+                return;
+            }
+            if host {
                 info!(
                     "{peer} copied {} file(s); Ctrl+V on another computer fetches them",
                     offer.files.len()
                 );
                 self.shared.copied(peer, offer.seq, true);
-                csc_platform::paste_watch(true);
-            } else if !host && c.files {
+                // Linux uses clipboard placeholders (no XGrabKey). Windows host
+                // still intercepts Ctrl+V via paste_watch.
+                if cfg!(windows) {
+                    csc_platform::paste_watch(true);
+                }
+                #[cfg(target_os = "linux")]
                 self.arm_paste_placeholders(peer, &offer);
+            } else if cfg!(target_os = "linux") {
+                self.arm_paste_placeholders(peer, &offer);
+            } else if cfg!(windows) {
+                // Windows client cannot build X11 placeholders; catch Ctrl+V.
+                csc_platform::paste_watch(true);
             }
             return;
         }
@@ -1739,6 +1765,11 @@ impl Core {
         match origin {
             ZoneOrigin::Local { dec, x, y } => {
                 self.enter_remote(dec, x, y).await;
+                // The physical button is still down; seed held so a spurious
+                // unpaired up from Esc-cancel is dropped instead of forwarded.
+                if csc_platform::primary_button_down() {
+                    self.held.buttons.insert(0);
+                }
                 self.net.send_control(&ready.peer, begin_frame).await;
                 info!(
                     "dragging {} item(s) onto {}",
@@ -1832,13 +1863,29 @@ impl Core {
         self.remote_y = self.remote_y.saturating_add(dy).clamp(0, h - 1);
         let applied = (self.remote_x - prev.0, self.remote_y - prev.1);
         csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
-        inject_controlled_delta(
-            self.injector.as_mut(),
-            self.remote_x,
-            self.remote_y,
-            applied.0,
-            applied.1,
-        );
+        // Wayland: if the logical pointer is already at a clamp edge but the
+        // host still sends motion, re-pin so the real uinput cursor can catch up
+        // (a short first jump leaves the left/top edge unreachable).
+        if csc_platform::wayland_session()
+            && (dx != 0 || dy != 0)
+            && applied == (0, 0)
+        {
+            inject_controlled_jump(
+                self.injector.as_mut(),
+                &mut self.commanded,
+                self.remote_x,
+                self.remote_y,
+                self.screen,
+            );
+        } else {
+            inject_controlled_delta(
+                self.injector.as_mut(),
+                self.remote_x,
+                self.remote_y,
+                applied.0,
+                applied.1,
+            );
+        }
         let (ox, oy) = csc_platform::virtual_origin();
         let (at, moved, real) = if csc_platform::wayland_session() {
             self.commanded = Some((self.remote_x, self.remote_y));
@@ -1847,7 +1894,12 @@ impl Core {
             }
             (
                 (self.remote_x, self.remote_y),
-                applied,
+                // Prefer host delta for edge probing when clamp ate applied.
+                if applied == (0, 0) && (dx != 0 || dy != 0) {
+                    (dx, dy)
+                } else {
+                    applied
+                },
                 (self.remote_x, self.remote_y),
             )
         } else {
@@ -2034,6 +2086,10 @@ impl Core {
                 csc_platform::PowerEvent::SecureDesktop => "secure_desktop",
                 _ => "normal",
             };
+            // Local lock while controlling a peer: release the parked cursor.
+            if state == "locked" && self.grab {
+                self.return_home("local locked").await;
+            }
             self.send_peer_state(state).await;
             return;
         }
@@ -2093,9 +2149,17 @@ impl Core {
             self.status.write().await.peer_note = note;
             if state == "secure_desktop" {
                 self.paused_peers.insert(peer.to_string());
-                if self.grab && self.switch.active_remote().eq_ignore_ascii_case(peer) {
-                    self.return_home("secure desktop").await;
-                }
+            }
+            if (state == "locked" || state == "secure_desktop")
+                && self.grab
+                && self.switch.active_remote().eq_ignore_ascii_case(peer)
+            {
+                let why = if state == "locked" {
+                    "peer locked"
+                } else {
+                    "secure desktop"
+                };
+                self.return_home(why).await;
             } else if state == "normal" {
                 self.paused_peers
                     .retain(|n| !n.eq_ignore_ascii_case(peer));
@@ -2300,6 +2364,10 @@ impl Core {
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
                 self.last_real = csc_platform::cursor_pos().map(|(ax, ay)| (ax - ox, ay - oy));
+                // Wayland: open uinput before the pin jump so the first move is not dropped.
+                if csc_platform::wayland_session() {
+                    let _ = csc_platform::warm_uinput();
+                }
                 inject_controlled_jump(
                     self.injector.as_mut(),
                     &mut self.commanded,

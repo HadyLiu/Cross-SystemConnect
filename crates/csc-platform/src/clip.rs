@@ -112,6 +112,18 @@ impl SystemClipboard {
                 return ClipContent::Files(files);
             }
         }
+        // GNOME Desktop Icons / Nautilus often expose only gnome-copied-files.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(files) = crate::linux::clip_x11::read_gnome_files() {
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .map(tidy_path)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            if !files.is_empty() {
+                return ClipContent::Files(files);
+            }
+        }
         match self.inner.get_text() {
             Ok(text) if !text.is_empty() => return ClipContent::Text(text),
             _ => {}
@@ -148,6 +160,14 @@ impl SystemClipboard {
     }
 
     pub fn set_files(&mut self, files: &[PathBuf]) -> anyhow::Result<()> {
+        // Prefer owning CLIPBOARD with both uri-list and gnome-copied-files so
+        // Desktop Icons / Nautilus can paste placeholders (Doc §4.4).
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            if crate::linux::clip_x11::set_files(files) {
+                return Ok(());
+            }
+        }
         self.inner.set().file_list(files)?;
         Ok(())
     }

@@ -246,10 +246,10 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
             let _ = ClipCursor(None);
         }
     }
-    if !grab {
-        if let Ok(mut q) = QUEUE.lock() {
-            q.clear();
-        }
+    // Clear stale events when grab starts (Esc-cancel / pre-grab ups) and when
+    // it stops, so a leftover button-up cannot abort the remote virtual drag.
+    if let Ok(mut q) = QUEUE.lock() {
+        q.clear();
     }
 }
 

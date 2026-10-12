@@ -115,14 +115,24 @@ fn ensure(slot: &mut Slot) -> Option<&mut Dev> {
     slot.dev.as_mut()
 }
 
+/// Open the device now so the first pointer jump on SwitchEnter is not dropped.
+pub fn warm() -> bool {
+    let Ok(mut slot) = SLOT.lock() else {
+        return false;
+    };
+    ensure(&mut slot).is_some()
+}
+
 /// Make `/dev/uinput` writable before the pointer arrives.
 /// A password dialog is shown once, at startup, while this computer still has the mouse.
 pub fn grant_access() {
     if device_writable() {
+        let _ = warm();
         return;
     }
     install_rule();
     if device_writable() {
+        let _ = warm();
         info!("Wayland pointer control can use /dev/uinput");
         return;
     }
@@ -131,6 +141,7 @@ pub fn grant_access() {
     let ok = prompt_install();
     ASKING.store(false, Ordering::Relaxed);
     if ok && device_writable() {
+        let _ = warm();
         info!("Wayland pointer control can use /dev/uinput; remote interaction is not requested");
     } else {
         warn!(

@@ -1,4 +1,5 @@
 pub(crate) mod badge;
+pub(crate) mod clip_x11;
 pub(crate) mod fullscreen;
 pub(crate) mod cursor;
 pub(crate) mod hint;
@@ -7,7 +8,7 @@ pub(crate) mod power;
 pub(crate) mod drop_folder;
 pub mod grab;
 pub(crate) mod gtkdrag;
-mod uinput;
+pub(crate) mod uinput;
 pub mod xdnd;
 mod xdo;
 

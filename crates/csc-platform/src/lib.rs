@@ -268,6 +268,18 @@ pub fn wayland_session() -> bool {
     }
 }
 
+/// Ensure `/dev/uinput` is open before the first controlled pointer jump.
+pub fn warm_uinput() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::uinput::warm()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        true
+    }
+}
+
 #[cfg(windows)]
 pub fn warp_cursor(x: i32, y: i32) {
     win::warp_cursor(x, y);

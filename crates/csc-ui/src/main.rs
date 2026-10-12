@@ -603,6 +603,12 @@ fn main() -> anyhow::Result<()> {
                     match build_webview(&w, proxy.clone()) {
                         Ok(wv) => {
                             webview = Some(wv);
+                            // Wayland CSD: heal dead close button after first map.
+                            #[cfg(target_os = "linux")]
+                            {
+                                w.set_resizable(false);
+                                w.set_resizable(true);
+                            }
                             window = Some(w);
                         }
                         Err(e) => {
@@ -612,6 +618,13 @@ fn main() -> anyhow::Result<()> {
                 } else if let Some(w) = window.as_ref() {
                     w.set_visible(true);
                     w.set_focus();
+                    // Hide→show leaves GTK CSD close dead until a configure
+                    // (e.g. maximize). Toggle resizable to force that heal.
+                    #[cfg(target_os = "linux")]
+                    {
+                        w.set_resizable(false);
+                        w.set_resizable(true);
+                    }
                 }
             }
             Event::UserEvent(UserEvent::DropZone(zone)) => match zone {
