@@ -1,6 +1,5 @@
 mod clipboard;
 mod discover;
-mod drag;
 mod ipc;
 mod layout;
 mod logging;
@@ -17,7 +16,6 @@ mod tls;
 mod transfer;
 
 use crate::clipboard::{ClipEvent, ClipHandle};
-use crate::drag::DragHandle;
 use crate::ipc::{claim_ipc, serve_ipc, AppState, IpcBusy};
 use crate::layout::ScreenLayout;
 use crate::logging::LogControl;
@@ -31,9 +29,9 @@ use csc_config::{default_config_path, Config};
 use csc_platform::{create_input_injector, create_screen_info, query_host_net_info, Captured};
 use csc_proto::{
     encode_activity, encode_frame, encode_json_frame, encode_switch_leave_bin, AppStatus,
-    ClipOfferPayload, ControlPausePayload, DragBeginPayload, DragCancelPayload, EdgeHitPayload,
-    FileEntry, LocalNic, LockState, MsgType, PasteLocatedPayload, PasteRequestPayload,
-    PeerStatePayload, SwitchPayload, CAP_CLIP_PLACEHOLDER, CAP_EDGE_REPORT, CAP_VIRTUAL_DRAG,
+    ClipOfferPayload, ControlPausePayload, EdgeHitPayload, FileEntry, LocalNic, LockState, MsgType,
+    PasteLocatedPayload, PasteRequestPayload, PeerStatePayload, SwitchPayload,
+    CAP_CLIP_PLACEHOLDER, CAP_EDGE_REPORT,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -44,7 +42,6 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info, warn};
 
 const HID_V: u32 = 0x19;
-const HID_ESC: u32 = 0x29;
 const HID_LCTRL: u32 = 0xE0;
 const HID_RCTRL: u32 = 0xE4;
 /// Text above this goes on the bulk queue so it never holds up the pointer.
@@ -68,8 +65,14 @@ fn peer_size(
 /// Where the local pointer reappears after it leaves a remote screen.
 /// `leave` is the edge of the remote screen that was crossed, `pct` the
 /// position along it, and `m` the local monitor the pointer returns to.
-fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i32, i32) {
-    let inset = 12;
+/// `deep` pulls farther inland so a still-held drag is not covered by the edge strip.
+fn reentry_point(
+    leave: csc_proto::Edge,
+    pct: f32,
+    m: csc_platform::Rect,
+    deep: bool,
+) -> (i32, i32) {
+    let inset = if deep { 80 } else { 12 };
     let pct = pct.clamp(0.0, 1.0);
     let lo_x = m.left + inset;
     let hi_x = (m.right - 1 - inset).max(lo_x);
@@ -269,44 +272,6 @@ impl HeldInput {
     }
 }
 
-/// Area against `edge` of monitor `m`, around the pointer, where dragged files
-/// are caught. Desktop coordinates relative to the virtual origin. With a
-/// virtual drag it is a thin strip: it only has to notice the drag arriving.
-fn drop_zone_rect(
-    edge: csc_proto::Edge,
-    x: i32,
-    y: i32,
-    m: csc_platform::Rect,
-    strip: bool,
-) -> csc_platform::Rect {
-    use csc_proto::Edge;
-    let depth = if strip { 12 } else { 160 };
-    const LENGTH: i32 = 260;
-    let (w, h) = match edge {
-        Edge::Left | Edge::Right => (depth, LENGTH),
-        Edge::Top | Edge::Bottom => (LENGTH, depth),
-        _ => (depth.max(48), depth.max(48)),
-    };
-    let w = w.min(m.width());
-    let h = h.min(m.height());
-    let left = match edge {
-        Edge::Left | Edge::TopLeft | Edge::BottomLeft => m.left,
-        Edge::Right | Edge::TopRight | Edge::BottomRight => m.right - w,
-        Edge::Top | Edge::Bottom => (x - w / 2).clamp(m.left, m.right - w),
-    };
-    let top = match edge {
-        Edge::Top | Edge::TopLeft | Edge::TopRight => m.top,
-        Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => m.bottom - h,
-        Edge::Left | Edge::Right => (y - h / 2).clamp(m.top, m.bottom - h),
-    };
-    csc_platform::Rect {
-        left,
-        top,
-        right: left + w,
-        bottom: top + h,
-    }
-}
-
 /// A key combination such as `Ctrl+Alt+/`, as HID usages.
 /// Modifiers are stored left-handed; either hand matches.
 #[derive(Debug, Clone, PartialEq)]
@@ -401,24 +366,6 @@ fn popup(body: &str, error: bool) {
     );
 }
 
-/// Where the edge window came from, and what happens once a file drag enters it.
-#[derive(Debug, Clone)]
-enum ZoneOrigin {
-    /// This computer's own pointer at an edge leading to a neighbor.
-    Local { dec: EnterDecision, x: i32, y: i32 },
-    /// This computer is controlled; its pointer pushed through an outer edge.
-    Controlled(EdgeReport),
-}
-
-/// Where the pointer went after a controlled computer reported a drag at its edge.
-#[derive(Debug, Clone)]
-struct DragRoute {
-    from: String,
-    /// None: the keyboard host itself.
-    to: Option<String>,
-    at: Instant,
-}
-
 /// A file manager pasted the placeholder copies of another computer's files.
 struct LocatedPaste {
     peer: String,
@@ -427,22 +374,14 @@ struct LocatedPaste {
     paths: Vec<PathBuf>,
 }
 
-/// Result of checking files dragged into the edge window.
-struct DragReady {
-    peer: String,
-    result: Result<DragBeginPayload, String>,
-}
-
 struct Core {
     config: Arc<RwLock<Config>>,
     status: Arc<RwLock<AppStatus>>,
     net: NetHub,
     transfer: TransferHandle,
-    drag: DragHandle,
     clip: ClipHandle,
     net_reload: watch::Sender<u64>,
     layout_rx: watch::Receiver<u64>,
-    drag_ready_tx: mpsc::Sender<DragReady>,
     injector: Box<dyn csc_platform::InputInjector>,
     screen_info: Box<dyn csc_platform::ScreenInfo>,
     screen: csc_platform::ScreenSize,
@@ -471,16 +410,6 @@ struct Core {
     last_miss: Instant,
     next_nic: Instant,
     supervisor: Supervisor,
-    drop_zone: Option<csc_proto::DropZone>,
-    zone_origin: Option<ZoneOrigin>,
-    /// Files in the last drag were refused; no new edge window until the button is released.
-    zone_blocked: bool,
-    drag_pending: bool,
-    drag_route: Option<DragRoute>,
-    /// Drag the keyboard host last sent, so it can be handed to another computer.
-    live_drag: Option<DragBeginPayload>,
-    /// Controlled side: a drag from `peer` (transfer id) is on this screen.
-    incoming_drag: Option<(String, u64)>,
     paste_gen: u64,
     paste_tx: mpsc::Sender<LocatedPaste>,
     clip_seq: u64,
@@ -740,24 +669,6 @@ impl Core {
         };
     }
 
-    async fn clear_zone(&mut self) {
-        if self.drop_zone.take().is_some() {
-            self.status.write().await.drop_zone = None;
-        }
-        self.zone_origin = None;
-    }
-
-    async fn show_zone(&mut self, zone: csc_proto::DropZone, origin: ZoneOrigin) {
-        // Keep the first area so the window does not jump under the drag.
-        if self.drop_zone.is_some() || self.zone_blocked {
-            return;
-        }
-        debug!("edge window for {} at {},{}", zone.peer, zone.x, zone.y);
-        self.status.write().await.drop_zone = Some(zone.clone());
-        self.drop_zone = Some(zone);
-        self.zone_origin = Some(origin);
-    }
-
     // ------------------------------------------------------------ tick
 
     async fn tick(&mut self) {
@@ -844,7 +755,6 @@ impl Core {
                 self.paste_remote_here().await;
             }
         }
-        self.zone_upkeep().await;
 
         if self.screen.width <= 1 || self.screen.height <= 1 {
             return;
@@ -903,37 +813,6 @@ impl Core {
         if let Some(why) = reload {
             info!("restarting the network: {why}");
             self.net_reload.send_modify(|n| *n = n.wrapping_add(1));
-        }
-    }
-
-    /// Drop the edge window once the drag moves away or ends.
-    async fn zone_upkeep(&mut self) {
-        let dragging = csc_platform::primary_button_down();
-        if !dragging {
-            self.zone_blocked = false;
-        }
-        let Some(zone) = self.drop_zone.as_ref() else {
-            return;
-        };
-        if self.drag_pending {
-            return;
-        }
-        // Wayland controlled: X cursor_pos does not track the uinput pointer, so
-        // a failed/stale read must not clear the zone before DropEnter arrives.
-        let near = match csc_platform::cursor_pos() {
-            Some((x, y)) => {
-                x >= zone.x - 48
-                    && x < zone.x + zone.width + 48
-                    && y >= zone.y - 48
-                    && y < zone.y + zone.height + 48
-            }
-            None => true,
-        };
-        let keep_controlled = matches!(self.zone_origin, Some(ZoneOrigin::Controlled(_)))
-            && dragging
-            && csc_platform::wayland_session();
-        if !dragging || !(near || keep_controlled) {
-            self.clear_zone().await;
         }
     }
 
@@ -1060,7 +939,7 @@ impl Core {
             self.net.send_mouse_move(dx, dy).await;
             return false;
         };
-        self.leave_remote(leave, None).await
+        self.leave_remote(leave).await
     }
 
     /// Bring input back to this computer from the active remote, crossing no edge.
@@ -1116,9 +995,8 @@ impl Core {
     }
 
     /// The pointer leaves the active remote through `leave.edge`: hop to the
-    /// next computer, or come back here. `dragging` names the computer a file
-    /// drag comes from. True when input is back on this computer.
-    async fn leave_remote(&mut self, leave: EnterDecision, dragging: Option<String>) -> bool {
+    /// next computer, or come back here. True when input is back on this computer.
+    async fn leave_remote(&mut self, leave: EnterDecision) -> bool {
         self.held.release_all(&self.net).await;
         let local_name = self.local_name().await;
         let current = self.switch.active_remote().to_string();
@@ -1155,13 +1033,6 @@ impl Core {
                 "switch hop {current} -> {next} at {:?} {:.2}",
                 leave.edge, leave.position_pct
             );
-            if let Some(from) = dragging {
-                self.drag_route = Some(DragRoute {
-                    from,
-                    to: Some(next),
-                    at: Instant::now(),
-                });
-            }
             false
         } else {
             if current.is_empty() {
@@ -1175,7 +1046,7 @@ impl Core {
             let m = self
                 .switch
                 .monitor_at(self.enter_point.0, self.enter_point.1);
-            let back = reentry_point(leave.edge, leave.position_pct, m);
+            let back = reentry_point(leave.edge, leave.position_pct, m, false);
             release_pointer(&mut self.grab, Some(back));
             self.grab_armed = false;
             self.set_active_screen(None).await;
@@ -1183,13 +1054,6 @@ impl Core {
                 "switch return from {current} at {:?} {:.2}, cursor to {back:?}",
                 leave.edge, leave.position_pct
             );
-            if let Some(from) = dragging {
-                self.drag_route = Some(DragRoute {
-                    from,
-                    to: None,
-                    at: Instant::now(),
-                });
-            }
             true
         }
     }
@@ -1203,6 +1067,7 @@ impl Core {
         let (ox, oy) = csc_platform::virtual_origin();
         let x = ax - ox;
         let y = ay - oy;
+        csc_platform::vdrag::note_pointer(x, y);
         let dragging = csc_platform::primary_button_down();
         if self.block_fullscreen && !dragging && csc_platform::foreground_fullscreen() {
             return;
@@ -1222,22 +1087,7 @@ impl Core {
             k.eq_ignore_ascii_case(&dec.neighbor) && size.width > 1 && size.height > 1
         });
         let has_peer = self.net.has_peer(&dec.neighbor).await;
-        let drops = has_peer && self.config.read().await.file_transfer.enabled;
-        if dragging && drops {
-            // A held button at the edge may be a file drag: show the edge window
-            // instead of switching. Files entering it start the drag across.
-            let virtual_drag = self.net.peer_caps(&dec.neighbor).await & CAP_VIRTUAL_DRAG != 0;
-            let r = drop_zone_rect(dec.edge, x, y, self.switch.monitor_at(x, y), virtual_drag);
-            let zone = csc_proto::DropZone {
-                peer: dec.neighbor.clone(),
-                x: r.left + ox,
-                y: r.top + oy,
-                width: r.width(),
-                height: r.height(),
-                virtual_drag,
-            };
-            self.show_zone(zone, ZoneOrigin::Local { dec, x, y }).await;
-        } else if has_peer && known_screen {
+        if has_peer && known_screen {
             self.enter_remote(dec, x, y).await;
         } else if self.last_miss.elapsed() > Duration::from_secs(2) {
             self.last_miss = Instant::now();
@@ -1280,7 +1130,6 @@ impl Core {
         let (ox, oy) = csc_platform::virtual_origin();
         let entry = dec.edge.opposite();
         let payload = self.enter_payload(entry, dec.position_pct);
-        self.drag.pointer_left().await;
         self.net
             .send_to(&dec.neighbor, csc_proto::encode_switch_bin(&payload))
             .await;
@@ -1297,7 +1146,7 @@ impl Core {
         self.switch.set_remote_reports(reports);
         self.enter_point = (x, y);
         let m = self.switch.monitor_at(x, y);
-        self.home_point = reentry_point(entry, dec.position_pct, m);
+        self.home_point = reentry_point(entry, dec.position_pct, m, false);
         self.held = HeldInput::default();
         if self.hooked {
             // Moves are measured from the park point, and Windows clips the cursor
@@ -1713,145 +1562,6 @@ impl Core {
         true
     }
 
-    // ------------------------------------------------------------ drags
-
-    /// The edge window saw files dragged into it.
-    async fn on_drag_enter(&mut self, peer: String, paths: Vec<PathBuf>) {
-        let wanted = self
-            .drop_zone
-            .as_ref()
-            .is_some_and(|z| z.virtual_drag && z.peer.eq_ignore_ascii_case(&peer));
-        if !wanted || self.drag_pending || paths.is_empty() {
-            debug!("drag into edge window ignored");
-            return;
-        }
-        self.drag_pending = true;
-        let transfer = self.transfer.clone();
-        let tx = self.drag_ready_tx.clone();
-        tokio::spawn(async move {
-            let result = transfer
-                .prepare_drag(peer.clone(), paths, String::new())
-                .await;
-            let _ = tx.send(DragReady { peer, result }).await;
-        });
-    }
-
-    async fn on_drag_ready(&mut self, ready: DragReady) {
-        self.drag_pending = false;
-        let begin = match ready.result {
-            Ok(b) => b,
-            Err(msg) => {
-                popup(&msg, true);
-                self.clear_zone().await;
-                self.zone_blocked = true;
-                return;
-            }
-        };
-        let origin = self.zone_origin.clone();
-        self.clear_zone().await;
-        let Some(origin) = origin.filter(|_| csc_platform::primary_button_down()) else {
-            debug!("drag ended before the files were checked");
-            return;
-        };
-        // Cancel the drag on this computer first, so the program it came from
-        // does not also get a drop (or move the files away).
-        self.injector.key(HID_ESC, true);
-        self.injector.key(HID_ESC, false);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let Ok(begin_frame) = encode_json_frame(MsgType::DragBegin, &begin) else {
-            return;
-        };
-        self.live_drag = Some(begin.clone());
-        match origin {
-            ZoneOrigin::Local { dec, x, y } => {
-                self.enter_remote(dec, x, y).await;
-                // The physical button is still down; seed held so a spurious
-                // unpaired up from Esc-cancel is dropped instead of forwarded.
-                if csc_platform::primary_button_down() {
-                    self.held.buttons.insert(0);
-                }
-                self.net.send_control(&ready.peer, begin_frame).await;
-                info!(
-                    "dragging {} item(s) onto {}",
-                    begin.entries.len(),
-                    ready.peer
-                );
-            }
-            ZoneOrigin::Controlled(report) => {
-                let hit = EdgeHitPayload {
-                    edge: report.edge,
-                    position_pct: report.position_pct,
-                    dragging: true,
-                    corner: report.corner,
-                    transfer_id: 0,
-                };
-                if let Ok(frame) = encode_json_frame(MsgType::EdgeHit, &hit) {
-                    self.net.send_control(&ready.peer, frame).await;
-                }
-                self.net.send_control(&ready.peer, begin_frame).await;
-                self.last_edge_sent = Instant::now();
-                info!("dragging {} item(s) off this screen", begin.entries.len());
-            }
-        }
-    }
-
-    /// A drag arrives on this screen, from `peer`.
-    async fn start_drag_here(&mut self, peer: &str, begin: DragBeginPayload) {
-        let ok = csc_platform::vdrag::supported() && self.config.read().await.file_transfer.enabled;
-        if !ok {
-            let c = DragCancelPayload {
-                transfer_id: begin.transfer_id,
-                reason: "unsupported".into(),
-            };
-            if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &c) {
-                self.net.send_control(peer, frame).await;
-            }
-            return;
-        }
-        // The hand is still holding the button. Windows needs that press here.
-        // The X11 source presses after it grabs the pointer. On Wayland the
-        // drag source presses once its popup is under the pointer, so the
-        // press is the one that starts the system drag.
-        if cfg!(windows) {
-            self.injector.mouse_button(0, true);
-        }
-        if !self.is_host().await {
-            self.injected.track(Captured::Button {
-                button: 0,
-                down: true,
-            });
-            self.incoming_drag = Some((peer.to_string(), begin.transfer_id));
-        }
-        self.drag.begin(peer.to_string(), begin).await;
-    }
-
-    async fn on_drag_begin(&mut self, peer: String, begin: DragBeginPayload) {
-        if !self.is_host().await {
-            self.start_drag_here(&peer, begin).await;
-            return;
-        }
-        let route = self.drag_route.take().filter(|r| {
-            r.from.eq_ignore_ascii_case(&peer) && r.at.elapsed() < Duration::from_secs(5)
-        });
-        match route {
-            Some(DragRoute { to: None, .. }) => self.start_drag_here(&peer, begin).await,
-            Some(DragRoute { to: Some(to), .. }) => {
-                info!("passing drag from {peer} on to {to}");
-                self.transfer.relay_drag(peer, begin, to).await;
-            }
-            None => {
-                info!("drag from {peer} did not lead anywhere");
-                let c = DragCancelPayload {
-                    transfer_id: begin.transfer_id,
-                    reason: "no_target".into(),
-                };
-                if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &c) {
-                    self.net.send_control(&peer, frame).await;
-                }
-            }
-        }
-    }
-
     // ------------------------------------------------------------ controlled side
 
     /// Input from the keyboard host moved this computer's pointer.
@@ -1933,37 +1643,6 @@ impl Core {
         let Some(host) = self.net.peer_names().await.into_iter().next() else {
             return;
         };
-        let dragging = self.injected.buttons.contains(&0);
-        if !dragging {
-            self.incoming_drag = None;
-        }
-        let host_reads_edges = self.net.peer_caps(&host).await & CAP_EDGE_REPORT != 0;
-        // What is being dragged here came from another computer: the edge window
-        // would only catch our own placeholders and send them back.
-        if dragging
-            && self.incoming_drag.is_none()
-            && host_reads_edges
-            && self.config.read().await.file_transfer.enabled
-        {
-            let r = drop_zone_rect(
-                report.edge,
-                real.0,
-                real.1,
-                self.switch.monitor_at(real.0, real.1),
-                true,
-            );
-            let zone = csc_proto::DropZone {
-                peer: host,
-                x: r.left + ox,
-                y: r.top + oy,
-                width: r.width(),
-                height: r.height(),
-                virtual_drag: true,
-            };
-            self.show_zone(zone, ZoneOrigin::Controlled(report)).await;
-            return;
-        }
-        let carried = self.incoming_drag.as_ref().map(|(_, id)| *id);
         info!(
             "pointer at {:?} pushed {:?} {:.2} (corner {:?})",
             real, report.edge, report.position_pct, report.corner
@@ -1971,9 +1650,9 @@ impl Core {
         let hit = EdgeHitPayload {
             edge: report.edge,
             position_pct: report.position_pct,
-            dragging: carried.is_some(),
+            dragging: false,
             corner: report.corner,
-            transfer_id: carried.unwrap_or(0),
+            transfer_id: 0,
         };
         if let Ok(frame) = encode_json_frame(MsgType::EdgeHit, &hit) {
             self.net.send_control(&host, frame).await;
@@ -1999,59 +1678,7 @@ impl Core {
             "{peer} reports its pointer at {:?} {:.2}; host estimate ({},{})",
             leave.edge, leave.position_pct, self.remote_x, self.remote_y
         );
-        if hit.dragging {
-            if let Some(begin) = self
-                .live_drag
-                .clone()
-                .filter(|b| hit.transfer_id == 0 || b.transfer_id == hit.transfer_id)
-            {
-                self.retarget_drag(peer, leave, begin).await;
-                return;
-            }
-        }
-        let dragging = hit.dragging.then(|| peer.to_string());
-        self.leave_remote(leave, dragging).await;
-    }
-
-    /// The drag on `peer` crossed an edge. Back to the computer the files came
-    /// from cancels it. Any other computer receives the same drag.
-    async fn retarget_drag(&mut self, peer: &str, leave: EnterDecision, begin: DragBeginPayload) {
-        let local = self.local_name().await;
-        let next = self.switch.neighbor_from_active(leave.edge);
-        let destination = next.clone().unwrap_or_else(|| local.clone());
-        let origin_here = begin.origin.is_empty() || begin.origin.eq_ignore_ascii_case(&local);
-        let back_to_source = if origin_here {
-            destination.eq_ignore_ascii_case(&local)
-        } else {
-            destination.eq_ignore_ascii_case(&begin.origin)
-        };
-        if back_to_source {
-            info!("drag {} returned to its source; cancelling", begin.transfer_id);
-            self.live_drag = None;
-            self.leave_remote(leave, None).await;
-            return;
-        }
-        info!(
-            "drag {} retargeted from {peer} to {destination}",
-            begin.transfer_id
-        );
-        let cancel = DragCancelPayload {
-            transfer_id: begin.transfer_id,
-            reason: "retarget".into(),
-        };
-        if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &cancel) {
-            self.net.send_control(peer, frame).await;
-        }
-        self.transfer
-            .retarget_send(begin.transfer_id, destination.clone())
-            .await;
-        self.leave_remote(leave, None).await;
-        self.live_drag = Some(begin.clone());
-        if destination.eq_ignore_ascii_case(&local) {
-            self.start_drag_here(peer, begin).await;
-        } else if let Ok(frame) = encode_json_frame(MsgType::DragBegin, &begin) {
-            self.net.send_control(&destination, frame).await;
-        }
+        self.leave_remote(leave).await;
     }
 
     async fn on_paste_request(&mut self, peer: &str, req: PasteRequestPayload) {
@@ -2214,11 +1841,6 @@ impl Core {
                         )
                         .await;
                     }
-                }
-            }
-            MsgType::DragBegin => {
-                if let Ok(begin) = serde_json::from_slice(&payload) {
-                    self.on_drag_begin(peer, begin).await;
                 }
             }
             MsgType::LockScreen => self.lock_all(Some(&peer)).await,
@@ -2391,9 +2013,6 @@ impl Core {
                 csc_platform::set_controlled_hint(None);
                 self.commanded = None;
                 debug!(edge = ?p.edge, "switch leave");
-                self.incoming_drag = None;
-                csc_platform::vdrag::cancel_follow();
-                self.drag.pointer_left().await;
                 if !self.grab {
                     self.injected.release_injected(self.injector.as_mut());
                 }
@@ -2427,7 +2046,7 @@ impl Core {
                         .monitor_at(self.enter_point.0, self.enter_point.1);
                     release_pointer(
                         &mut self.grab,
-                        Some(reentry_point(p.edge, p.position_pct, m)),
+                        Some(reentry_point(p.edge, p.position_pct, m, false)),
                     );
                 }
                 self.grab_armed = false;
@@ -2454,19 +2073,6 @@ impl Core {
             }
             Some(InboundEvent::Key { hid, down }) => {
                 if !self.grab {
-                    if down && hid == HID_ESC && self.incoming_drag.is_some() {
-                        if let Some((peer, id)) = self.incoming_drag.take() {
-                            info!("esc cancels drag {id} from {peer}");
-                            self.drag.pointer_left().await;
-                            let c = DragCancelPayload {
-                                transfer_id: id,
-                                reason: "user".into(),
-                            };
-                            if let Ok(frame) = encode_json_frame(MsgType::DragCancel, &c) {
-                                self.net.send_control(&peer, frame).await;
-                            }
-                        }
-                    }
                     self.injected.track(Captured::Key { hid, down });
                     self.injector.key(hid, down);
                 }
@@ -2621,7 +2227,6 @@ pub async fn run() -> anyhow::Result<()> {
         host_state: "no_host".into(),
         discovered: Vec::new(),
         search_subnet: crate::discover::subnet_label(&cfg.search_address).unwrap_or_default(),
-        drop_zone: None,
         transfers: Vec::new(),
     };
 
@@ -2635,13 +2240,11 @@ pub async fn run() -> anyhow::Result<()> {
     let prompt = Arc::new(PeerPrompt::default());
     let (transfer, transfer_rx) = crate::transfer::channel();
     let board = crate::progress::TransferBoard::default();
-    let (drag_enter_tx, mut drag_enter_rx) = mpsc::channel::<(String, Vec<PathBuf>)>(4);
     let (paste_here_tx, mut paste_here_rx) = mpsc::channel::<()>(2);
 
     let state = Arc::new(AppState {
         transfer: transfer.clone(),
         board: board.clone(),
-        drag_enter: drag_enter_tx,
         paste_here: paste_here_tx,
         config: config.clone(),
         config_path: config_path.clone(),
@@ -2725,8 +2328,6 @@ pub async fn run() -> anyhow::Result<()> {
     let clip = crate::clipboard::spawn(clip_tx);
     tokio::spawn(watch_memory(state.clone(), board.clone()));
     crate::transfer::spawn(transfer_rx, net.clone(), config.clone(), board);
-    let drag = crate::drag::spawn(transfer.clone(), config.clone());
-    let (drag_ready_tx, mut drag_ready_rx) = mpsc::channel::<DragReady>(4);
     // Sequence numbers start from the clock so a restarted core is never mistaken for a repeat.
     let clip_seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2738,11 +2339,9 @@ pub async fn run() -> anyhow::Result<()> {
         status,
         net,
         transfer,
-        drag,
         clip,
         net_reload,
         layout_rx,
-        drag_ready_tx,
         injector: create_input_injector(),
         screen_info,
         screen,
@@ -2782,13 +2381,6 @@ pub async fn run() -> anyhow::Result<()> {
         last_miss: Instant::now() - Duration::from_secs(5),
         next_nic: Instant::now(),
         supervisor,
-        drop_zone: None,
-        zone_origin: None,
-        zone_blocked: false,
-        drag_pending: false,
-        drag_route: None,
-        live_drag: None,
-        incoming_drag: None,
         paste_gen: 0,
         paste_tx: paste_tx.clone(),
         clip_seq,
@@ -2818,9 +2410,7 @@ pub async fn run() -> anyhow::Result<()> {
             _ = tick.tick() => core.tick().await,
             Some(ev) = clip_rx.recv() => core.on_clip(ev).await,
             Some(found) = paste_rx.recv() => core.on_located_paste(found).await,
-            Some((peer, paths)) = drag_enter_rx.recv() => core.on_drag_enter(peer, paths).await,
             Some(()) = paste_here_rx.recv() => core.paste_remote_here().await,
-            Some(ready) = drag_ready_rx.recv() => core.on_drag_ready(ready).await,
             ev = inbound_rx.recv() => {
                 if !core.on_inbound(ev).await {
                     break;
@@ -2918,17 +2508,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_is_thin_but_old_window_is_not() {
-        let m = csc_platform::Rect {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-        let strip = super::drop_zone_rect(csc_proto::Edge::Right, 1919, 500, m, true);
-        assert_eq!((strip.left, strip.width(), strip.height()), (1908, 12, 260));
-        let wide = super::drop_zone_rect(csc_proto::Edge::Right, 1919, 500, m, false);
-        assert_eq!(wide.width(), 160);
-    }
 }

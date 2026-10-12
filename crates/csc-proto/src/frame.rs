@@ -45,8 +45,11 @@ pub enum MsgType {
     PasteRequest = 0x33,
     PasteLocated = 0x34,
     ClipEnd = 0x37,
+    /// Reserved (cross-screen drag removed); ignored if received.
     DragBegin = 0x40,
+    /// Reserved (cross-screen drag removed); ignored if received.
     DragCancel = 0x41,
+    /// Reserved (cross-screen drag removed); ignored if received.
     DragRetarget = 0x42,
     FileRequest = 0x50,
     FileData = 0x51,
@@ -64,7 +67,7 @@ pub enum MsgType {
     BenchEcho = 0x71,
 }
 
-/// Peer supports dragging a virtual file onto its desktop (`DragBegin`).
+/// Reserved: cross-screen virtual drag was removed. Never advertise.
 pub const CAP_VIRTUAL_DRAG: u32 = 1 << 0;
 /// Peer reports edge contact itself (`EdgeHit`) instead of the host guessing.
 pub const CAP_EDGE_REPORT: u32 = 1 << 1;
@@ -80,9 +83,9 @@ pub const CAP_FOCUS_INFO: u32 = 1 << 5;
 pub const CAP_MULTI_MONITOR: u32 = 1 << 6;
 /// Linux file paste uses clipboard placeholders, so Ctrl+V must reach that computer.
 pub const CAP_CLIP_PLACEHOLDER: u32 = 1 << 7;
-/// Everything this build supports on every platform.
-pub const CAPABILITIES: u32 = CAP_VIRTUAL_DRAG
-    | CAP_EDGE_REPORT
+/// Capabilities common to every platform. Linux adds `CAP_CLIP_PLACEHOLDER`
+/// in `local_capabilities`; `CAP_VIRTUAL_DRAG` is never advertised.
+pub const CAPABILITIES: u32 = CAP_EDGE_REPORT
     | CAP_FILE_ACK
     | CAP_DATA_CHANNEL
     | CAP_LAZY_CLIP

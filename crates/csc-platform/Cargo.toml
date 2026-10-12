@@ -48,4 +48,3 @@ libc = "0.2"
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = { version = "0.13", features = ["xfixes"] }
 dbus = "0.9"
-gtk = "0.18"

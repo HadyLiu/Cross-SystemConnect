@@ -209,11 +209,11 @@ pub struct ClipOfferPayload {
 pub enum TransferPurpose {
     /// Sent by older versions for copied files; handled like `Paste`.
     Clipboard,
-    /// Files dropped on the edge window: saved to the receive folder.
+    /// Reserved (cross-screen drag removed); treated like `Paste` if received.
     Drag,
     /// Copied files pasted with Ctrl+V on the receiver: saved to the receive folder.
     Paste,
-    /// Files dragged across and released over a folder on the receiver.
+    /// Reserved (cross-screen drag removed); treated like `Paste` if received.
     DragDrop,
 }
 

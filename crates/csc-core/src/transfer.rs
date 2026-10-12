@@ -1,26 +1,22 @@
-//! File batches between computers: pasted files, files dropped on the edge
-//! window, and files dragged onto the other screen.
+//! File batches between computers: pasted files and explicit file sends.
 //!
-//! Sender: FileOffer (or DragBegin for a drag). Receiver checks names and
-//! limits, asks about name conflicts, then FileRequest or FileError.
-//! Sender streams FileBegin / FileData / FileEnd per entry and FileDone on the
-//! bulk queue, so they stay in order and never hold up pointer input. The
-//! receiver acknowledges every MiB (FileAck) and the sender keeps at most
-//! `WINDOW` bytes unacknowledged. The keyboard host relays batches between
-//! controlled computers (see `relay`).
+//! Sender: FileOffer. Receiver checks names and limits, asks about name
+//! conflicts, then FileRequest or FileError. Sender streams FileBegin /
+//! FileData / FileEnd per entry and FileDone on the bulk queue, so they stay
+//! in order and never hold up pointer input. The receiver acknowledges every
+//! MiB (FileAck) and the sender keeps at most `WINDOW` bytes unacknowledged.
+//! The keyboard host relays batches between controlled computers (see `relay`).
 
 use crate::net::NetHub;
 use crate::path_safe::{adapt_relative_path, check_relative_path, name_problem};
 use crate::progress::TransferBoard;
 use crate::relay::{self, Hop, Relay};
 use csc_config::{default_config_path, Config};
-use csc_platform::vdrag::StagedFeed;
 use csc_proto::{
     decode_file_batch, decode_file_data, encode_file_batch, encode_file_data, encode_json_frame,
-    DragBeginPayload, DragCancelPayload, FileAckPayload, FileBeginPayload, FileDonePayload,
-    FileEndPayload, FileEntry, FileErrorPayload, FileOfferPayload, FileRequestPayload, FileResume,
-    MsgType, RenamedName, TransferConflict, TransferProgress, TransferPurpose, TransferState,
-    CAP_FILE_ACK,
+    DragCancelPayload, FileAckPayload, FileBeginPayload, FileDonePayload, FileEndPayload,
+    FileEntry, FileErrorPayload, FileOfferPayload, FileRequestPayload, FileResume, MsgType,
+    RenamedName, TransferConflict, TransferProgress, TransferPurpose, TransferState, CAP_FILE_ACK,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -31,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, oneshot, Notify, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
 use xxhash_rust::xxh64::Xxh64;
 
@@ -80,8 +76,6 @@ pub enum Sink {
     Dir(PathBuf),
     /// Over placeholder files a file manager copied, one per top-level item.
     InPlace(Vec<PathBuf>),
-    /// Into a staging folder that Explorer reads while it grows.
-    Staged(Arc<StagedFeed>),
 }
 
 pub enum TransferCmd {
@@ -91,34 +85,6 @@ pub enum TransferCmd {
         purpose: TransferPurpose,
         relay_to: String,
     },
-    /// Check and register files dragged toward `peer`; nothing is sent yet.
-    PrepareDrag {
-        peer: String,
-        paths: Vec<PathBuf>,
-        to: String,
-        reply: oneshot::Sender<Result<DragBeginPayload, String>>,
-    },
-    /// Target: a drag from `peer` is over this screen; wait for the drop.
-    ParkDrag {
-        peer: String,
-        begin: DragBeginPayload,
-    },
-    /// Target: the drag was dropped; receive into `sink`.
-    BindDrop {
-        id: u64,
-        sink: Sink,
-    },
-    /// Target: the drag ended without a drop.
-    CancelDrag {
-        id: u64,
-        reason: String,
-    },
-    /// Keyboard host: pass a drag from `from` on to `to`.
-    RelayDragBegin {
-        from: String,
-        begin: DragBeginPayload,
-        to: String,
-    },
     /// Keyboard host: `from` may send a batch for `to` through us.
     AllowRelay {
         from: String,
@@ -127,11 +93,6 @@ pub enum TransferCmd {
     /// Next paste offer overwrites these placeholder copies.
     ExpectPaste {
         paths: Vec<PathBuf>,
-    },
-    /// The drag's files stay offered, but the receiver is now `peer`.
-    RetargetSend {
-        id: u64,
-        peer: String,
     },
     Cancel {
         id: u64,
@@ -178,51 +139,8 @@ impl TransferHandle {
         .await;
     }
 
-    pub async fn prepare_drag(
-        &self,
-        peer: String,
-        paths: Vec<PathBuf>,
-        to: String,
-    ) -> Result<DragBeginPayload, String> {
-        let (reply, rx) = oneshot::channel();
-        self.cmd(TransferCmd::PrepareDrag {
-            peer,
-            paths,
-            to,
-            reply,
-        })
-        .await;
-        rx.await.unwrap_or_else(|_| Err("传输服务未运行".into()))
-    }
-
-    pub async fn park_drag(&self, peer: String, begin: DragBeginPayload) {
-        self.cmd(TransferCmd::ParkDrag { peer, begin }).await;
-    }
-
-    pub async fn bind_drop(&self, id: u64, sink: Sink) {
-        self.cmd(TransferCmd::BindDrop { id, sink }).await;
-    }
-
     pub async fn expect_paste(&self, paths: Vec<PathBuf>) {
         self.cmd(TransferCmd::ExpectPaste { paths }).await;
-    }
-
-    /// Keep offering drag `id`, to `peer` instead of the computer it left.
-    pub async fn retarget_send(&self, id: u64, peer: String) {
-        self.cmd(TransferCmd::RetargetSend { id, peer }).await;
-    }
-
-    pub async fn cancel_drag(&self, id: u64, reason: &str) {
-        self.cmd(TransferCmd::CancelDrag {
-            id,
-            reason: reason.into(),
-        })
-        .await;
-    }
-
-    pub async fn relay_drag(&self, from: String, begin: DragBeginPayload, to: String) {
-        self.cmd(TransferCmd::RelayDragBegin { from, begin, to })
-            .await;
     }
 
     pub async fn allow_relay(&self, from: String, to: String) {
@@ -574,7 +492,6 @@ struct Current {
 enum Target {
     Dir(PathBuf),
     InPlace,
-    Staged(Arc<StagedFeed>),
 }
 
 struct Incoming {
@@ -614,16 +531,8 @@ impl Incoming {
                 .and_then(|p| p.parent())
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            Target::Staged(_) => String::new(),
         }
     }
-}
-
-/// A drag over this screen that has not been dropped yet.
-struct Parked {
-    peer: String,
-    begin: DragBeginPayload,
-    at: Instant,
 }
 
 struct Engine {
@@ -633,9 +542,6 @@ struct Engine {
     outgoing: HashMap<u64, Outgoing>,
     sending: HashMap<u64, Sending>,
     incoming: HashMap<u64, Incoming>,
-    parked: HashMap<u64, Parked>,
-    /// Outgoing drags that must survive the computer they just left.
-    retain_send: HashSet<u64>,
     /// Placeholder copies a file-manager paste already created.
     expect_paste: Option<Vec<PathBuf>>,
     relay: Relay,
@@ -659,8 +565,6 @@ pub fn spawn(
         outgoing: HashMap::new(),
         sending: HashMap::new(),
         incoming: HashMap::new(),
-        parked: HashMap::new(),
-        retain_send: HashSet::new(),
         expect_paste: None,
         relay: Relay::default(),
         next_id: seed << 12,
@@ -683,13 +587,11 @@ fn id_of(payload: &[u8]) -> Option<u64> {
 
 impl Engine {
     async fn run(mut self, mut rx: mpsc::Receiver<TransferCmd>) {
-        tokio::task::spawn_blocking(csc_platform::vdrag::cleanup_stale);
         let window = self.config.read().await.file_transfer.resume_window_min;
         let receive = self.config.read().await.file_transfer.receive_dir.clone();
         tokio::task::spawn_blocking(move || cleanup_expired_parts(&receive, window));
         while let Some(cmd) = rx.recv().await {
             self.outgoing.retain(|_, o| o.created.elapsed() < OFFER_TTL);
-            self.parked.retain(|_, p| p.at.elapsed() < OFFER_TTL);
             self.sending.retain(|_, s| Arc::strong_count(&s.cancel) > 1);
             match cmd {
                 TransferCmd::Send {
@@ -698,46 +600,8 @@ impl Engine {
                     purpose,
                     relay_to,
                 } => self.offer(peer, paths, purpose, relay_to).await,
-                TransferCmd::PrepareDrag {
-                    peer,
-                    paths,
-                    to,
-                    reply,
-                } => {
-                    let r = self.prepare_drag(peer, paths, to).await;
-                    let _ = reply.send(r);
-                }
-                TransferCmd::ParkDrag { peer, begin } => {
-                    self.parked.insert(
-                        begin.transfer_id,
-                        Parked {
-                            peer,
-                            begin,
-                            at: Instant::now(),
-                        },
-                    );
-                }
-                TransferCmd::BindDrop { id, sink } => self.bind_drop(id, sink).await,
-                TransferCmd::CancelDrag { id, reason } => {
-                    if let Some(p) = self.parked.remove(&id) {
-                        let c = DragCancelPayload {
-                            transfer_id: id,
-                            reason,
-                        };
-                        self.send_json(&p.peer, MsgType::DragCancel, &c).await;
-                    }
-                }
-                TransferCmd::RelayDragBegin { from, begin, to } => {
-                    self.relay_drag(from, begin, to).await
-                }
                 TransferCmd::AllowRelay { from, to } => self.relay.allow(&from, &to),
                 TransferCmd::ExpectPaste { paths } => self.expect_paste = Some(paths),
-                TransferCmd::RetargetSend { id, peer } => {
-                    if let Some(out) = self.outgoing.get_mut(&id) {
-                        out.peer = peer;
-                        self.retain_send.insert(id);
-                    }
-                }
                 TransferCmd::Cancel { id } => self.cancel_incoming(id).await,
                 TransferCmd::Resolve { id, decisions } => self.resolve(id, decisions).await,
                 TransferCmd::Frame { peer, msg, payload } => {
@@ -809,6 +673,11 @@ impl Engine {
         purpose: TransferPurpose,
         relay_to: String,
     ) {
+        // Cross-screen drag is retired; map leftover Drag purposes to paste.
+        let purpose = match purpose {
+            TransferPurpose::Drag | TransferPurpose::DragDrop => TransferPurpose::Paste,
+            other => other,
+        };
         let plan = match self.planned(paths).await {
             Ok(p) => p,
             Err(msg) => {
@@ -838,23 +707,6 @@ impl Engine {
             origin_device_id: self.config.read().await.device_id.clone(),
         };
         self.send_json(&peer, MsgType::FileOffer, &offer).await;
-    }
-
-    async fn prepare_drag(
-        &mut self,
-        peer: String,
-        paths: Vec<PathBuf>,
-        to: String,
-    ) -> Result<DragBeginPayload, String> {
-        let plan = self.planned(paths).await?;
-        let (id, entries, total) = self.register(peer, TransferPurpose::DragDrop, plan);
-        Ok(DragBeginPayload {
-            transfer_id: id,
-            entries,
-            total_bytes: total,
-            to,
-            origin: String::new(),
-        })
     }
 
     async fn on_frame(&mut self, peer: &str, msg: MsgType, payload: Vec<u8>) -> anyhow::Result<()> {
@@ -895,20 +747,11 @@ impl Engine {
                 }
             }
             MsgType::FileCancel | MsgType::DragCancel => {
-                let reason = parse::<DragCancelPayload>(&payload)
+                let _reason = parse::<DragCancelPayload>(&payload)
                     .map(|c| c.reason)
                     .unwrap_or_default();
-                if msg == MsgType::DragCancel && self.retain_send.contains(&id) {
-                    self.parked.remove(&id);
-                    if !matches!(reason.as_str(), "user" | "no target" | "error") {
-                        return Ok(());
-                    }
-                    self.retain_send.remove(&id);
-                }
                 if self.cancel_send(id) {
                     info!("{peer} cancelled transfer {id}");
-                } else if self.parked.remove(&id).is_some() {
-                    debug!("{peer} withdrew drag {id}");
                 } else if let Some(inc) = self.incoming.remove(&id) {
                     discard(inc);
                     self.board
@@ -1001,16 +844,6 @@ impl Engine {
         self.send_json(&to, MsgType::FileOffer, &offer).await;
     }
 
-    async fn relay_drag(&mut self, from: String, mut begin: DragBeginPayload, to: String) {
-        let src_id = begin.transfer_id;
-        let rid = self.new_id();
-        self.relay.open(&self.net, &from, src_id, &to, rid);
-        begin.transfer_id = rid;
-        begin.to.clear();
-        begin.origin = self.label(&from).await;
-        self.send_json(&to, MsgType::DragBegin, &begin).await;
-    }
-
     async fn relay_frame(&mut self, hop: Hop, msg: MsgType, payload: &[u8]) {
         match hop {
             Hop::ToTarget { dst, rid } => {
@@ -1095,6 +928,7 @@ impl Engine {
                 None => Sink::Dir(csc_platform::paste_folder().unwrap_or_else(|| receive_root(&cfg))),
             }
         } else {
+            // Legacy Drag/DragDrop offers still land in the receive folder.
             Sink::Dir(receive_root(&cfg))
         };
         let space_dir = match &sink {
@@ -1103,7 +937,6 @@ impl Engine {
                 .first()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                 .unwrap_or_else(|| receive_root(&cfg)),
-            Sink::Staged(_) => receive_root(&cfg),
         };
         if let Some(free) = csc_platform::free_bytes(&space_dir) {
             let need = offer.total_bytes.saturating_add(64 * 1024 * 1024);
@@ -1131,38 +964,6 @@ impl Engine {
         .await;
     }
 
-    async fn bind_drop(&mut self, id: u64, sink: Sink) {
-        let Some(p) = self.parked.remove(&id) else {
-            warn!("drop for unknown drag {id}");
-            if let Sink::Staged(feed) = sink {
-                feed.fail();
-            }
-            return;
-        };
-        let from = if p.begin.origin.is_empty() {
-            self.label(&p.peer).await
-        } else {
-            p.begin.origin.clone()
-        };
-        let via = if p.begin.origin.is_empty() {
-            String::new()
-        } else {
-            self.label(&p.peer).await
-        };
-        self.receive(
-            &p.peer,
-            id,
-            TransferPurpose::DragDrop,
-            p.begin.entries,
-            p.begin.total_bytes,
-            sink,
-            from,
-            via,
-            String::new(),
-        )
-        .await;
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn receive(
         &mut self,
@@ -1177,10 +978,6 @@ impl Engine {
         origin_device_id: String,
     ) {
         let cfg = self.config.read().await.clone();
-        let staged = match &sink {
-            Sink::Staged(feed) => Some(feed.clone()),
-            _ => None,
-        };
         let title = batch_title(&entries);
         let files_total = entries.iter().filter(|e| !e.is_directory).count() as u32;
         match prepare_incoming(peer, purpose, entries, total, sink, &cfg) {
@@ -1216,9 +1013,6 @@ impl Engine {
                 }
             }
             Err(why) => {
-                if let Some(feed) = staged {
-                    feed.fail();
-                }
                 popup(format!("拒绝接收来自 {from} 的文件：{why}"), true);
                 let e = FileErrorPayload {
                     transfer_id: id,
@@ -1395,9 +1189,6 @@ impl Engine {
         if let Some(file) = cur.file.as_mut() {
             file.write_all(data)
                 .map_err(|e| format!("写入 {}：{e}", cur.path.display()))?;
-            if let Target::Staged(feed) = &inc.target {
-                feed.progress(index as usize, cur.written);
-            }
             board.add_bytes(id, data.len() as u64);
         }
         inc.received += data.len() as u64;
@@ -1477,9 +1268,6 @@ impl Engine {
         let mode = inc.entries.get(i).map(|e| e.mode).unwrap_or(0);
         apply_mode(preserve, strip, &finished, mode);
         mark_of_web(motw, &finished, peer);
-        if let Target::Staged(feed) = &inc.target {
-            feed.complete(i);
-        }
         board.file_done(end.transfer_id);
         Ok(())
     }
@@ -1498,20 +1286,9 @@ impl Engine {
             .zip(&inc.skip)
             .filter(|(e, s)| !**s && !e.is_directory)
             .count();
-        let message = match &inc.target {
-            Target::Staged(feed) => {
-                for (i, e) in inc.entries.iter().enumerate() {
-                    if e.is_directory || inc.skip[i] {
-                        feed.complete(i);
-                    }
-                }
-                format!("已接收 {files} 个文件")
-            }
-            _ => format!("已接收 {files} 个文件，保存在 {}", inc.dest()),
-        };
-        let open_path = match (&inc.target, inc.tops.as_slice()) {
-            (Target::Staged(_), _) => String::new(),
-            (_, [one]) => one.display().to_string(),
+        let message = format!("已接收 {files} 个文件，保存在 {}", inc.dest());
+        let open_path = match inc.tops.as_slice() {
+            [one] => one.display().to_string(),
             _ => String::new(),
         };
         info!("received {files} files from {peer}");
@@ -1574,8 +1351,6 @@ impl Engine {
                 }
             }
         }
-        self.parked
-            .retain(|_, p| !p.peer.eq_ignore_ascii_case(peer));
         self.outgoing
             .retain(|_, o| !o.peer.eq_ignore_ascii_case(peer));
         self.sending.retain(|_, s| {
@@ -1708,11 +1483,6 @@ fn place(inc: &mut Incoming, choices: &HashMap<usize, Choice>) -> Result<(), Str
             }
             inc.fresh = top_path.values().cloned().collect();
         }
-        Target::Staged(feed) => {
-            for &t in &inc.shape.tops {
-                top_path.insert(t, feed.root.join(&inc.entries[t].relative_path));
-            }
-        }
     }
     let mut targets = Vec::with_capacity(n);
     for i in 0..n {
@@ -1722,10 +1492,7 @@ fn place(inc: &mut Incoming, choices: &HashMap<usize, Choice>) -> Result<(), Str
             targets.push(PathBuf::new());
             continue;
         }
-        let path = match &inc.target {
-            Target::Staged(feed) => feed.path(i).map(Path::to_path_buf).unwrap_or_default(),
-            _ => below(&top_path[&t], &inc.shape.rest[i]),
-        };
+        let path = below(&top_path[&t], &inc.shape.rest[i]);
         if replacing.contains(&t)
             && !inc.entries[i].is_directory
             && std::fs::symlink_metadata(&path).is_ok()
@@ -1814,14 +1581,6 @@ fn prepare_incoming(
                 return Err("放下的位置与文件不对应".into());
             }
             (Target::InPlace, paths, Vec::new())
-        }
-        Sink::Staged(feed) => {
-            if feed.len() != n {
-                return Err("暂存区与文件不对应".into());
-            }
-            std::fs::create_dir_all(&feed.root)
-                .map_err(|e| format!("无法创建 {}：{e}", feed.root.display()))?;
-            (Target::Staged(feed), Vec::new(), Vec::new())
         }
     };
     Ok(Incoming {
@@ -2078,18 +1837,11 @@ fn discard(inc: Incoming) {
     if !inc.requested {
         return;
     }
-    match &inc.target {
-        Target::Staged(feed) => {
-            feed.fail();
-        }
-        _ => {
-            for p in &inc.fresh {
-                if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
-                    let _ = std::fs::remove_dir_all(p);
-                } else {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
+    for p in &inc.fresh {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::remove_dir_all(p);
+        } else {
+            let _ = std::fs::remove_file(p);
         }
     }
     debug!("discarded incoming batch ({:?})", inc.purpose);
@@ -2455,7 +2207,7 @@ mod tests {
         ];
         let mut inc = prepare_incoming(
             "peer",
-            TransferPurpose::DragDrop,
+            TransferPurpose::Paste,
             entries,
             3,
             Sink::InPlace(vec![found.clone(), dir.join("照片")]),
@@ -2474,6 +2226,5 @@ mod tests {
             TransferPurpose::Clipboard.normalized(),
             TransferPurpose::Paste
         );
-        assert_eq!(TransferPurpose::Drag.normalized(), TransferPurpose::Drag);
     }
 }

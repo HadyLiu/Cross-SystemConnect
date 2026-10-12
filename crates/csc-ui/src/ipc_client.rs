@@ -238,14 +238,6 @@ pub fn save_config(body: Value) -> anyhow::Result<Value> {
     call("save_config", body)
 }
 
-pub fn send_files(peer: &str, paths: &[String]) -> anyhow::Result<Value> {
-    call("send_files", json!({"peer": peer, "paths": paths}))
-}
-
-pub fn drag_enter(peer: &str, paths: &[String]) -> anyhow::Result<Value> {
-    call("drag_enter", json!({"peer": peer, "paths": paths}))
-}
-
 pub fn cancel_transfer(id: u64) -> anyhow::Result<Value> {
     call("cancel_transfer", json!({"id": id}))
 }

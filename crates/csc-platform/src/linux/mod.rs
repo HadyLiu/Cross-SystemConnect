@@ -1,4 +1,3 @@
-pub(crate) mod badge;
 pub(crate) mod clip_x11;
 pub(crate) mod fullscreen;
 pub(crate) mod cursor;
@@ -7,9 +6,8 @@ pub(crate) mod leds;
 pub(crate) mod power;
 pub(crate) mod drop_folder;
 pub mod grab;
-pub(crate) mod gtkdrag;
+pub(crate) mod paste_hold;
 pub(crate) mod uinput;
-pub mod xdnd;
 mod xdo;
 
 use crate::stub::StubInputCapture;
@@ -196,20 +194,3 @@ pub(crate) fn warp_cursor(x: i32, y: i32) {
     xdo::warp(x, y);
 }
 
-/// Press or release an X11 button. On Wayland this is a uinput button, so it
-/// does not open the remote-interaction prompt.
-pub(crate) fn inject_x_button(xbtn: u32, down: bool) {
-    if wayland_session() {
-        let button = match xbtn {
-            1 => 0,
-            3 => 1,
-            2 => 2,
-            8 => 3,
-            9 => 4,
-            _ => return,
-        };
-        uinput::button(button, down);
-        return;
-    }
-    xdo::x_button(xbtn, down);
-}

@@ -493,7 +493,7 @@ pub enum InboundEvent {
         hid: u32,
         down: bool,
     },
-    /// JSON message whose sender matters: ClipOffer, EdgeHit, PasteRequest, DragBegin.
+    /// JSON message whose sender matters: ClipOffer, EdgeHit, PasteRequest.
     From {
         peer: String,
         msg: MsgType,
@@ -1723,17 +1723,16 @@ where
     Ok(())
 }
 
-/// What this build can do here. Virtual drags need a desktop that supports them.
+/// What this build can do here. Cross-screen virtual drag is retired.
 fn local_capabilities() -> u32 {
-    let mut caps = csc_proto::CAPABILITIES;
-    if !csc_platform::vdrag::supported() {
-        caps &= !csc_proto::CAP_VIRTUAL_DRAG;
-    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        caps |= csc_proto::CAP_CLIP_PLACEHOLDER;
+        csc_proto::CAPABILITIES | csc_proto::CAP_CLIP_PLACEHOLDER
     }
-    caps
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        csc_proto::CAPABILITIES
+    }
 }
 
 /// A second TCP opened this soon is the other computer dialing at the same time.
@@ -2155,8 +2154,6 @@ async fn dispatch_frame(
         | MsgType::EdgeHit
         | MsgType::PasteRequest
         | MsgType::PasteLocated
-        | MsgType::DragBegin
-        | MsgType::DragRetarget
         | MsgType::FocusInfo
         | MsgType::PeerState
         | MsgType::ControlPause
@@ -2171,6 +2168,8 @@ async fn dispatch_frame(
                 })
                 .await;
         }
+        // Retired cross-screen virtual drag: decode so direction checks pass, then discard.
+        MsgType::DragBegin | MsgType::DragRetarget => {}
         MsgType::Hello => {
             if let Some(h) = decode_hello_bin(&frame.payload) {
                 {

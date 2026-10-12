@@ -59,12 +59,6 @@ pub trait Clipboard: Send {
     fn set_files_lazy(&mut self, entries: &[FileEntry]);
 }
 
-pub trait DragDrop: Send {
-    fn current_drag_files(&mut self) -> Option<Vec<std::path::PathBuf>>;
-    fn begin_drag(&mut self, entries: &[FileEntry]);
-    fn cancel_drag(&mut self);
-}
-
 /// Monitor area in virtual-desktop pixels, relative to the desktop origin.
 /// `right` and `bottom` are exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -1,7 +1,5 @@
-//! One thread reading the core status for the edge window and the transfer window.
-//! Polls fast: the edge window only matters while a drag is held against the edge.
+//! One thread reading the core status for the transfer window.
 
-use crate::drop_zone::{zone_from_status, Zone};
 use crate::ipc_client;
 use crate::UserEvent;
 use serde_json::Value;
@@ -15,19 +13,11 @@ const REFRESH: Duration = Duration::from_secs(1);
 
 pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
-        let mut zone: Option<Zone> = None;
         let mut transfers: Vec<Value> = Vec::new();
         let mut sent_at = Instant::now();
         loop {
             std::thread::sleep(TICK);
             let status = ipc_client::get_status().ok();
-            let z = status.as_ref().and_then(zone_from_status);
-            if z != zone {
-                zone = z.clone();
-                if proxy.send_event(UserEvent::DropZone(z)).is_err() {
-                    return;
-                }
-            }
             let t = status
                 .as_ref()
                 .and_then(|s| s.get("transfers"))

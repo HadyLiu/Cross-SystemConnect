@@ -1,7 +1,6 @@
 mod capture;
 pub mod power;
 mod paste_dir;
-pub mod dragsrc;
 pub mod hook;
 mod host_net;
 mod injector;

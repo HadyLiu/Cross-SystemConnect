@@ -210,10 +210,6 @@ pub fn create_clipboard() -> Box<dyn Clipboard> {
     Box::new(stub::StubClipboard::default())
 }
 
-pub fn create_drag_drop() -> Box<dyn DragDrop> {
-    Box::new(stub::StubDragDrop)
-}
-
 pub fn create_screen_info() -> Box<dyn ScreenInfo> {
     #[cfg(windows)]
     {
@@ -429,7 +425,7 @@ pub fn paste_watch(enable: bool) {
 pub fn prepare_paste(id: u64, items: &[vdrag::DragItem]) -> Option<(u64, Vec<std::path::PathBuf>)> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        linux::xdnd::prepare_paste(id, items)
+        linux::paste_hold::prepare_paste(id, items)
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
@@ -442,7 +438,7 @@ pub fn prepare_paste(id: u64, items: &[vdrag::DragItem]) -> Option<(u64, Vec<std
 pub fn wait_paste(gen: u64, wait: std::time::Duration) -> Option<Vec<std::path::PathBuf>> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        linux::xdnd::wait_paste(gen, wait)
+        linux::paste_hold::wait_paste(gen, wait)
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {

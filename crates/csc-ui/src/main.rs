@@ -1,7 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
-mod drop_zone;
 mod icon;
 mod ipc_client;
 #[cfg(target_os = "linux")]
@@ -38,7 +37,6 @@ pub(crate) enum UserEvent {
     PasteHere,
     ToggleSharing,
     Quit,
-    DropZone(Option<drop_zone::Zone>),
     /// Settings language changed; Windows tray labels are updated on this thread.
     TrayLanguage,
     /// Incoming batches from the core status.
@@ -556,7 +554,6 @@ fn main() -> anyhow::Result<()> {
 
     let mut window = None::<tao::window::Window>;
     let mut webview = None::<wry::WebView>;
-    let mut drop_window = None::<drop_zone::DropWindow>;
     let mut transfer_window = None::<transfer_window::TransferWindow>;
     let mut transfers: Vec<serde_json::Value> = Vec::new();
     let mut warmed = false;
@@ -627,21 +624,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            Event::UserEvent(UserEvent::DropZone(zone)) => match zone {
-                Some(zone) => {
-                    if drop_window.is_none() {
-                        drop_window = drop_zone::DropWindow::create(event_loop);
-                    }
-                    if let Some(dw) = drop_window.as_ref() {
-                        dw.show(&zone);
-                    }
-                }
-                None => {
-                    if let Some(dw) = drop_window.as_ref() {
-                        dw.hide();
-                    }
-                }
-            },
             Event::UserEvent(UserEvent::Transfers(list)) => {
                 if transfer_window.is_none() && !list.is_empty() {
                     transfer_window = transfer_window::TransferWindow::create(event_loop);

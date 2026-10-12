@@ -26,8 +26,6 @@ pub struct AppState {
     pub transfer: crate::transfer::TransferHandle,
     /// Progress of incoming batches, merged into `get_status`.
     pub board: crate::progress::TransferBoard,
-    /// Files dragged into the edge window: (peer, paths).
-    pub drag_enter: tokio::sync::mpsc::Sender<(String, Vec<PathBuf>)>,
     /// Tray asked to paste another computer's files into the fallback folder.
     pub paste_here: tokio::sync::mpsc::Sender<()>,
 }
@@ -401,25 +399,11 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             if peer.is_empty() || paths.is_empty() {
                 return IpcResponse::err(req.id, "peer and paths are required");
             }
-            info!("sending {} dropped item(s) to {peer}", paths.len());
+            info!("sending {} file(s) to {peer}", paths.len());
             state
                 .transfer
-                .send_files(peer, paths, csc_proto::TransferPurpose::Drag)
+                .send_files(peer, paths, csc_proto::TransferPurpose::Paste)
                 .await;
-            IpcResponse::ok(req.id, json!({"ok": true}))
-        }
-        "drag_enter" => {
-            let peer = req
-                .params
-                .get("peer")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let paths = param_paths(&req.params);
-            if peer.is_empty() || paths.is_empty() {
-                return IpcResponse::err(req.id, "peer and paths are required");
-            }
-            let _ = state.drag_enter.try_send((peer, paths));
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "cancel_transfer" => {

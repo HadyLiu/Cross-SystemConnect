@@ -345,7 +345,7 @@ fn parse_gnome_copied(text: &str) -> Option<Vec<PathBuf>> {
 }
 
 fn file_uri(path: &Path) -> String {
-    super::xdnd::file_uri(path)
+    super::paste_hold::file_uri(path)
 }
 
 fn path_of_uri(uri: &str) -> Option<PathBuf> {

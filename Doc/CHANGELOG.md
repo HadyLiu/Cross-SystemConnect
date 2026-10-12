@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 删除
+
+- **移除跨屏文件拖拽**：电脑之间传文件只用复制粘贴（`Ctrl+C` / `Ctrl+V`，以及托盘「粘贴其他电脑复制的文件到这里」）。不再实现边缘细窗、边缘投放窗、虚拟拖放源与承接窗。协议消息 `DRAG_*`、`CAP_VIRTUAL_DRAG`、IPC `drag_enter` / `drag_edge`、平台 `vdrag` 等保留编号/符号但不使用。相关测试与缺陷项标为功能已取消。
+
 ## [2.0.0] - 未发布
 
 协议版本 2，配置版本 5。设计依据：设计方案 v1.1 评审与优化方案 v1.0（2026-10-02）。
@@ -53,26 +57,26 @@
 - 健壮性与诊断（F28）：UI 监护内核自动重启、Linux `systemd --user` 单元、崩溃信息与 Windows minidump、内存自检、诊断包导出 `export_diagnostics`。
 - 卸载与数据清理（F30）：`--uninstall`、`--uninstall --purge`、应用内 `reset_data`；安装包卸载时可选择保留配置与配对记录。
 - 性能测量模式（F31）：`BENCH_SYNC`/`BENCH_ECHO`、时钟同步、`bench_run` 与 `--bench`，CSV 输出；标准测量环境与验收流程。
-- 界面设计文档（[界面设计](界面设计.md)）：设置窗 9 个页面（首页/设备/剪贴板与文件/快捷键与切换/网络/通知与语言/隐私与诊断/高级/关于与更新）、首次运行向导、配对窗、接收进度窗、边缘窗、托盘图标状态；热键录制器与冲突检测（IPC `validate_hotkey`、`set_hotkey_recording`）；状态字段 `first_run`、`drag_edge`，明确 `host_state` 取值；浅色/深色、WCAG AA 对比度、键盘与读屏支持；被控提示层、未摆放区、Wayland 授权横幅；40 条界面测试 T-UI-01～40。
+- 界面设计文档（[界面设计](界面设计.md)）：设置窗 9 个页面（首页/设备/剪贴板与文件/快捷键与切换/网络/通知与语言/隐私与诊断/高级/关于与更新）、首次运行向导、配对窗、接收进度窗、托盘图标状态；热键录制器与冲突检测（IPC `validate_hotkey`、`set_hotkey_recording`）；状态字段 `first_run`（`drag_edge` 保留未用），明确 `host_state` 取值；浅色/深色、WCAG AA 对比度、键盘与读屏支持；被控提示层、未摆放区、Wayland 授权横幅；界面测试 T-UI-01～40（跨屏拖拽相关项后在 Unreleased 取消）。
 - Wayland（F32）：会话判定 `status.platform`（`session`/`desktop`/`supported`/`portals`/`shell_extension`）；IPC `wayland_setup{step}`；GNOME Shell 扩展 `csc-shell@<域名 TBD>`（D-Bus `org.csc.Shell1`）；portal restore token 保存在 `portal-tokens.json`（0600）。
 - 共享控制与被控提示（F33）：托盘/首页「暂停共享」（IPC `set_sharing_enabled`，不持久化，`status.sharing_paused`）；被控端紧急暂停热键与 `CONTROL_PAUSE`(0x16)；被控提示层（`ui.controlled_indicator`，`status.controlled_by`）。
 - 指针与输入一致性（F34）：按物理速度换算（`pointer.match_physical_speed`）与每台速度系数（`trusted_peers[].pointer_speed`）；远端态隐藏主机光标（`pointer.hide_host_cursor`）、被控端非活动时隐藏光标（`pointer.hide_inactive_cursor`）；`SWITCH_ENTER`/`EDGE_HIT` 带越界位移 `carry`；多段外露边的 `position_pct` 规则；滚轮 1/120 单位并在 X11 端累积；连发只由被控端产生（转发的 repeat 丢弃）；AltGr 不触发 `Ctrl+Alt` 热键。
 - 防闲置：使用任一电脑时其他电脑不熄屏、不闲置锁屏（`ACTIVITY`(0x15)、`power.keep_peers_awake`）。
 - 粘贴定位：`PASTE_LOCATED`(0x34)，`FILE_OFFER.dest_hint`/`paste_id`/`purpose:"tray_paste"`；占位目录 `$XDG_RUNTIME_DIR/csc-paste/`；Ubuntu 桌面（DING）与 Dolphin 加入文件管理器白名单（DING 标识 TBD）。
-- 拖拽：落点 = 目标电脑上松开左键时指针所在位置；Esc 在所有平台取消；拖到第三台电脑（`DRAG_RETARGET`(0x42)，旧目标收到 `DRAG_CANCEL{reason:"retarget"}`）。
+- （已在 Unreleased 移除）拖拽：落点 = 目标电脑上松开左键时指针所在位置；Esc 在所有平台取消；拖到第三台电脑（`DRAG_RETARGET`(0x42)）。
 - IPC 新增 `list_interfaces`、`refresh_network`、`set_sharing_enabled`、`set_pairing_open`、`set_peer_pointer_speed`、`wayland_setup`；`export_diagnostics` 增加 `include_crash_dumps`；`validate_hotkey` 冲突类型增加 `ide`；`status`/`transfers`/`pairing` 推送给出完整 JSON 结构。
-- 新消息 `PEER_STATE`(0x07)、`PAIR_COMMIT`(0x08)、`PAIR_NONCE`(0x09)、`ACTIVITY`(0x15)、`CONTROL_PAUSE`(0x16)、`PASTE_LOCATED`(0x34)、`DRAG_RETARGET`(0x42)、`FILE_BATCH`(0x59)、`BENCH_SYNC`(0x70)、`BENCH_ECHO`(0x71)；`MOUSE_*` 类型固定为 0x20–0x23；`LOCK_SCREEN{reason}`。
+- 新消息 `PEER_STATE`(0x07)、`PAIR_COMMIT`(0x08)、`PAIR_NONCE`(0x09)、`ACTIVITY`(0x15)、`CONTROL_PAUSE`(0x16)、`PASTE_LOCATED`(0x34)、`FILE_BATCH`(0x59)、`BENCH_SYNC`(0x70)、`BENCH_ECHO`(0x71)；`DRAG_*`(0x40–0x42) 编号保留但未用（跨屏拖拽已取消）；`MOUSE_*` 类型固定为 0x20–0x23；`LOCK_SCREEN{reason}`。
 - 新错误码 `secure_desktop`、`no_space`、`file_too_large_for_fs`、`resume_mismatch`、`bench_disabled`、`bad_direction`、`pairing_closed`、`pair_code_mismatch`、`commit_mismatch`、`too_many_connections`、`handshake_timeout`、`rate_limited`、`sharing_paused`、`placeholder_mismatch`、`resume_origin_mismatch`、`portal_denied`、`extension_missing`、`path_not_allowed`；UI 本地 `forbidden`、`update_signature_invalid`。
 - 配置 v5 新增字段：`keyboard.*`、`switch.block_modifier/block_when_fullscreen/corner_dead_px`、`hotkeys.lock_to_screen`、`clipboard.rich`、`file_transfer.preserve_mtime/preserve_mode/resume_window_min/max_parallel`、`notify.*`、`ui.language`、`network.manual_peers/interface_mode/ipv6/listen_private_only/trusted_wifi`、`update.*`、`limits.*`、`diagnostics.bench_enabled`、`trusted_peers[].pointer_speed`、`hotkeys.emergency_pause`、`clipboard.push_mode`、`pointer.*`、`power.keep_peers_awake`、`pairing.open_window_s`、`identity.key_store`、`file_transfer.mark_of_web/strip_exec_on_desktop`、`ui.controlled_indicator`（缺省自动补齐，不再升配置版本）。
 - 首次运行向导：选择角色、网卡、开机自启（默认勾选），Wayland 下增加系统授权与扩展步骤，最后打开“允许新配对”；两端都为主机时提示角色冲突（`role_conflict`）。
-- 独立数据连接（TCP `data_port`，默认 24901，与控制端口分开；`DATA_ATTACH` + 会话令牌绑定），文件、大段文字、图片、拖拽内容都走数据连接。
+- 独立数据连接（TCP `data_port`，默认 24901，与控制端口分开；`DATA_ATTACH` + 会话令牌绑定），文件、大段文字、图片都走数据连接。
 - 剪贴板延迟拉取：大于 64 KiB 的文字和所有图片只发元数据，粘贴时才用 `CLIP_REQUEST`/`CLIP_DATA`/`CLIP_END` 分块拉取（Windows 延迟渲染、X11 选择所有者 + INCR）。
 - `INPUT_RESET` 消息、主机 `PressedSet` 与被控端 `InjectedSet`：切换、断线、锁屏时释放所有按下的键和鼠标按钮；被控端 1.5 s 看门狗。
 - Win（Super）键缓冲：远端态下 Win 键先缓冲，根据后续按键决定转发或执行热键。
 - 锁屏联动会话事件：Windows `WTS_SESSION_LOCK`、Linux logind `Lock` / ScreenSaver `ActiveChanged`。
 - `FOCUS_INFO` 焦点上报；托盘菜单「粘贴其他电脑复制的文件到这里」（IPC `paste_remote_files`）。
 - `SCREEN_UPDATE` 与显示器矩形模型（支持负坐标、外露边判断）；Windows PerMonitorV2 DPI 感知。
-- Windows 跨屏拖拽承接窗；Linux 非 XDS 拖拽用 inotify 定位副本，并清理占位文件。
+- （已在 Unreleased 移除）Windows 跨屏拖拽承接窗；Linux 非 XDS 拖拽用 inotify 定位副本。
 - 能力位 `CAP_DATA_CHANNEL`、`CAP_LAZY_CLIP`、`CAP_FOCUS_INFO`、`CAP_MULTI_MONITOR`。
 - 协议错误码表（`frame_too_large`、`not_paired`、`unsolicited`、`path_rejected` 等）。
 - Windows 低级钩子看门狗（自动重装）；“以管理员权限运行”自启选项（计划任务）。
@@ -92,9 +96,8 @@
 - 单实例：Windows 命名互斥体，Linux `flock` 锁文件；命名管道仅当前用户可访问并拒绝远程客户端；Unix socket 0600。
 - 自启一律为“用户登录后”启动。
 - 日志单文件 1 MB 时转存为 `log.1.txt`（原为 100 KB 清空重写）。
-- “保存目录”改名为“兜底保存目录”（默认桌面），只在拿不到文件管理器当前文件夹或拖放位置时使用；`file_transfer.receive_dir` 只能在配置文件中设置。
+- “保存目录”改名为“兜底保存目录”（默认桌面），只在拿不到文件管理器当前文件夹或托盘粘贴时使用；`file_transfer.receive_dir` 只能在配置文件中设置。
 - 首次运行无界面时 core 不写开机自启；向导默认勾选“开机自动启动”。
-- Windows 拖拽目标的放下位置、重名、命名由资源管理器决定，进度窗不再提供「打开位置」。
 
 ### 删除
 
@@ -108,9 +111,8 @@
 
 - 未配对连接只允许 `HELLO`/`HEARTBEAT`/`PAIR_*`，不进入布局、不收剪贴板、不能成为切换目标。
 - 帧长上限：控制连接 64 KiB+256、数据块帧 64 KiB+64、JSON 帧 4 MiB，超限断开。
-- `FILE_OFFER` 必须带一次性 `offer_token`（120 s），或匹配已定位的拖拽登记。
+- `FILE_OFFER` 必须带一次性 `offer_token`（120 s）。
 - 接收路径逐分量净化：拒绝 `..`、绝对路径、盘符/UNC；Windows 非法字符（含 `:`，因而不会形成备用数据流）、保留名、末尾点或空格、控制字符自动改名；不跟随、不创建符号链接。
-- Linux 非 XDS 拖拽只向文件管理器提供占位文件，浏览器等程序不会收到。
 - 隐私（F29）：任何日志级别都不记录按键内容、剪贴板内容、文件内容、配对码；info 及以上不记录文件名；无遥测；诊断包不含私钥；杀毒软件/EDR 误报与白名单说明、隐私声明写入用户手册。
 - 测量消息 `BENCH_*` 仅在两端都开启 `diagnostics.bench_enabled` 时接受。
 - 配对承诺-揭示（防中间人在看到对方随机数后挑选碰撞）；限时“允许新配对”窗口；被控端输入配对码；新设备不自动进布局；指纹变化警告。
@@ -120,7 +122,7 @@
 - 暴露面：只在所选网卡或私有/链路本地地址监听；网卡自动模式不使用公共网络和未信任的 Wi-Fi；Windows 防火墙规则只作用于专用/域网络。
 - 抗滥用：未认证连接全局 8、每 IP 2；TLS/HELLO 各 5 s 超时；失败过多按 IP 拒绝 5 分钟；配对窗队列上限 3。
 - 消息方向检查：方向不符的消息断开（`bad_direction`）。
-- Linux 占位与拖拽定位校验令牌、inode、属主，不跟随符号链接（`placeholder_mismatch`）。
+- Linux 粘贴占位定位校验令牌、inode、属主，不跟随符号链接（`placeholder_mismatch`）。
 - 收到的文件：Windows 加 Mark-of-the-Web（ZoneId=3）；Linux 存到桌面的文件去掉可执行位，`.desktop` 不标记可信；续传校验发送方身份（`resume_origin_mismatch`）。
 - 威胁模型增加“主机被攻陷”：被控端可随时紧急暂停并看到被控提示。
 - 更新检查：清单 minisign 签名、下载域名白名单、说明纯文本显示（`update_signature_invalid`）。

@@ -50,15 +50,6 @@ impl Clipboard for StubClipboard {
     fn set_files_lazy(&mut self, _entries: &[FileEntry]) {}
 }
 
-pub struct StubDragDrop;
-impl DragDrop for StubDragDrop {
-    fn current_drag_files(&mut self) -> Option<Vec<std::path::PathBuf>> {
-        None
-    }
-    fn begin_drag(&mut self, _entries: &[FileEntry]) {}
-    fn cancel_drag(&mut self) {}
-}
-
 pub struct StubScreenInfo;
 impl ScreenInfo for StubScreenInfo {
     fn virtual_size(&self) -> ScreenSize {

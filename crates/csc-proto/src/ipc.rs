@@ -85,9 +85,6 @@ pub struct AppStatus {
     /// For example `10.10.10.0/24` when search is bound to 10.10.10.10.
     #[serde(default)]
     pub search_subnet: String,
-    /// Shown while files are dragged against an edge that leads to a peer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drop_zone: Option<DropZone>,
     /// Batches this computer is receiving or has just received.
     #[serde(default)]
     pub transfers: Vec<TransferProgress>,
@@ -169,21 +166,6 @@ pub struct TransferProgress {
 pub struct RenamedName {
     pub from: String,
     pub to: String,
-}
-
-/// Screen area (absolute desktop pixels) where a drop sends files to `peer`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DropZone {
-    pub peer: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    /// Files entering the window start a drag onto the other screen (`drag_enter`).
-    /// Otherwise they are sent when dropped on the window (`send_files`).
-    #[serde(default)]
-    pub virtual_drag: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
