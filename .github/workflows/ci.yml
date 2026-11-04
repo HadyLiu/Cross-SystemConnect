@@ -2,7 +2,7 @@
 # image：调用 toolchain-image.yml，按 Dockerfile 哈希标签判断，标签不存在时才构建；
 #        输出的标签供 check/build 作为 container.image。
 # check：所有 push / PR / 手动触发都在镜像容器内执行 packaging/check.sh。
-# build：仅打 v* 标签时运行，编译、生成 SHA256SUMS、上传 artifact 并创建草稿 Release。
+# build：仅打 v* 标签时运行，编译、生成 SHA256SUMS、上传 artifact 并发布 Release。
 # 去重：分支推送的 run 先由 plan 检查当前 commit 是否已有 v* 标签，有则整套跳过，
 #       交给标签 run 完整执行；标签 run 永远执行。详见 Doc/构建发布流程.md §8.1。
 name: ci
@@ -139,10 +139,11 @@ jobs:
             dist/Cross-SystemConnect-windows-x86_64.zip
             dist/SHA256SUMS
 
-      - name: 草稿 Release
+      - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ github.ref_name }}
+          draft: false
           generate_release_notes: true
           files: |
             dist/Cross-SystemConnect-linux-x86_64.tar.gz
