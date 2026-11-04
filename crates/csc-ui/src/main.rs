@@ -51,6 +51,24 @@ pub(crate) enum UserEvent {
     },
 }
 
+/// What should pop the settings window: a client asking to connect, or a
+/// pairing code this computer must show. Empty when nothing is waiting.
+fn popup_key(status: &serde_json::Value) -> String {
+    let host = status
+        .get("pendingPeer")
+        .and_then(|p| p.get("hostName"))
+        .and_then(|s| s.as_str())
+        .unwrap_or_default();
+    let code = status
+        .get("pairingCode")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default();
+    if host.is_empty() && code.is_empty() {
+        return String::new();
+    }
+    format!("{host}\u{1f}{code}")
+}
+
 pub(crate) fn app_title() -> String {
     format!("Cross-SystemConnect v{APP_VERSION}")
 }
@@ -534,28 +552,25 @@ fn main() -> anyhow::Result<()> {
         handle
     };
 
-    // Bring the settings window forward when a client asks to connect.
+    // Bring the settings window forward when a client asks to connect, or when
+    // this computer has a pairing code to show. The page skips status polls while
+    // hidden in the tray, so a code would otherwise never appear.
     {
         let proxy = proxy.clone();
         std::thread::spawn(move || {
             let mut shown_for = String::new();
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(800));
-                let host = ipc_client::get_status()
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let key = ipc_client::get_status()
                     .ok()
-                    .and_then(|v| {
-                        v.get("pendingPeer")
-                            .and_then(|p| p.get("hostName"))
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string())
-                    })
+                    .map(|v| popup_key(&v))
                     .unwrap_or_default();
-                if host.is_empty() {
+                if key.is_empty() {
                     shown_for.clear();
                     continue;
                 }
-                if host != shown_for {
-                    shown_for = host;
+                if key != shown_for {
+                    shown_for = key;
                     let _ = proxy.send_event(UserEvent::ShowSettings);
                 }
             }
@@ -626,7 +641,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 } else if let Some(w) = window.as_ref() {
                     w.set_visible(true);
+                    w.set_minimized(false);
+                    // Briefly on top so a pairing prompt is not buried under other windows.
+                    w.set_always_on_top(true);
                     w.set_focus();
+                    w.set_always_on_top(false);
                     // Hide→show leaves GTK CSD close dead until a configure
                     // (e.g. maximize). Toggle resizable to force that heal.
                     #[cfg(target_os = "linux")]
@@ -756,6 +775,18 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pairing_code_pops_the_window() {
+        let none = serde_json::json!({"pairingCode": "", "pendingPeer": null});
+        assert!(super::popup_key(&none).is_empty());
+        let code = serde_json::json!({"pairingCode": "123456"});
+        let other = serde_json::json!({"pairingCode": "654321"});
+        assert!(!super::popup_key(&code).is_empty());
+        assert_ne!(super::popup_key(&code), super::popup_key(&other));
+        let peer = serde_json::json!({"pendingPeer": {"hostName": "Desk"}});
+        assert!(!super::popup_key(&peer).is_empty());
+    }
+
     #[test]
     fn index_html_embeds_package_version() {
         let html = String::from_utf8(super::index_html()).expect("utf-8");

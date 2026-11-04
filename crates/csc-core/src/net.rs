@@ -1924,6 +1924,9 @@ where
     let mut early = Vec::new();
     let mut tmp = [0u8; 4096];
     let mut last = tokio::time::Instant::now();
+    // Code this attempt put on screen. Another attempt (a second address, a
+    // redial) may show its own code meanwhile; only clear ours.
+    let mut shown = String::new();
     let result = async {
         loop {
             if let Some(frame) = try_decode_frame(buf)? {
@@ -1953,14 +1956,16 @@ where
                     };
                     write_locked(writer, &encode_json_frame(MsgType::PairNonce, &reveal)?).await?;
                     let code = csc_proto::pair_code(exporter, &na, &nb);
-                    app_status.write().await.pairing_code = format!("{code:06}");
+                    shown = format!("{code:06}");
+                    app_status.write().await.pairing_code = shown.clone();
                     info!("pairing code {code:06}");
                     let confirm =
                         read_typed(reader, buf, Duration::from_secs(120), MsgType::PairConfirm)
                             .await?;
                     let ok: csc_proto::PairConfirmPayload =
                         serde_json::from_slice(&confirm.payload)?;
-                    app_status.write().await.pairing_code.clear();
+                    release_code(&mut app_status.write().await.pairing_code, &shown);
+                    shown.clear();
                     if !ok.accepted {
                         anyhow::bail!("pair_code_mismatch");
                     }
@@ -1993,8 +1998,15 @@ where
         }
     }
     .await;
-    app_status.write().await.pairing_code.clear();
+    release_code(&mut app_status.write().await.pairing_code, &shown);
     result
+}
+
+/// Clear the displayed pairing code only if it is still the one this attempt showed.
+fn release_code(slot: &mut String, mine: &str) {
+    if !mine.is_empty() && slot == mine {
+        slot.clear();
+    }
 }
 
 async fn allow_control(
@@ -2559,6 +2571,18 @@ pub fn encode_clip_offer(v: &impl serde::Serialize) -> Result<Vec<u8>, serde_jso
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_failed_attempt_keeps_another_attempts_code() {
+        let mut slot = "111111".to_string();
+        // An attempt that showed nothing, or another code, leaves it alone.
+        super::release_code(&mut slot, "");
+        super::release_code(&mut slot, "222222");
+        assert_eq!(slot, "111111");
+        super::release_code(&mut slot, "111111");
+        assert!(slot.is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -1399,6 +1399,8 @@ $('shareBtn').onclick=async()=>{
 applyLang('auto');
 load();
 setInterval(()=>{ refreshStatus().catch(()=>{}); }, 1000);
+// Shown again from the tray: refresh at once so a waiting pairing code appears immediately.
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshStatus().catch(()=>{}); });
 </script>
 </body>
 </html>
