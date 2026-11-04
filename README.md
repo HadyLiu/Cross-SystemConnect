@@ -2,7 +2,7 @@
 
 跨平台**键鼠共享**软件：一套键盘鼠标控制多台 Windows / Linux 电脑，并支持剪贴板与文件协同。
 
-详细设计见 [Doc/设计方案.md](Doc/设计方案.md)；开发环境与构建步骤见 [Doc/开发环境.md](Doc/开发环境.md)。
+完整说明见 [Doc/README.md](Doc/README.md)；架构见 [Doc/架构设计.md](Doc/架构设计.md)；构建与发布见 [Doc/构建发布流程.md](Doc/构建发布流程.md)；使用见 [Doc/用户手册.md](Doc/用户手册.md)。
 
 ---
 
@@ -37,7 +37,7 @@
 
 ## 快速开始
 
-完整步骤见 **[Doc/开发环境.md](Doc/开发环境.md)**。
+完整步骤见 **[Doc/构建发布流程.md](Doc/构建发布流程.md)**。
 
 使用 Docker 生成的程序。重新生成前先托盘右键「退出」，否则新启动的界面会连上还在运行的旧内核。
 
@@ -60,21 +60,45 @@ bash scripts/package-docker.sh
 
 电脑之间的键鼠通道是 TLS。每台机器在配置目录保存自己的 `identity.crt` 和 `identity.key`。发现广播只包含计算机名和端口。
 
-Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/uinput`，不弹出远程交互。见 [Doc/开发环境.md](Doc/开发环境.md)。
+Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/uinput`，不弹出远程交互。见 [Doc/用户手册.md](Doc/用户手册.md)。
 
-版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/开发环境.md](Doc/开发环境.md) 第 6 节。
+版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/构建发布流程.md](Doc/构建发布流程.md)。
 
 ---
 
-## 文档与目录
+## 目录结构
 
-| 文档 / 目录 | 内容 |
-|-------------|------|
-| [Doc/设计方案.md](Doc/设计方案.md) | 需求、协议、架构 |
-| [Doc/开发环境.md](Doc/开发环境.md) | 环境搭建、构建、运行、FAQ |
-| `packaging/` | Docker 镜像定义，一次生成 Windows 与 Linux |
-| `scripts/` | `package-docker.sh` |
-| `crates/` | Rust 源码（crate 名可含 csc-*，产物名为 Cross-SystemConnect*） |
-| `resources/` | 图标等资源 |
+```
+Cross-SystemConnect/
+├── Cargo.toml          # Rust workspace（版本号、公共依赖）
+├── crates/
+│   ├── csc-proto/      # 协议帧、消息、配对、IPC 定义
+│   ├── csc-config/     # 配置与日志文件
+│   ├── csc-platform/   # 平台层：Windows 钩子/注入、Linux X11/uinput、剪贴板等
+│   ├── csc-core/       # 内核 Cross-SystemConnect-core：网络、TLS、切换、剪贴板、文件传输、IPC
+│   └── csc-ui/         # 界面 Cross-SystemConnect：托盘 + WebView 设置窗、传输窗口
+├── packaging/          # Docker 镜像定义与编译脚本（一次生成 Windows 与 Linux）
+├── scripts/            # package-docker.sh、check-docker.sh
+├── resources/          # 图标
+├── tools/              # 辅助脚本
+└── Doc/                # PRD、架构设计、构建发布、用户手册、测试、CHANGELOG
+```
 
-生成产物（如 `dist/`）不纳入版本库。
+生成产物（`dist/`、`target/`）不纳入版本库。
+
+## 文档
+
+| 文档 | 内容 |
+|------|------|
+| [Doc/README.md](Doc/README.md) | 特性、支持平台、快速开始 |
+| [Doc/PRD.md](Doc/PRD.md) | 需求 |
+| [Doc/架构设计.md](Doc/架构设计.md) | 协议与架构 |
+| [Doc/界面设计.md](Doc/界面设计.md) | 界面 |
+| [Doc/构建发布流程.md](Doc/构建发布流程.md) | 工具链、构建、发布 |
+| [Doc/用户手册.md](Doc/用户手册.md) | 使用说明 |
+| [Doc/测试用例.md](Doc/测试用例.md) / [Doc/测试bug问题.md](Doc/测试bug问题.md) | 测试 |
+| [Doc/CHANGELOG.md](Doc/CHANGELOG.md) | 变更记录 |
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。Copyright 2026 Hady Liu。

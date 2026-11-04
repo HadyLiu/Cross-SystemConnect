@@ -113,4 +113,4 @@ Deskflow、Input Leap、LAN Mouse（同类项目）；Tokio、rustls、serde；t
 
 ## 许可证
 
-TBD
+本项目基于 [Apache License 2.0](../LICENSE) 开源。Copyright 2026 Hady Liu。
