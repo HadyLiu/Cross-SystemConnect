@@ -8,6 +8,7 @@
 
 ### 变更
 
+- **适配新版 cargo-deny 配置格式**：`deny.toml` 的 `[advisories]` 删除已移除的 `vulnerability`、`notice` 键（漏洞一律报错），`unmaintained` 改为作用范围值 `"none"`（无人维护的依赖不导致失败），`yanked = "warn"` 保持不变。
 - **被控提示改为托盘绿点**：不再显示屏幕右上角「Controlled · Ctrl+Alt+Shift+P」叠层（含 X11 override-redirect / 原计划的 Shell 顶栏指示）。已连接时主机与被控端托盘图标右下角常亮绿点；仅当本机正在被控时绿点闪烁；未连接不加绿点。状态字段 `status.beingControlled`；`ui.controlled_indicator` 与屏幕提示层不再使用。
 
 ### 删除

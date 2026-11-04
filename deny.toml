@@ -8,10 +8,11 @@ targets = [
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny 0.18+ 新格式：vulnerability/notice 键已移除，漏洞一律报错；
+# unmaintained 表示作用范围（all/workspace/transitive/none），范围内即报错。
+# 设为 none：不因无人维护的依赖失败（原意图为仅警告，cargo audit 仍会提示）。
+unmaintained = "none"
 yanked = "warn"
-notice = "warn"
 
 [licenses]
 version = 2
