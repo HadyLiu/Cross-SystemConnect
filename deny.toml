@@ -29,6 +29,8 @@ allow = [
     "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # ksni（csc-ui 的 Linux 托盘依赖）使用 Unlicense（公共领域），与 Apache-2.0 兼容
+    "Unlicense",
     "Zlib",
 ]
 confidence-threshold = 0.8
