@@ -20,6 +20,8 @@ pub enum ClipEvent {
     Image(ClipImage),
 }
 
+// 变体都表示“写入剪贴板”的命令，Set 前缀即语义本身，保留以免大范围改名。
+#[allow(clippy::enum_variant_names)]
 enum ClipCmd {
     SetText(String),
     SetImage(Vec<u8>),

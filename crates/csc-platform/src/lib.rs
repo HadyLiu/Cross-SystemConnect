@@ -95,7 +95,7 @@ pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
-        return Some(st.f_bavail as u64 * st.f_frsize as u64);
+        Some(st.f_bavail as u64 * st.f_frsize as u64)
     }
     #[cfg(not(unix))]
     {

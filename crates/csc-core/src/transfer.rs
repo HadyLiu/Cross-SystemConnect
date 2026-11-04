@@ -199,7 +199,7 @@ fn unix_mode(meta: &std::fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return meta.permissions().mode() & 0o777;
+        meta.permissions().mode() & 0o777
     }
     #[cfg(not(unix))]
     {
@@ -1799,10 +1799,8 @@ fn park_partial(mut inc: Incoming) {
             continue;
         }
         let part = part_path(dest);
-        if writing != part {
-            if std::fs::rename(&writing, &part).is_err() {
-                continue;
-            }
+        if writing != part && std::fs::rename(&writing, &part).is_err() {
+            continue;
         }
         write_meta(
             &part,

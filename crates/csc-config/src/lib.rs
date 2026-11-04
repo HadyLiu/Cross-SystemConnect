@@ -364,19 +364,11 @@ fn default_theme() -> String {
     "dark".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiagnosticsConfig {
     /// Accept BENCH_SYNC / BENCH_ECHO only when this is on.
     #[serde(default)]
     pub bench_enabled: bool,
-}
-
-impl Default for DiagnosticsConfig {
-    fn default() -> Self {
-        Self {
-            bench_enabled: false,
-        }
-    }
 }
 
 /// Which desktop notices the core may show. Pairing always opens its own window.

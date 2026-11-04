@@ -16,9 +16,7 @@ pub struct LinuxTray {
 
 impl LinuxTray {
     fn dot(&self) -> GreenDot {
-        if !self.connected {
-            GreenDot::Off
-        } else if self.being_controlled && !self.blink_on {
+        if !self.connected || (self.being_controlled && !self.blink_on) {
             GreenDot::Off
         } else {
             GreenDot::On

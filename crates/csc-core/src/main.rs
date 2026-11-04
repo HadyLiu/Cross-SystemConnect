@@ -145,7 +145,6 @@ fn inject_controlled_jump(
         } else {
             injector.mouse_move_abs(x, y);
         }
-        return;
     }
     #[cfg(not(target_os = "linux"))]
     {

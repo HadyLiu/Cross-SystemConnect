@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn one_file_manager_window_is_the_paste_folder() {
         let only = PathBuf::from("/home/hady/Projects");
-        assert_eq!(pick_window(&[only.clone()], ""), Some(only));
+        assert_eq!(pick_window(std::slice::from_ref(&only), ""), Some(only));
         assert!(is_files("org.gnome.Nautilus"));
         assert!(is_files("文件"));
         assert!(!is_files("gnome-terminal"));
