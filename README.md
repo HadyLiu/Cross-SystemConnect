@@ -64,7 +64,7 @@ Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/
 
 ### GitHub Actions
 
-`.github/workflows/ci.yml` 按 **image → check → build** 运行，统一使用 Docker 工具链镜像 `ghcr.io/hadyliu/cross-systemconnect-toolchain`：`image` 只在 GHCR 上还没有该镜像时构建一次（即第一次推送时），之后直接复用；`check` 在每次 push/PR 时于镜像内执行测试、clippy、fmt、audit、deny；`build` 只在推送 `v*` 标签时运行，编译 Linux 与 Windows 包、生成 `SHA256SUMS` 并创建草稿 Release。需重建镜像时手动运行 `toolchain-image` 并勾选 `force`。仓库需在 Settings → Actions → General 把 Workflow permissions 设为读写；同一 commit 同时推送分支和 `v*` 标签时，分支 run 的 `plan` 会发现该标签并整套跳过，只由标签 run 完整执行 image → check → build，不会跑两遍。详见 [Doc/构建发布流程.md](Doc/构建发布流程.md) §8。
+`.github/workflows/ci.yml` 按 **image → check → build** 运行，统一使用 Docker 工具链镜像 `ghcr.io/hadyliu/cross-systemconnect-toolchain`：镜像标签按 `packaging/Dockerfile` 内容哈希生成（`toolchain-<12 位哈希>`），`image` 只在 GHCR 上还没有该标签时构建一次，Dockerfile 不变就一直复用，改了 Dockerfile 后的第一次推送自动重建；`check` 在每次 push/PR 时于镜像内执行测试、clippy、fmt、audit、deny；`build` 只在推送 `v*` 标签时运行，编译 Linux 与 Windows 包、生成 `SHA256SUMS` 并创建草稿 Release。Dockerfile 未变但需强制重建时，手动运行 `toolchain-image` 并勾选 `force`。仓库需在 Settings → Actions → General 把 Workflow permissions 设为读写；同一 commit 同时推送分支和 `v*` 标签时，分支 run 的 `plan` 会发现该标签并整套跳过，只由标签 run 完整执行 image → check → build，不会跑两遍。详见 [Doc/构建发布流程.md](Doc/构建发布流程.md) §8。
 
 版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/构建发布流程.md](Doc/构建发布流程.md)。
 

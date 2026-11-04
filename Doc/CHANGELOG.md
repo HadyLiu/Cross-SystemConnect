@@ -20,6 +20,7 @@
 
 - 清理代码格式与 clippy 警告：全仓 `cargo fmt`，修复全部 clippy 警告，`packaging/check.sh` 的 fmt / clippy 步骤可通过。
 - 工作流避免分支与标签重复触发：同一 commit 同时推送分支和 `v*` 标签时只由标签 run 完整执行 image → check → build（见 [构建发布流程](构建发布流程.md) §8.1.1）。
+- 修复 CI 工具链镜像缺少 clippy/rustfmt：Dockerfile 固定 `rust:1.99.1-bookworm` 并显式安装组件；镜像改按 Dockerfile 内容哈希打标签，Dockerfile 变更后自动重建一次。
 
 ## [0.2.0] - 2026-11-04
 
