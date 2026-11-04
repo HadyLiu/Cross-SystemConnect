@@ -14,7 +14,7 @@
 
 - **移除跨屏文件拖拽**：电脑之间传文件只用复制粘贴（`Ctrl+C` / `Ctrl+V`，以及托盘「粘贴其他电脑复制的文件到这里」）。不再实现边缘细窗、边缘投放窗、虚拟拖放源与承接窗。协议消息 `DRAG_*`、`CAP_VIRTUAL_DRAG`、IPC `drag_enter` / `drag_edge`、平台 `vdrag` 等保留编号/符号但不使用。相关测试与缺陷项标为功能已取消。
 
-## [2.0.0] - 未发布
+## [0.2.0] - 2026-11-04
 
 协议版本 2，配置版本 5。设计依据：设计方案 v1.1 评审与优化方案 v1.0（2026-10-02）。
 
@@ -179,6 +179,6 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
-[2.0.0]: TBD
+[0.2.0]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.0
 [1.1]: TBD
 [0.3]: TBD
