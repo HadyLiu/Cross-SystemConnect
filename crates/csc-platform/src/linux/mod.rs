@@ -1,11 +1,11 @@
 pub(crate) mod clip_x11;
-pub(crate) mod fullscreen;
 pub(crate) mod cursor;
-pub(crate) mod leds;
-pub(crate) mod power;
 pub(crate) mod drop_folder;
+pub(crate) mod fullscreen;
 pub mod grab;
+pub(crate) mod leds;
 pub(crate) mod paste_hold;
+pub(crate) mod power;
 pub(crate) mod uinput;
 mod xdo;
 
@@ -192,4 +192,3 @@ pub(crate) fn warp_cursor(x: i32, y: i32) {
     }
     xdo::warp(x, y);
 }
-

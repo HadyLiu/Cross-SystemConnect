@@ -158,31 +158,31 @@ pub fn ensure_core_running() -> anyhow::Result<()> {
     }
     #[cfg(not(windows))]
     {
-    let mut slot = start_failure()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    if try_connect() {
-        *slot = None;
-        return Ok(());
-    }
-    if let Some(prev) = slot.as_ref() {
-        if prev.at.elapsed() < Duration::from_secs(3) {
-            anyhow::bail!("{}", prev.message);
-        }
-    }
-    match spawn_core() {
-        Ok(()) => {
+        let mut slot = start_failure()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if try_connect() {
             *slot = None;
-            Ok(())
+            return Ok(());
         }
-        Err(err) => {
-            *slot = Some(StartFailure {
-                at: Instant::now(),
-                message: err.to_string(),
-            });
-            Err(err)
+        if let Some(prev) = slot.as_ref() {
+            if prev.at.elapsed() < Duration::from_secs(3) {
+                anyhow::bail!("{}", prev.message);
+            }
         }
-    }
+        match spawn_core() {
+            Ok(()) => {
+                *slot = None;
+                Ok(())
+            }
+            Err(err) => {
+                *slot = Some(StartFailure {
+                    at: Instant::now(),
+                    message: err.to_string(),
+                });
+                Err(err)
+            }
+        }
     }
 }
 

@@ -128,7 +128,8 @@ fn worker(rx: Receiver<Cmd>) {
                     let mut gnome = String::from("copy\n");
                     gnome.push_str(&uris.join("\n"));
                     gnome_bytes = gnome.into_bytes();
-                    if let Err(e) = conn.set_selection_owner(win, atoms.clipboard, x11rb::CURRENT_TIME)
+                    if let Err(e) =
+                        conn.set_selection_owner(win, atoms.clipboard, x11rb::CURRENT_TIME)
                     {
                         warn!("clipboard: set_selection_owner: {e}");
                         continue;
@@ -286,14 +287,8 @@ pub fn read_gnome_files() -> Option<Vec<PathBuf>> {
         .reply()
         .ok()?
         .atom;
-    conn.convert_selection(
-        win,
-        atoms.clipboard,
-        atoms.gnome,
-        prop,
-        x11rb::CURRENT_TIME,
-    )
-    .ok()?;
+    conn.convert_selection(win, atoms.clipboard, atoms.gnome, prop, x11rb::CURRENT_TIME)
+        .ok()?;
     conn.flush().ok()?;
     let deadline = Instant::now() + Duration::from_millis(400);
     while Instant::now() < deadline {

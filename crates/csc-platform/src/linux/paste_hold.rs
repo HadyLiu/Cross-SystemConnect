@@ -205,11 +205,7 @@ fn search_dirs(staging: &Path, since_secs: i64) -> Vec<PathBuf> {
         if seen > MAX_DIRS {
             break;
         }
-        if dir.starts_with(staging)
-            || dir
-                .components()
-                .any(|c| c.as_os_str() == "csc-paste")
-        {
+        if dir.starts_with(staging) || dir.components().any(|c| c.as_os_str() == "csc-paste") {
             continue;
         }
         if std::fs::metadata(&dir).is_ok_and(|m| m.mtime() >= since_secs) {
@@ -267,7 +263,12 @@ pub(crate) fn prepare_paste(id: u64, items: &[DragItem]) -> Option<(u64, Vec<Pat
 /// Block until the file manager has copied the placeholders, or `wait` elapses.
 /// A newer [`prepare_paste`] cancels this wait.
 pub(crate) fn wait_paste(gen: u64, wait: Duration) -> Option<Vec<PathBuf>> {
-    let hold = PASTE.lock().ok()?.as_ref().filter(|h| h.gen == gen)?.clone();
+    let hold = PASTE
+        .lock()
+        .ok()?
+        .as_ref()
+        .filter(|h| h.gen == gen)?
+        .clone();
     let since = SystemTime::now() - Duration::from_secs(2);
     let deadline = Instant::now() + wait;
     loop {

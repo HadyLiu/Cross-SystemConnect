@@ -10,7 +10,9 @@ mod notify;
 mod traits;
 pub mod vdrag;
 
-pub use lock::{lock_hits, lock_screen, lock_watch, mods_held, pause_hits, pause_watch, stay_hits, stay_watch};
+pub use lock::{
+    lock_hits, lock_screen, lock_watch, mods_held, pause_hits, pause_watch, stay_hits, stay_watch,
+};
 pub use notify::notify;
 
 /// The machine is about to sleep, shutting down, or has woken.
@@ -57,11 +59,11 @@ pub fn note_user_activity() {
     linux::power::note_user_activity();
     #[cfg(windows)]
     {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_MOVE,
-        };
         use windows::Win32::System::Power::{
             SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+        };
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
         };
         unsafe {
             let input = INPUT {
@@ -78,9 +80,8 @@ pub fn note_user_activity() {
                 },
             };
             let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-            let _ = SetThreadExecutionState(
-                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
-            );
+            let _ =
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
         }
     }
 }

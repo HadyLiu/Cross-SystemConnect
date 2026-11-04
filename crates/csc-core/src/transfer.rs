@@ -918,14 +918,13 @@ impl Engine {
         } else {
             self.label(peer).await
         };
-        let sink = if matches!(
-            purpose,
-            TransferPurpose::Paste | TransferPurpose::Clipboard
-        ) {
+        let sink = if matches!(purpose, TransferPurpose::Paste | TransferPurpose::Clipboard) {
             match self.expect_paste.take() {
                 Some(paths) if paths.is_empty() => Sink::Dir(receive_root(&cfg)),
                 Some(paths) => Sink::InPlace(paths),
-                None => Sink::Dir(csc_platform::paste_folder().unwrap_or_else(|| receive_root(&cfg))),
+                None => {
+                    Sink::Dir(csc_platform::paste_folder().unwrap_or_else(|| receive_root(&cfg)))
+                }
             }
         } else {
             // Legacy Drag/DragDrop offers still land in the receive folder.
@@ -1346,8 +1345,7 @@ impl Engine {
                         .finish(id, TransferState::Failed, "连接断开，文件未接收完");
                 } else {
                     park_partial(inc);
-                    self.board
-                        .finish(id, TransferState::Paused, "等待重连");
+                    self.board.finish(id, TransferState::Paused, "等待重连");
                 }
             }
         }
@@ -1410,7 +1408,11 @@ impl Engine {
         let net = self.net.clone();
         let config = self.config.clone();
         let skip: HashSet<u32> = req.skip.into_iter().collect();
-        let resume: HashMap<u32, u64> = req.resume.into_iter().map(|r| (r.index, r.offset)).collect();
+        let resume: HashMap<u32, u64> = req
+            .resume
+            .into_iter()
+            .map(|r| (r.index, r.offset))
+            .collect();
         let label = self.label(peer).await;
         tokio::spawn(async move {
             let peer = out.peer.clone();

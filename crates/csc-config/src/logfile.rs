@@ -76,10 +76,7 @@ impl CappedLog {
 }
 
 fn backup_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("log");
+    let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("log");
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => path.with_file_name(format!("{stem}.1.{ext}")),
         None => path.with_file_name(format!("{stem}.1")),

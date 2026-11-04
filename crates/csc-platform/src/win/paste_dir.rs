@@ -7,7 +7,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{
-    IShellWindows, IWebBrowser2, SHGetKnownFolderPath, ShellWindows, FOLDERID_Desktop,
+    FOLDERID_Desktop, IShellWindows, IWebBrowser2, SHGetKnownFolderPath, ShellWindows,
     KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetClassNameW, GetForegroundWindow};
@@ -49,8 +49,7 @@ unsafe fn desktop_dir() -> Option<PathBuf> {
 }
 
 unsafe fn explorer_folder(foreground: isize) -> Option<PathBuf> {
-    let shell: IShellWindows =
-        CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER).ok()?;
+    let shell: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER).ok()?;
     let count = shell.Count().ok()?;
     let tab = FindWindowExW(
         windows::Win32::Foundation::HWND(foreground as *mut _),
@@ -103,10 +102,9 @@ fn percent_decode(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(v);
                 i += 3;
                 continue;

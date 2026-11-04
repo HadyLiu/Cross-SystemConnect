@@ -166,7 +166,10 @@ pub fn bad_direction(role: SessionRole, msg: MsgType) -> bool {
         ),
         SessionRole::Controlled => matches!(
             msg,
-            MsgType::EdgeHit | MsgType::ControlPause | MsgType::PasteLocated | MsgType::DragRetarget
+            MsgType::EdgeHit
+                | MsgType::ControlPause
+                | MsgType::PasteLocated
+                | MsgType::DragRetarget
         ),
     }
 }

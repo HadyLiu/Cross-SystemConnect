@@ -3,11 +3,7 @@
 use std::fs;
 
 pub(crate) fn lock_leds() -> (bool, bool, bool) {
-    (
-        led("capslock"),
-        led("numlock"),
-        led("scrolllock"),
-    )
+    (led("capslock"), led("numlock"), led("scrolllock"))
 }
 
 fn led(suffix: &str) -> bool {

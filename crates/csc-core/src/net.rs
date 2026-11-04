@@ -1606,10 +1606,7 @@ where
             .adopt(&link.key, link.tx.clone(), DUPLICATE_LINK)
             .await
         {
-            debug!(
-                "already linked to {}; dropping extra connection",
-                link.key
-            );
+            debug!("already linked to {}; dropping extra connection", link.key);
             return Ok(());
         }
         link.registered.store(true, Ordering::Release);
@@ -1893,11 +1890,7 @@ where
     let nonce = csc_proto::PairNoncePayload {
         nonce: hex_encode(&nb),
     };
-    write_locked(
-        writer,
-        &encode_json_frame(MsgType::PairNonce, &nonce)?,
-    )
-    .await?;
+    write_locked(writer, &encode_json_frame(MsgType::PairNonce, &nonce)?).await?;
     let na_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairNonce).await?;
     let na_msg: csc_proto::PairNoncePayload = serde_json::from_slice(&na_frame.payload)?;
     let na = unhex(&na_msg.nonce).unwrap_or_default();
@@ -1939,7 +1932,8 @@ where
                         let result = csc_proto::PairResultPayload {
                             status: "rejected".into(),
                         };
-                        write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?).await?;
+                        write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?)
+                            .await?;
                         anyhow::bail!("pairing window closed");
                     }
                     let na = random_nonce();
@@ -2367,11 +2361,7 @@ fn export_server(stream: &tokio_rustls::server::TlsStream<TcpStream>) -> [u8; 32
     }
 }
 
-async fn spawn_data_listener(
-    identity: &Arc<crate::tls::Identity>,
-    addr: SocketAddr,
-    port: u16,
-) {
+async fn spawn_data_listener(identity: &Arc<crate::tls::Identity>, addr: SocketAddr, port: u16) {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             info!("data port {port} listening");
@@ -2458,9 +2448,7 @@ where
     Ok(())
 }
 
-fn data_target(
-    fingerprint: &str,
-) -> Option<(String, Wires, bool, Arc<RwLock<NetStatus>>)> {
+fn data_target(fingerprint: &str) -> Option<(String, Wires, bool, Arc<RwLock<NetStatus>>)> {
     let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
     let slot = map.get(fingerprint)?;
     Some((
@@ -2497,8 +2485,8 @@ async fn take_data(
     if frame.msg_type != MsgType::DataAttach {
         anyhow::bail!("expected DATA_ATTACH");
     }
-    let attach: csc_proto::DataAttachPayload = serde_json::from_slice(&frame.payload)
-        .map_err(|_| anyhow::anyhow!("bad DATA_ATTACH"))?;
+    let attach: csc_proto::DataAttachPayload =
+        serde_json::from_slice(&frame.payload).map_err(|_| anyhow::anyhow!("bad DATA_ATTACH"))?;
     if attach.data_port != local_port {
         anyhow::bail!("bad_data_port");
     }

@@ -32,16 +32,14 @@ fn windows_of(dest: &str, path: &str) -> Vec<PathBuf> {
     };
     let proxy = conn.with_proxy(dest, path, BUS_WAIT);
     use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-    let map: HashMap<String, Vec<String>> = match proxy.get(
-        "org.freedesktop.FileManager1",
-        "OpenWindowsWithLocations",
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("file manager windows ({dest}): {e}");
-            return Vec::new();
-        }
-    };
+    let map: HashMap<String, Vec<String>> =
+        match proxy.get("org.freedesktop.FileManager1", "OpenWindowsWithLocations") {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("file manager windows ({dest}): {e}");
+                return Vec::new();
+            }
+        };
     map.into_values()
         .filter_map(|uris| uris.into_iter().next())
         .filter_map(|uri| file_uri_to_path(&uri))
@@ -124,11 +122,9 @@ fn children(
     }
     let mut out = Vec::new();
     for index in 0..32 {
-        let Ok(((dest, path),)) = node.method_call(
-            "org.a11y.atspi.Accessible",
-            "GetChildAtIndex",
-            (index,),
-        ) as Result<((String, dbus::Path<'static>),), dbus::Error>
+        let Ok(((dest, path),)) =
+            node.method_call("org.a11y.atspi.Accessible", "GetChildAtIndex", (index,))
+                as Result<((String, dbus::Path<'static>),), dbus::Error>
         else {
             break;
         };
@@ -150,11 +146,7 @@ fn is_focused(node: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> bool
     states.first().is_some_and(|word| word & (1 << 12) != 0)
 }
 
-fn accessible_name(
-    bus: &dbus::blocking::Connection,
-    dest: &str,
-    path: &dbus::Path<'_>,
-) -> String {
+fn accessible_name(bus: &dbus::blocking::Connection, dest: &str, path: &dbus::Path<'_>) -> String {
     let node = bus.with_proxy(dest, path, Duration::from_millis(80));
     proxy_name(&node)
 }
@@ -182,7 +174,6 @@ fn pick_window(windows: &[PathBuf], focused_name: &str) -> Option<PathBuf> {
         })
         .cloned()
 }
-
 
 fn desktop_dir() -> PathBuf {
     user_dir("XDG_DESKTOP_DIR").unwrap_or_else(|| home().join("Desktop"))
@@ -233,7 +224,8 @@ fn percent_decode(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
             {
                 out.push(v);
                 i += 3;
@@ -260,7 +252,9 @@ fn is_desktop(app: &str, names: &[String]) -> bool {
         || app.contains("mutter")
         || app.contains("ding")
         || app.contains("desktop icons")
-        || names.iter().any(|n| n.eq_ignore_ascii_case("desktop") || n == "桌面")
+        || names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("desktop") || n == "桌面")
 }
 
 #[cfg(test)]

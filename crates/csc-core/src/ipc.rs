@@ -278,34 +278,34 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                         return IpcResponse::err(req.id, "端口已被占用");
                     }
                     match cfg.save(&state.config_path) {
-                    Ok(()) => {
-                        if before_log != cfg.log {
-                            state.log.apply(&cfg.log);
+                        Ok(()) => {
+                            if before_log != cfg.log {
+                                state.log.apply(&cfg.log);
+                            }
+                            let restart = before_role != cfg.role
+                                || before_port != cfg.control_port
+                                || before_bind != cfg.bind_address
+                                || before_name != cfg.name
+                                || before_search != cfg.search_address
+                                || before_manual != cfg.network.manual_peers;
+                            let layout_changed =
+                                before_layout != cfg.layout || before_screens != cfg.screens;
+                            crate::notice::apply(&cfg.notify);
+                            crate::notice::set_language(&cfg.gui.language);
+                            refresh_status_from_config(state, &cfg).await;
+                            drop(cfg);
+                            if restart {
+                                state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+                            }
+                            if layout_changed {
+                                info!("screen layout changed");
+                            }
+                            // Switch settings and hotkeys live in the same reload; it keeps sessions.
+                            state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
+                            IpcResponse::ok(req.id, json!({"ok": true}))
                         }
-                        let restart = before_role != cfg.role
-                            || before_port != cfg.control_port
-                            || before_bind != cfg.bind_address
-                            || before_name != cfg.name
-                            || before_search != cfg.search_address
-                            || before_manual != cfg.network.manual_peers;
-                        let layout_changed =
-                            before_layout != cfg.layout || before_screens != cfg.screens;
-                        crate::notice::apply(&cfg.notify);
-                        crate::notice::set_language(&cfg.gui.language);
-                        refresh_status_from_config(state, &cfg).await;
-                        drop(cfg);
-                        if restart {
-                            state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
-                        }
-                        if layout_changed {
-                            info!("screen layout changed");
-                        }
-                        // Switch settings and hotkeys live in the same reload; it keeps sessions.
-                        state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
-                        IpcResponse::ok(req.id, json!({"ok": true}))
+                        Err(e) => IpcResponse::err(req.id, e.to_string()),
                     }
-                    Err(e) => IpcResponse::err(req.id, e.to_string()),
-                }
                 }
                 Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
@@ -517,7 +517,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             let cfg = state.config.read().await.clone();
             let log = state.log.path();
             match export_diagnostics(&cfg, log.as_deref()) {
-                Ok(path) => IpcResponse::ok(req.id, json!({"ok": true, "path": path.display().to_string()})),
+                Ok(path) => IpcResponse::ok(
+                    req.id,
+                    json!({"ok": true, "path": path.display().to_string()}),
+                ),
                 Err(e) => IpcResponse::err(req.id, e),
             }
         }

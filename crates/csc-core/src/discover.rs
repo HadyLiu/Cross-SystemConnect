@@ -57,13 +57,21 @@ pub fn encode_search_unlinked(control_port: u16, data_port: u16, name: &str) -> 
 }
 
 pub fn encode_announce(a: &Announce) -> Vec<u8> {
-    let name = if a.name.is_empty() { &a.host_name } else { &a.name };
+    let name = if a.name.is_empty() {
+        &a.host_name
+    } else {
+        &a.name
+    };
     encode_packet(KIND_REPLY, a.control_port, a.data_port, name)
 }
 
 #[cfg(test)]
 pub fn encode_port_announce(a: &Announce) -> Vec<u8> {
-    let name = if a.name.is_empty() { &a.host_name } else { &a.name };
+    let name = if a.name.is_empty() {
+        &a.host_name
+    } else {
+        &a.name
+    };
     encode_packet(KIND_ANNOUNCE, a.control_port, a.data_port, name)
 }
 
@@ -93,7 +101,9 @@ pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
     if name_len > 63 || buf.len() < 11 + name_len {
         return None;
     }
-    let name = std::str::from_utf8(&buf[11..11 + name_len]).ok()?.to_string();
+    let name = std::str::from_utf8(&buf[11..11 + name_len])
+        .ok()?
+        .to_string();
     let ann = Announce {
         host_name: name.clone(),
         name,

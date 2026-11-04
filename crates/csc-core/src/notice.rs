@@ -92,7 +92,10 @@ fn recent(kind: Kind) -> bool {
         Kind::Error => 4,
     };
     let now = Instant::now();
-    if last.get(&key).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5)) {
+    if last
+        .get(&key)
+        .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5))
+    {
         return true;
     }
     last.insert(key, now);

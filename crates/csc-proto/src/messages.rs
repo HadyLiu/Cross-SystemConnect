@@ -488,7 +488,8 @@ pub fn encode_file_batch(transfer_id: u64, items: &[(u32, u64, &[u8])]) -> Optio
     if items.is_empty() || items.len() > u16::MAX as usize {
         return None;
     }
-    let mut body = Vec::with_capacity(10 + items.iter().map(|(_, _, d)| 16 + d.len()).sum::<usize>());
+    let mut body =
+        Vec::with_capacity(10 + items.iter().map(|(_, _, d)| 16 + d.len()).sum::<usize>());
     body.extend_from_slice(&transfer_id.to_le_bytes());
     body.extend_from_slice(&(items.len() as u16).to_le_bytes());
     for &(index, xxh, data) in items {

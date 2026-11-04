@@ -366,12 +366,7 @@ fn nics_of(host: csc_platform::HostNetInfo) -> (String, Vec<String>, Vec<LocalNi
 }
 
 fn popup(body: &str, error: bool) {
-    notice::tell(
-        notice::Kind::Error,
-        "Cross-SystemConnect",
-        body,
-        error,
-    );
+    notice::tell(notice::Kind::Error, "Cross-SystemConnect", body, error);
 }
 
 /// A file manager pasted the placeholder copies of another computer's files.
@@ -532,12 +527,7 @@ impl Core {
     }
 
     fn load_input_prefs(&mut self, cfg: &Config) {
-        self.remap = cfg
-            .keyboard
-            .remap
-            .iter()
-            .map(|r| (r.from, r.to))
-            .collect();
+        self.remap = cfg.keyboard.remap.iter().map(|r| (r.from, r.to)).collect();
         self.sync_locks = cfg.keyboard.sync_locks;
         self.block_fullscreen = cfg.switch_cfg.block_when_fullscreen;
         self.pointer_speed = cfg.pointer.speed.clamp(0.25, 4.0);
@@ -608,8 +598,11 @@ impl Core {
             return;
         }
         let have = csc_platform::lock_leds();
-        for (hid, on, now) in [(0x39u32, want.0, have.0), (0x53, want.1, have.1), (0x47, want.2, have.2)]
-        {
+        for (hid, on, now) in [
+            (0x39u32, want.0, have.0),
+            (0x53, want.1, have.1),
+            (0x47, want.2, have.2),
+        ] {
             if on != now {
                 self.injector.key(hid, true);
                 self.injector.key(hid, false);
@@ -876,8 +869,7 @@ impl Core {
         if let Captured::Key { hid, down: true } = step {
             // Win+L must never reach the remote: GNOME treats Super+L as lock,
             // then further L presses land in the password field as "lll".
-            let win_held = self.held.keys.contains(&HID_LGUI)
-                || self.held.keys.contains(&HID_RGUI);
+            let win_held = self.held.keys.contains(&HID_LGUI) || self.held.keys.contains(&HID_RGUI);
             if hid == HID_L && win_held {
                 self.lock_all(None).await;
                 return true;
@@ -1349,7 +1341,8 @@ impl Core {
         let Some(offer) = self.pending_clip.clone() else {
             return;
         };
-        self.send_clip_offer(&offer, &[peer.to_string()], None).await;
+        self.send_clip_offer(&offer, &[peer.to_string()], None)
+            .await;
     }
 
     async fn send_clip_frame(&self, frame: Vec<u8>, peers: &[String], except: Option<&str>) {
@@ -1597,10 +1590,7 @@ impl Core {
         // Wayland: if the logical pointer is already at a clamp edge but the
         // host still sends motion, re-pin so the real uinput cursor can catch up
         // (a short first jump leaves the left/top edge unreachable).
-        if csc_platform::wayland_session()
-            && (dx != 0 || dy != 0)
-            && applied == (0, 0)
-        {
+        if csc_platform::wayland_session() && (dx != 0 || dy != 0) && applied == (0, 0) {
             inject_controlled_jump(
                 self.injector.as_mut(),
                 &mut self.commanded,
@@ -1821,8 +1811,7 @@ impl Core {
                 };
                 self.return_home(why).await;
             } else if state == "normal" {
-                self.paused_peers
-                    .retain(|n| !n.eq_ignore_ascii_case(peer));
+                self.paused_peers.retain(|n| !n.eq_ignore_ascii_case(peer));
             }
             return;
         }
@@ -1903,8 +1892,7 @@ impl Core {
                         self.return_home("peer paused sharing").await;
                     }
                 } else {
-                    self.paused_peers
-                        .retain(|n| !n.eq_ignore_ascii_case(&peer));
+                    self.paused_peers.retain(|n| !n.eq_ignore_ascii_case(&peer));
                 }
             }
             MsgType::PeerState => {
@@ -2552,5 +2540,4 @@ mod tests {
             (12, 400)
         );
     }
-
 }

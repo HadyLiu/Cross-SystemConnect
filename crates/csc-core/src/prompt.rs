@@ -10,7 +10,9 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     /// `code` is what the user typed. Empty when this computer is not asking for one.
-    Trust { code: String },
+    Trust {
+        code: String,
+    },
     Reject,
 }
 

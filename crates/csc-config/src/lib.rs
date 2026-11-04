@@ -1008,7 +1008,10 @@ impl Config {
             return false;
         }
         let peers = &mut self.network.manual_peers;
-        match peers.iter_mut().find(|p| p.address.eq_ignore_ascii_case(address)) {
+        match peers
+            .iter_mut()
+            .find(|p| p.address.eq_ignore_ascii_case(address))
+        {
             Some(p) => p.control_port = control_port,
             None => peers.push(ManualPeer {
                 address: address.to_string(),
@@ -1113,8 +1116,7 @@ impl Config {
         }
         let peers = self.trusted_peers.len();
         let prints = self.peer_fingerprints.len();
-        self.trusted_peers
-            .retain(|h| !h.eq_ignore_ascii_case(host));
+        self.trusted_peers.retain(|h| !h.eq_ignore_ascii_case(host));
         self.peer_fingerprints
             .retain(|name, _| !name.eq_ignore_ascii_case(host));
         peers != self.trusted_peers.len() || prints != self.peer_fingerprints.len()

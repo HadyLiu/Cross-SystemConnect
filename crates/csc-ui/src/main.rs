@@ -176,7 +176,10 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
     if path == "/sharing" && method == Method::POST {
         let body: serde_json::Value =
             serde_json::from_slice(req.body()).unwrap_or(serde_json::Value::Null);
-        let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = body
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let (status, v) = match ipc_client::set_sharing_enabled(enabled) {
             Ok(v) => (StatusCode::OK, v),
             Err(e) => (
@@ -401,17 +404,19 @@ fn build_webview(
 /// Smart App Control reports as a blocked unsafe app.
 #[cfg(windows)]
 fn start_core_in_process() {
-    let _ = std::thread::Builder::new().name("csc-core".into()).spawn(|| {
-        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        if let Err(e) = rt.block_on(csc_core::run()) {
-            eprintln!("core: {e:#}");
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name("csc-core".into())
+        .spawn(|| {
+            let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            if let Err(e) = rt.block_on(csc_core::run()) {
+                eprintln!("core: {e:#}");
+            }
+        });
 }
 
 fn main() -> anyhow::Result<()> {
