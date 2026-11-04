@@ -140,15 +140,8 @@ pub fn foreground_fullscreen() -> bool {
     }
 }
 
-/// A small label while another computer is moving this pointer. `None` hides it.
-pub fn set_controlled_hint(text: Option<String>) {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    linux::hint::set_controlled_hint(text);
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    {
-        let _ = text;
-    }
-}
+/// Former on-screen “Controlled” badge. Kept as a no-op; link state is the tray green dot.
+pub fn set_controlled_hint(_text: Option<String>) {}
 
 /// A background watch. The receiver stays open; events arrive when the OS reports them.
 pub fn spawn_power_watch() -> std::sync::mpsc::Receiver<PowerEvent> {

@@ -399,6 +399,7 @@ pub async fn spawn_network(
             {
                 let mut s = app_status.write().await;
                 s.pending_peer = None;
+                s.being_controlled = false;
             }
             {
                 let mut s = status2.write().await;

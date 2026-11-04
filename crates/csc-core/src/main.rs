@@ -42,8 +42,11 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info, warn};
 
 const HID_V: u32 = 0x19;
+const HID_L: u32 = 0x0F;
 const HID_LCTRL: u32 = 0xE0;
 const HID_RCTRL: u32 = 0xE4;
+const HID_LGUI: u32 = 0xE3;
+const HID_RGUI: u32 = 0xE7;
 /// Text above this goes on the bulk queue so it never holds up the pointer.
 const BULK_TEXT: usize = 64 * 1024;
 /// A held lock key repeats, and every computer passes the lock on once.
@@ -703,6 +706,9 @@ impl Core {
             let on = {
                 let mut s = self.status.write().await;
                 s.sharing_enabled = !s.sharing_enabled;
+                if !s.sharing_enabled {
+                    s.being_controlled = false;
+                }
                 s.sharing_enabled
             };
             info!(sharing = on, "emergency pause");
@@ -863,6 +869,14 @@ impl Core {
     /// One captured event while grabbed. True once input is back on this computer.
     async fn grab_input(&mut self, step: Captured) -> bool {
         if let Captured::Key { hid, down: true } = step {
+            // Win+L must never reach the remote: GNOME treats Super+L as lock,
+            // then further L presses land in the password field as "lll".
+            let win_held = self.held.keys.contains(&HID_LGUI)
+                || self.held.keys.contains(&HID_RGUI);
+            if hid == HID_L && win_held {
+                self.lock_all(None).await;
+                return true;
+            }
             let hit = |k: &Option<Hotkey>| {
                 k.as_ref()
                     .is_some_and(|k| k.completes(hid, &self.held.keys))
@@ -972,6 +986,8 @@ impl Core {
             return;
         }
         self.last_lock = Instant::now();
+        // Release remote keys first (especially Super) so a following LockScreen
+        // does not leave modifiers held into the password field.
         if self.grab {
             self.return_home("lock screen").await;
         } else {
@@ -1903,6 +1919,7 @@ impl Core {
                 if !self.grab {
                     // The host that was driving this computer is gone.
                     self.injected.release_injected(self.injector.as_mut());
+                    s.being_controlled = false;
                     if self.switch.state() == SwitchState::Remote {
                         self.switch.unlock_to_local();
                         s.active_screen = s.local_name.clone();
@@ -1916,6 +1933,9 @@ impl Core {
                     .collect();
                 s.peer_name = left.join(", ");
                 s.connected = !s.peer_name.is_empty();
+                if !s.connected {
+                    s.being_controlled = false;
+                }
                 if s.role != "server" && s.host_state != "host_sleeping" {
                     s.host_state = if s.connected {
                         "connected".into()
@@ -2001,16 +2021,16 @@ impl Core {
                 if let Some(locks) = p.locks {
                     self.match_locks((locks.caps, locks.num, locks.scroll));
                 }
-                csc_platform::set_controlled_hint(Some(
-                    "Controlled  ·  Ctrl+Alt+Shift+P".into(),
-                ));
+                if !self.grab {
+                    self.status.write().await.being_controlled = true;
+                }
                 info!(
                     "pointer entered this screen from {:?} at ({}, {})",
                     p.edge, self.remote_x, self.remote_y
                 );
             }
             Some(InboundEvent::SwitchLeave(p)) => {
-                csc_platform::set_controlled_hint(None);
+                self.status.write().await.being_controlled = false;
                 self.commanded = None;
                 debug!(edge = ?p.edge, "switch leave");
                 if !self.grab {
@@ -2205,6 +2225,7 @@ pub async fn run() -> anyhow::Result<()> {
         connected: false,
         peer_name: String::new(),
         active_screen: cfg.name.clone(),
+        being_controlled: false,
         sharing_enabled: true,
         role: match cfg.role {
             csc_config::Role::Server => "server".into(),

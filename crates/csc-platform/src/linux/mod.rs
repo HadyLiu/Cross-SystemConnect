@@ -1,7 +1,6 @@
 pub(crate) mod clip_x11;
 pub(crate) mod fullscreen;
 pub(crate) mod cursor;
-pub(crate) mod hint;
 pub(crate) mod leds;
 pub(crate) mod power;
 pub(crate) mod drop_folder;

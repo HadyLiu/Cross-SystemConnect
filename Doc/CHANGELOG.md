@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **被控提示改为托盘绿点**：不再显示屏幕右上角「Controlled · Ctrl+Alt+Shift+P」叠层（含 X11 override-redirect / 原计划的 Shell 顶栏指示）。已连接时主机与被控端托盘图标右下角常亮绿点；仅当本机正在被控时绿点闪烁；未连接不加绿点。状态字段 `status.beingControlled`；`ui.controlled_indicator` 与屏幕提示层不再使用。
+
 ### 删除
 
 - **移除跨屏文件拖拽**：电脑之间传文件只用复制粘贴（`Ctrl+C` / `Ctrl+V`，以及托盘「粘贴其他电脑复制的文件到这里」）。不再实现边缘细窗、边缘投放窗、虚拟拖放源与承接窗。协议消息 `DRAG_*`、`CAP_VIRTUAL_DRAG`、IPC `drag_enter` / `drag_edge`、平台 `vdrag` 等保留编号/符号但不使用。相关测试与缺陷项标为功能已取消。

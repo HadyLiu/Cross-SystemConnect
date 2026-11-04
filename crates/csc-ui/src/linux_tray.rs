@@ -3,12 +3,27 @@
 //! tray-icon on Linux never emits click or double-click. A left click arrives
 //! as Activate, which opens the settings window. Right click still shows the menu.
 
-use crate::icon::load_rgba;
+use crate::icon::{self, GreenDot};
 use crate::UserEvent;
 use tao::event_loop::EventLoopProxy;
 
 pub struct LinuxTray {
     pub proxy: EventLoopProxy<UserEvent>,
+    pub connected: bool,
+    pub being_controlled: bool,
+    pub blink_on: bool,
+}
+
+impl LinuxTray {
+    fn dot(&self) -> GreenDot {
+        if !self.connected {
+            GreenDot::Off
+        } else if self.being_controlled && !self.blink_on {
+            GreenDot::Off
+        } else {
+            GreenDot::On
+        }
+    }
 }
 
 impl ksni::Tray for LinuxTray {
@@ -21,7 +36,7 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let Some((w, h, data)) = argb_icon(32) else {
+        let Some((w, h, data)) = argb_icon(32, self.dot()) else {
             return Vec::new();
         };
         vec![ksni::Icon {
@@ -65,8 +80,8 @@ fn item(label: &str, event: UserEvent) -> ksni::MenuItem<LinuxTray> {
     .into()
 }
 
-fn argb_icon(size: u32) -> Option<(i32, i32, Vec<u8>)> {
-    let (rgba, w, h) = load_rgba(size).ok()?;
+fn argb_icon(size: u32, dot: GreenDot) -> Option<(i32, i32, Vec<u8>)> {
+    let (rgba, w, h) = icon::tray_rgba(size, dot).ok()?;
     let mut argb = Vec::with_capacity(rgba.len());
     for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
         argb.extend_from_slice(&[a, r, g, b]);

@@ -43,6 +43,12 @@ pub(crate) enum UserEvent {
     Transfers(Vec<serde_json::Value>),
     /// Settings page asked for the log file dialog, starting from this path.
     PickLogFile(String),
+    /// Tray green-dot: connected / being-controlled blink phase.
+    TrayLink {
+        connected: bool,
+        being_controlled: bool,
+        blink_on: bool,
+    },
 }
 
 pub(crate) fn app_title() -> String {
@@ -91,6 +97,7 @@ fn handle_http(req: Request<Vec<u8>>) -> anyhow::Result<Response<Cow<'static, [u
                 "connected": false,
                 "peerName": "",
                 "activeScreen": "",
+                "beingControlled": false,
                 "sharingEnabled": false,
                 "role": "",
                 "localName": csc_config::local_computer_name(),
@@ -469,7 +476,7 @@ fn main() -> anyhow::Result<()> {
         tray_menu.append(&item_share)?;
         tray_menu.append(&item_quit)?;
 
-        let tray_icon_img = icon::app_tray_icon();
+        let tray_icon_img = icon::app_tray_icon(icon::GreenDot::Off);
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip(app_title())
@@ -514,13 +521,18 @@ fn main() -> anyhow::Result<()> {
         )
     };
     #[cfg(target_os = "linux")]
-    {
+    let linux_tray = {
         // Linux panels do not deliver a double-click. Left click is Activate.
-        ksni::TrayService::new(linux_tray::LinuxTray {
+        let service = ksni::TrayService::new(linux_tray::LinuxTray {
             proxy: proxy.clone(),
-        })
-        .spawn();
-    }
+            connected: false,
+            being_controlled: false,
+            blink_on: true,
+        });
+        let handle = service.handle();
+        service.spawn();
+        handle
+    };
 
     // Bring the settings window forward when a client asks to connect.
     {
@@ -632,6 +644,31 @@ fn main() -> anyhow::Result<()> {
                     tw.update(&list);
                 }
                 transfers = list;
+            }
+            Event::UserEvent(UserEvent::TrayLink {
+                connected,
+                being_controlled,
+                blink_on,
+            }) => {
+                let show_dot = connected && (!being_controlled || blink_on);
+                let dot = if show_dot {
+                    icon::GreenDot::On
+                } else {
+                    icon::GreenDot::Off
+                };
+                #[cfg(not(target_os = "linux"))]
+                if let Some(tray) = tray_icon.as_ref() {
+                    let _ = tray.set_icon(Some(icon::app_tray_icon(dot)));
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    linux_tray.update(|t| {
+                        t.connected = connected;
+                        t.being_controlled = being_controlled;
+                        t.blink_on = blink_on;
+                    });
+                    let _ = dot;
+                }
             }
             Event::UserEvent(UserEvent::PickLogFile(current)) => {
                 if let (Some(w), Some(wv)) = (window.as_ref(), webview.as_ref()) {

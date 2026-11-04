@@ -49,6 +49,9 @@ pub struct AppStatus {
     pub connected: bool,
     pub peer_name: String,
     pub active_screen: String,
+    /// True while this computer is accepting remote pointer (after SWITCH_ENTER).
+    #[serde(default)]
+    pub being_controlled: bool,
     pub sharing_enabled: bool,
     pub role: String,
     pub local_name: String,

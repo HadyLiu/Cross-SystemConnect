@@ -495,6 +495,9 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .unwrap_or(true);
             let mut s = state.status.write().await;
             s.sharing_enabled = enabled;
+            if !enabled {
+                s.being_controlled = false;
+            }
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "get_logs" | "getLogs" => {
