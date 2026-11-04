@@ -53,22 +53,24 @@ pub fn spawn() -> Receiver<PowerEvent> {
 
 fn watch_screensaver(tx: Sender<PowerEvent>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = dbus::blocking::Connection::new_session()?;
-    let send = MatchSend(tx);
-    conn.add_match(
-        dbus::message::MatchRule::new_signal(
-            "org.freedesktop.ScreenSaver",
-            "ActiveChanged",
-        ),
-        move |(active,): (bool,), _: &dbus::blocking::Connection, _: &dbus::Message| {
-            let ev = if active {
-                PowerEvent::Locked
-            } else {
-                PowerEvent::Unlocked
-            };
-            let _ = send.0.send(ev);
-            true
-        },
-    )?;
+    // GNOME (Ubuntu) emits the lock only on org.gnome.ScreenSaver; KDE, Deepin
+    // and others on org.freedesktop.ScreenSaver. Listen to both; a duplicate
+    // Locked is harmless.
+    for iface in ["org.freedesktop.ScreenSaver", "org.gnome.ScreenSaver"] {
+        let send = MatchSend(tx.clone());
+        conn.add_match(
+            dbus::message::MatchRule::new_signal(iface, "ActiveChanged"),
+            move |(active,): (bool,), _: &dbus::blocking::Connection, _: &dbus::Message| {
+                let ev = if active {
+                    PowerEvent::Locked
+                } else {
+                    PowerEvent::Unlocked
+                };
+                let _ = send.0.send(ev);
+                true
+            },
+        )?;
+    }
     loop {
         conn.process(Duration::from_secs(60))?;
     }

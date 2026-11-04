@@ -268,7 +268,7 @@ impl SwitchController {
         raw: (i32, i32),
         moved: (i32, i32),
     ) -> Option<EdgeReport> {
-        let Some(edge) = self.hit_outer_edge(x, y) else {
+        let Some(edge) = pick_edge(&self.touched_outer_edges(x, y), raw, |_| true) else {
             push.reset();
             return None;
         };
@@ -354,20 +354,22 @@ impl SwitchController {
         self.unlock_to_local();
     }
 
-    fn hit_outer_edge(&self, x: i32, y: i32) -> Option<Edge> {
+    /// Outer sides the point touches: two at a corner pixel.
+    fn touched_outer_edges(&self, x: i32, y: i32) -> Vec<Edge> {
         let m = self.monitor_at(x, y);
         let (ol, or, ot, ob) = self.outer_sides(&m);
+        let mut out = Vec::with_capacity(2);
         if ol && x <= m.left {
-            Some(Edge::Left)
+            out.push(Edge::Left);
         } else if or && x >= m.right - 1 {
-            Some(Edge::Right)
-        } else if ot && y <= m.top {
-            Some(Edge::Top)
-        } else if ob && y >= m.bottom - 1 {
-            Some(Edge::Bottom)
-        } else {
-            None
+            out.push(Edge::Right);
         }
+        if ot && y <= m.top {
+            out.push(Edge::Top);
+        } else if ob && y >= m.bottom - 1 {
+            out.push(Edge::Bottom);
+        }
+        out
     }
 
     /// Distance from a corner, along a side, that counts as that corner.
@@ -460,9 +462,13 @@ impl SwitchController {
         let diagonal = self
             .diagonal_at(x, y)
             .filter(|d| self.layout.neighbor(&self.local_name, *d).is_some());
+        let touched = self.touched_outer_edges(x, y);
+        let leads = |e: Edge| self.layout.neighbor(&self.local_name, e).is_some();
         let edge = if let Some(diag) = diagonal {
             diag
-        } else if let Some(edge) = self.hit_outer_edge(x, y) {
+        } else if let Some(edge) =
+            pick_edge(&touched, raw.unwrap_or((0, 0)), leads).or_else(|| touched.first().copied())
+        {
             edge
         } else {
             self.pending_edge = None;
@@ -641,6 +647,20 @@ impl SwitchController {
     }
 }
 
+/// Of the sides the pointer touches, the one it is pushed through hardest,
+/// among those `ok` accepts. At a corner pixel the old order always chose the
+/// left/right side, so pushing up or down there never switched.
+fn pick_edge(touched: &[Edge], raw: (i32, i32), ok: impl Fn(Edge) -> bool) -> Option<Edge> {
+    let mut best: Option<(Edge, i32)> = None;
+    for &e in touched.iter().filter(|e| ok(**e)) {
+        let push = outward(e, raw.0, raw.1);
+        if best.is_none_or(|(_, p)| push > p) {
+            best = Some((e, push));
+        }
+    }
+    best.map(|(e, _)| e)
+}
+
 fn is_corner(e: Edge) -> bool {
     matches!(
         e,
@@ -650,6 +670,49 @@ fn is_corner(e: Edge) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn corner_pixel_pushed_up_switches_up() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("top".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        let cfg = SwitchConfig {
+            diagonal_zone_px: 1,
+            corner_dead_zone_px: 0,
+            ..SwitchConfig::default()
+        };
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 100,
+                height: 100,
+            },
+            cfg,
+            ScreenLayout::load(&layout_map),
+        );
+        let t = Instant::now();
+        // Pressed into the top-left pixel, pushing up only: the top side leads somewhere.
+        let mut got = None;
+        for _ in 0..20 {
+            got = got.or(sw.on_local_cursor(0, 0, Some((0, -4)), t));
+        }
+        assert_eq!(got.expect("switches up").edge, Edge::Top);
+    }
+
+    #[test]
+    fn pick_edge_follows_the_push() {
+        let both = [Edge::Left, Edge::Top];
+        assert_eq!(pick_edge(&both, (0, -5), |_| true), Some(Edge::Top));
+        assert_eq!(pick_edge(&both, (-5, 0), |_| true), Some(Edge::Left));
+        assert_eq!(
+            pick_edge(&both, (-5, 0), |e| e == Edge::Top),
+            Some(Edge::Top)
+        );
+        assert_eq!(pick_edge(&[], (0, 0), |_| true), None);
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

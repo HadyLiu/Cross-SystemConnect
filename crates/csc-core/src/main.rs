@@ -202,6 +202,11 @@ fn follow_real_pointer(logical: (i32, i32), real: (i32, i32), real_moved: bool) 
     }
 }
 
+/// A local session state that must hand the pointer back to this computer.
+fn local_lock_releases(state: &str) -> bool {
+    matches!(state, "locked" | "secure_desktop")
+}
+
 /// Give input back to this computer. `target` is where the cursor reappears,
 /// in desktop coordinates relative to the virtual origin.
 fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
@@ -1730,8 +1735,20 @@ impl Core {
                 _ => "normal",
             };
             // Local lock while controlling a peer: release the parked cursor.
-            if state == "locked" && self.grab {
-                self.return_home("local locked").await;
+            // Windows reports Win+L, Ctrl+Alt+Del and UAC only as the secure
+            // desktop; the input hook stops there, so the pointer would stay
+            // pinned to the park point after unlocking.
+            if local_lock_releases(state) {
+                // Keys injected here for a host (Win of Win+L) never come up.
+                self.injected.release_injected(self.injector.as_mut());
+                if self.grab {
+                    let why = if state == "locked" {
+                        "local locked"
+                    } else {
+                        "local secure desktop"
+                    };
+                    self.return_home(why).await;
+                }
             }
             self.send_peer_state(state).await;
             return;
@@ -2478,6 +2495,13 @@ async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoar
 mod tests {
     use super::Hotkey;
     use std::collections::HashSet;
+
+    #[test]
+    fn secure_desktop_releases_the_pointer_like_a_lock() {
+        assert!(super::local_lock_releases("locked"));
+        assert!(super::local_lock_releases("secure_desktop"));
+        assert!(!super::local_lock_releases("normal"));
+    }
 
     #[test]
     fn return_hotkey_matches_either_hand() {
