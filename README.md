@@ -62,6 +62,10 @@ bash scripts/package-docker.sh
 
 Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/uinput`，不弹出远程交互。见 [Doc/用户手册.md](Doc/用户手册.md)。
 
+### GitHub Actions
+
+`.github/workflows/ci.yml` 按 **image → check → build** 运行，统一使用 Docker 工具链镜像 `ghcr.io/hadyliu/cross-systemconnect-toolchain`：`image` 只在 GHCR 上还没有该镜像时构建一次（即第一次推送时），之后直接复用；`check` 在每次 push/PR 时于镜像内执行测试、clippy、fmt、audit、deny；`build` 只在推送 `v*` 标签时运行，编译 Linux 与 Windows 包、生成 `SHA256SUMS` 并创建草稿 Release。需重建镜像时手动运行 `toolchain-image` 并勾选 `force`。仓库需在 Settings → Actions → General 把 Workflow permissions 设为读写；首次 check 可能因历史代码格式和 clippy 警告失败。详见 [Doc/构建发布流程.md](Doc/构建发布流程.md) §8。
+
 版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/构建发布流程.md](Doc/构建发布流程.md)。
 
 ---
@@ -77,6 +81,7 @@ Cross-SystemConnect/
 │   ├── csc-platform/   # 平台层：Windows 钩子/注入、Linux X11/uinput、剪贴板等
 │   ├── csc-core/       # 内核 Cross-SystemConnect-core：网络、TLS、切换、剪贴板、文件传输、IPC
 │   └── csc-ui/         # 界面 Cross-SystemConnect：托盘 + WebView 设置窗、传输窗口
+├── .github/workflows/  # GitHub Actions：镜像 → 检查 → 构建发布
 ├── packaging/          # Docker 镜像定义与编译脚本（一次生成 Windows 与 Linux）
 ├── scripts/            # package-docker.sh、check-docker.sh
 ├── resources/          # 图标

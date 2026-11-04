@@ -1,0 +1,77 @@
+# 工具链镜像 packaging/Dockerfile → ghcr.io/<owner>/<repo>-toolchain:latest（小写）。
+# 只在镜像不存在时构建一次：由 ci.yml 的 image job 调用（首次推送即自动构建），
+# 已存在则跳过。需要重建时在 Actions 页手动运行本 workflow 并勾选 force。
+name: toolchain-image
+
+on:
+  workflow_call:
+    inputs:
+      force:
+        type: boolean
+        default: false
+    outputs:
+      name:
+        description: 镜像完整名（含 :latest）
+        value: ${{ jobs.image.outputs.name }}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 强制重建并覆盖 :latest
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: toolchain-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.img.outputs.name }}
+    steps:
+      - name: 镜像名（小写）
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}-toolchain:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 判断镜像是否已存在
+        id: exists
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "强制重建"; echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "镜像已存在，跳过构建"; echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "镜像不存在，开始构建"; echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.exists.outputs.build == 'true'
+        uses: actions/checkout@v4
+
+      - if: steps.exists.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - if: steps.exists.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging
+          file: packaging/Dockerfile
+          push: true
+          tags: ${{ steps.img.outputs.name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

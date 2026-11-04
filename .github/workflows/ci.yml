@@ -1,0 +1,109 @@
+# image → check → build
+# image：调用 toolchain-image.yml，镜像不存在时才构建（首次推送）。
+# check：所有 push / PR / 手动触发都在镜像容器内执行 packaging/check.sh。
+# build：仅打 v* 标签时运行，编译、生成 SHA256SUMS、上传 artifact 并创建草稿 Release。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/toolchain-image.yml
+
+  check:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.image.outputs.name }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 与本地脚本一致的 /src 路径
+        run: rm -rf /src && ln -s "$GITHUB_WORKSPACE" /src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            /opt/cargo-tools
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+
+      - name: test / clippy / fmt / audit / deny
+        run: bash packaging/check.sh
+
+  build:
+    needs: [image, check]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    container:
+      image: ${{ needs.image.outputs.name }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 与本地脚本一致的 /src 路径
+        run: rm -rf /src && ln -s "$GITHUB_WORKSPACE" /src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: build-${{ runner.os }}-
+
+      - name: 编译 Linux 与 Windows（x86_64-pc-windows-gnu）
+        run: bash packaging/compile.sh
+
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          sha256sum Cross-SystemConnect-linux-x86_64.tar.gz Cross-SystemConnect-windows-x86_64.zip > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-systemconnect-${{ github.ref_name }}
+          path: |
+            dist/Cross-SystemConnect-linux-x86_64.tar.gz
+            dist/Cross-SystemConnect-windows-x86_64.zip
+            dist/SHA256SUMS
+
+      - name: 草稿 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/Cross-SystemConnect-linux-x86_64.tar.gz
+            dist/Cross-SystemConnect-windows-x86_64.zip
+            dist/SHA256SUMS
