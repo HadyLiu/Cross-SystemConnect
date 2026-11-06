@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **CI 不再构建工具链镜像。** `ci.yml` 只做检查，打 `v*` 标签时再编译发布；容器固定使用已发布的 `ghcr.io/hadyliu/cross-systemconnect-toolchain:latest`。更新镜像改为在 Actions 里手动运行 `toolchain-image`。
+
 ## [0.2.2] - 2026-11-06
 
 ### 修复

@@ -1,19 +1,10 @@
-# 工具链镜像 packaging/Dockerfile → ghcr.io/<owner>/<repo>-toolchain:toolchain-<哈希>（小写）。
-# 哈希 = packaging/Dockerfile 内容 sha256 前 12 位。该标签不存在时才构建一次（同时更新 :latest），
-# Dockerfile 不变则永远跳过；Dockerfile 改动后首次推送自动构建新标签。
-# 需要重建同一标签时在 Actions 页手动运行本 workflow 并勾选 force。
+# 手动构建工具链镜像。ci.yml 不调用本工作流。
+# packaging/Dockerfile → ghcr.io/<owner>/<repo>-toolchain:toolchain-<哈希>（小写），并覆盖 :latest。
+# 哈希 = packaging/Dockerfile 内容 sha256 前 12 位。该标签已存在则跳过，除非勾选 force。
+# ci.yml 的 check / build 固定使用 :latest，所以构建完成后下一次 CI 才会用到新镜像。
 name: toolchain-image
 
 on:
-  workflow_call:
-    inputs:
-      force:
-        type: boolean
-        default: false
-    outputs:
-      name:
-        description: 镜像完整名（含 toolchain-<哈希> 标签）
-        value: ${{ jobs.image.outputs.name }}
   workflow_dispatch:
     inputs:
       force:

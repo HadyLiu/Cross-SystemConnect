@@ -1,6 +1,6 @@
-# image → check → build
-# image：调用 toolchain-image.yml，按 Dockerfile 哈希标签判断，标签不存在时才构建；
-#        输出的标签供 check/build 作为 container.image。
+# check → build
+# 容器使用已发布的 ghcr.io/hadyliu/cross-systemconnect-toolchain:latest。
+# 本工作流不构建镜像；更新镜像时手动运行 toolchain-image.yml。
 # check：所有 push / PR / 手动触发都在镜像容器内执行 packaging/check.sh。
 # build：仅打 v* 标签时运行，编译、生成 SHA256SUMS、上传 artifact 并发布 Release。
 # 去重：分支推送的 run 先由 plan 检查当前 commit 是否已有 v* 标签，有则整套跳过，
@@ -57,23 +57,15 @@ jobs:
           done
           echo "run=true" >> "$GITHUB_OUTPUT"
 
-  image:
-    needs: plan
-    if: needs.plan.outputs.run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/toolchain-image.yml
-
   check:
-    needs: [plan, image]
+    needs: plan
     if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
     container:
-      image: ${{ needs.image.outputs.name }}
+      image: ghcr.io/hadyliu/cross-systemconnect-toolchain:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -97,14 +89,14 @@ jobs:
         run: bash packaging/check.sh
 
   build:
-    needs: [plan, image, check]
+    needs: [plan, check]
     if: needs.plan.outputs.run == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: read
     container:
-      image: ${{ needs.image.outputs.name }}
+      image: ghcr.io/hadyliu/cross-systemconnect-toolchain:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
