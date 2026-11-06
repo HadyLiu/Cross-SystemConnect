@@ -306,15 +306,12 @@ fn event_bytes(type_: u16, code: u16, value: i32) -> [u8; std::mem::size_of::<Ev
 }
 
 pub fn move_rel(dx: i32, dy: i32) {
-    const STEP: i32 = 400;
-    let (mut left_x, mut left_y) = (dx, dy);
-    while left_x != 0 || left_y != 0 {
-        let sx = left_x.clamp(-STEP, STEP);
-        let sy = left_y.clamp(-STEP, STEP);
-        emit(&[(EV_REL, REL_X, sx), (EV_REL, REL_Y, sy)]);
-        left_x -= sx;
-        left_y -= sy;
+    // One report. Splitting a jump into many small steps paints the pointer
+    // sliding across the desktop. The kernel accepts a full relative delta.
+    if dx == 0 && dy == 0 {
+        return;
     }
+    emit(&[(EV_REL, REL_X, dx), (EV_REL, REL_Y, dy)]);
 }
 
 pub fn button(button: u32, down: bool) {

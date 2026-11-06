@@ -68,14 +68,10 @@ fn peer_size(
 /// Where the local pointer reappears after it leaves a remote screen.
 /// `leave` is the edge of the remote screen that was crossed, `pct` the
 /// position along it, and `m` the local monitor the pointer returns to.
-/// `deep` pulls farther inland so a still-held drag is not covered by the edge strip.
-fn reentry_point(
-    leave: csc_proto::Edge,
-    pct: f32,
-    m: csc_platform::Rect,
-    deep: bool,
-) -> (i32, i32) {
-    let inset = if deep { 80 } else { 12 };
+/// The pointer stays on that edge (one pixel in, so the crossing itself does not
+/// immediately switch back).
+fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i32, i32) {
+    let inset = 1;
     let pct = pct.clamp(0.0, 1.0);
     let lo_x = m.left + inset;
     let hi_x = (m.right - 1 - inset).max(lo_x);
@@ -113,10 +109,10 @@ fn inject_controlled_delta(
     }
 }
 
-/// Place the pointer when control arrives. On Linux this is one relative jump
-/// from wherever the pointer already is. On Wayland the compositor cursor cannot
-/// be read, so a jump from a guessed origin lands short and later moves cannot
-/// cover the rest of the screen. Pin to the top-left of the desktop first.
+/// Place the pointer on the entry edge when control arrives. One relative jump,
+/// not a slide through the desktop and not a warp to the screen center.
+/// On Wayland the compositor cursor cannot be read, so the first placement pins
+/// to the top-left and then to the edge. Each step is a single event.
 fn inject_controlled_jump(
     injector: &mut dyn csc_platform::InputInjector,
     commanded: &mut Option<(i32, i32)>,
@@ -169,9 +165,10 @@ fn x11_pointer() -> Option<(i32, i32)> {
     Some((ax - ox, ay - oy))
 }
 
-/// Land inside the screen, not on the edge that was just crossed.
+/// One pixel in from the edge that was just crossed, so the pointer stays
+/// where the hand crossed and a later outward push can leave again.
 fn inset_from_edge(edge: csc_proto::Edge, x: &mut i32, y: &mut i32, m: &csc_platform::Rect) {
-    const N: i32 = 48;
+    const N: i32 = 1;
     match edge {
         csc_proto::Edge::Left | csc_proto::Edge::TopLeft | csc_proto::Edge::BottomLeft => {
             *x = (*x + N).min(m.right - 1);
@@ -204,6 +201,16 @@ fn follow_real_pointer(logical: (i32, i32), real: (i32, i32), real_moved: bool) 
 /// A local session state that must hand the pointer back to this computer.
 fn local_lock_releases(state: &str) -> bool {
     matches!(state, "locked" | "secure_desktop")
+}
+
+/// A button or wheel the hook swallowed in the same batch as a screen change.
+/// Play it on this computer once the pointer is back here.
+fn replay_swallowed(injector: &mut dyn csc_platform::InputInjector, step: Captured) {
+    match step {
+        Captured::Button { button, down } => injector.mouse_button(button, down),
+        Captured::Wheel { v, h } => injector.mouse_wheel(v, h),
+        Captured::Move { .. } | Captured::Key { .. } => {}
+    }
 }
 
 /// Give input back to this computer. `target` is where the cursor reappears,
@@ -307,31 +314,6 @@ impl Hotkey {
                 .mods
                 .iter()
                 .all(|m| held.iter().any(|k| fold_modifier(*k) == *m))
-    }
-}
-
-/// Keep the pointer just inside the edge it crossed, so the physical mouse
-/// stays where the hand is and a small move back returns to this computer.
-fn park_inside(
-    edge: csc_proto::Edge,
-    x: i32,
-    y: i32,
-    screen: csc_platform::ScreenSize,
-) -> (i32, i32) {
-    let w = screen.width.max(2);
-    let h = screen.height.max(2);
-    let inset = 24;
-    let cx = x.clamp(inset, w - 1 - inset);
-    let cy = y.clamp(inset, h - 1 - inset);
-    match edge {
-        csc_proto::Edge::Left => (inset, cy),
-        csc_proto::Edge::Right => (w - 1 - inset, cy),
-        csc_proto::Edge::Top => (cx, inset),
-        csc_proto::Edge::Bottom => (cx, h - 1 - inset),
-        csc_proto::Edge::TopLeft => (inset, inset),
-        csc_proto::Edge::TopRight => (w - 1 - inset, inset),
-        csc_proto::Edge::BottomLeft => (inset, h - 1 - inset),
-        csc_proto::Edge::BottomRight => (w - 1 - inset, h - 1 - inset),
     }
 }
 
@@ -856,9 +838,24 @@ impl Core {
             }
             polled
         };
+        let mut returned = false;
         for step in steps {
+            if returned {
+                // A click queued in the same batch as the crossing must not be
+                // thrown away. The hook already swallowed it.
+                if matches!(step, Captured::Move { .. }) {
+                    continue;
+                }
+                if self.grab {
+                    self.held.track(step);
+                    self.net.send_captured(step).await;
+                } else {
+                    replay_swallowed(self.injector.as_mut(), step);
+                }
+                continue;
+            }
             if self.grab_input(step).await {
-                break;
+                returned = true;
             }
         }
     }
@@ -918,17 +915,6 @@ impl Core {
         if let Captured::Key { hid, down: false } = step {
             if !self.held.keys.contains(&hid) {
                 // Release of a key the remote never saw (hotkey, caught Ctrl+V).
-                return false;
-            }
-        }
-        if let Captured::Button {
-            button,
-            down: false,
-        } = step
-        {
-            if !self.held.buttons.contains(&button) {
-                // Spurious up after Esc-cancel / grab start must not abort the
-                // remote virtual drag that just pressed its own button.
                 return false;
             }
         }
@@ -1058,7 +1044,7 @@ impl Core {
             let m = self
                 .switch
                 .monitor_at(self.enter_point.0, self.enter_point.1);
-            let back = reentry_point(leave.edge, leave.position_pct, m, false);
+            let back = reentry_point(leave.edge, leave.position_pct, m);
             release_pointer(&mut self.grab, Some(back));
             self.grab_armed = false;
             self.set_active_screen(None).await;
@@ -1158,18 +1144,18 @@ impl Core {
         self.switch.set_remote_reports(reports);
         self.enter_point = (x, y);
         let m = self.switch.monitor_at(x, y);
-        self.home_point = reentry_point(entry, dec.position_pct, m, false);
+        self.home_point = reentry_point(entry, dec.position_pct, m);
         self.held = HeldInput::default();
+        // Leave the cursor on the edge it just crossed. Warping it to the
+        // monitor center is the stutter, and clipping that center traps the
+        // hand there while the other computer already shows it is controlled.
+        // Later motion is relative (raw input), not a reposition.
+        self.park_x = x;
+        self.park_y = y;
         if self.hooked {
-            // Moves are measured from the park point, and Windows clips the cursor
-            // at the desktop edge. Park in the middle of this monitor so no motion is lost.
-            let (cx, cy) = m.center();
-            csc_platform::capture_set_grab(true, Some((ox + cx, oy + cy)));
+            csc_platform::capture_set_grab(true, Some((ox + x, oy + y)));
         } else {
-            let parked = park_inside(dec.edge, x, y, self.screen);
-            self.park_x = parked.0;
-            self.park_y = parked.1;
-            csc_platform::warp_cursor(ox + self.park_x, oy + self.park_y);
+            csc_platform::warp_cursor(ox + x, oy + y);
         }
         self.grab = true;
         self.virtual_locks = Some(csc_platform::lock_leds());
@@ -1586,26 +1572,14 @@ impl Core {
         self.remote_y = self.remote_y.saturating_add(dy).clamp(0, h - 1);
         let applied = (self.remote_x - prev.0, self.remote_y - prev.1);
         csc_platform::vdrag::note_pointer(self.remote_x, self.remote_y);
-        // Wayland: if the logical pointer is already at a clamp edge but the
-        // host still sends motion, re-pin so the real uinput cursor can catch up
-        // (a short first jump leaves the left/top edge unreachable).
-        if csc_platform::wayland_session() && (dx != 0 || dy != 0) && applied == (0, 0) {
-            inject_controlled_jump(
-                self.injector.as_mut(),
-                &mut self.commanded,
-                self.remote_x,
-                self.remote_y,
-                self.screen,
-            );
+        // Pass the host's relative step. Do not re-pin when the pointer is
+        // already on an edge: that jump pulls it off the edge and feels stuck.
+        let (sx, sy) = if applied == (0, 0) && (dx != 0 || dy != 0) {
+            (dx, dy)
         } else {
-            inject_controlled_delta(
-                self.injector.as_mut(),
-                self.remote_x,
-                self.remote_y,
-                applied.0,
-                applied.1,
-            );
-        }
+            applied
+        };
+        inject_controlled_delta(self.injector.as_mut(), self.remote_x, self.remote_y, sx, sy);
         let (ox, oy) = csc_platform::virtual_origin();
         let (at, moved, real) = if csc_platform::wayland_session() {
             self.commanded = Some((self.remote_x, self.remote_y));
@@ -1647,7 +1621,7 @@ impl Core {
         else {
             return;
         };
-        if self.last_edge_sent.elapsed() < Duration::from_millis(250) {
+        if self.last_edge_sent.elapsed() < Duration::from_millis(16) {
             return;
         }
         let Some(host) = self.net.peer_names().await.into_iter().next() else {
@@ -2005,7 +1979,9 @@ impl Core {
                 self.remote_y = self.remote_y.clamp(m.top, m.bottom - 1);
                 inset_from_edge(p.edge, &mut self.remote_x, &mut self.remote_y, &m);
                 self.probe.reset();
-                self.control_ready = Instant::now() + Duration::from_millis(400);
+                // Ignore the tail of the crossing move. Long enough to not bounce
+                // straight back, short enough that a deliberate return is immediate.
+                self.control_ready = Instant::now() + Duration::from_millis(16);
                 // Seed with the pointer before the jump. If the jump is ignored,
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
@@ -2070,7 +2046,7 @@ impl Core {
                         .monitor_at(self.enter_point.0, self.enter_point.1);
                     release_pointer(
                         &mut self.grab,
-                        Some(reentry_point(p.edge, p.position_pct, m, false)),
+                        Some(reentry_point(p.edge, p.position_pct, m)),
                     );
                 }
                 self.grab_armed = false;
@@ -2420,7 +2396,8 @@ pub async fn run() -> anyhow::Result<()> {
         last_edge_sent: Instant::now() - Duration::from_secs(5),
         power_rx: csc_platform::spawn_power_watch(),
     };
-    let mut tick = tokio::time::interval(Duration::from_millis(8));
+    let mut tick = tokio::time::interval(Duration::from_millis(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -2482,6 +2459,24 @@ async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoar
 mod tests {
     use super::Hotkey;
     use std::collections::HashSet;
+
+    #[test]
+    fn reentry_stays_on_the_edge_that_was_crossed() {
+        let m = csc_platform::Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        // Leaving the remote through its left edge returns on this monitor's right edge.
+        let (x, y) = super::reentry_point(csc_proto::Edge::Left, 0.25, m);
+        assert_eq!(x, 1918);
+        assert_eq!(y, 270);
+        // Leaving through the remote's bottom returns on this monitor's top edge.
+        let (x, y) = super::reentry_point(csc_proto::Edge::Bottom, 0.5, m);
+        assert_eq!(y, 1);
+        assert_eq!(x, 960);
+    }
 
     #[test]
     fn secure_desktop_releases_the_pointer_like_a_lock() {

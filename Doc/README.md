@@ -2,7 +2,7 @@
 
 一套键盘鼠标控制多台 Windows / Linux 电脑，并在电脑之间同步剪贴板、用复制粘贴互传文件。所有操作在后台自动完成，不需要在软件里点「发送」或「接收」。
 
-> 当前文档对应 **v0.2.1**，协议版本 2，与 v1.x 不互通。变更见 [CHANGELOG](CHANGELOG.md)。
+> 当前文档对应 **v0.2.2**，协议版本 2，与 v1.x 不互通。变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 特性
 
@@ -63,6 +63,8 @@ bash scripts/package-docker.sh
 bash scripts/check-docker.sh
 ```
 
+推送前按 CI 摸底（不发布）：`bash scripts/ci-local.sh`；加 `--build` 再生成 `dist/SHA256SUMS`。说明见 [构建发布流程](构建发布流程.md) §3、§8.1。
+
 性能测量（延迟 P50/P99、吞吐）：两端开启测量模式后运行 `Cross-SystemConnect-core --bench latency --peer <名字>`，方法见 [架构设计](架构设计.md) §12.15。
 
 签名、打包、CI 与发布检查见 [构建发布流程](构建发布流程.md)。
@@ -82,7 +84,7 @@ Cross-SystemConnect/
 │   ├── 构建发布流程.md
 │   └── 用户手册.md
 ├── packaging/                 # Docker 镜像、gnome-shell-extension/（csc-shell 扩展）
-├── scripts/                   # package-docker.sh
+├── scripts/                   # package-docker.sh、check-docker.sh、ci-local.sh
 ├── crates/
 │   ├── csc-proto/             # 跨机帧 + IPC 类型
 │   ├── csc-config/            # 配置读写与迁移

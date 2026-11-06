@@ -68,6 +68,8 @@ Linux 被控端在 X11 上需要 `libx11-6`、`libxtst6`。Wayland 上用 `/dev/
 
 版本号在根目录 `Cargo.toml` 的 `version`。设置窗口左上角显示 `v` 加该版本；窗口标题和托盘提示同样带上版本。发布步骤见 [Doc/构建发布流程.md](Doc/构建发布流程.md)。
 
+推送前在本地摸底，不访问 GitHub、不发布：`bash scripts/ci-local.sh`（与 CI 的 check 相同）；加 `--build` 再编译两端并生成 `dist/SHA256SUMS`。要在 GitHub 上只跑 check：`gh workflow run ci.yml`。
+
 ---
 
 ## 目录结构
@@ -83,7 +85,7 @@ Cross-SystemConnect/
 │   └── csc-ui/         # 界面 Cross-SystemConnect：托盘 + WebView 设置窗、传输窗口
 ├── .github/workflows/  # GitHub Actions：镜像 → 检查 → 构建发布
 ├── packaging/          # Docker 镜像定义与编译脚本（一次生成 Windows 与 Linux）
-├── scripts/            # package-docker.sh、check-docker.sh
+├── scripts/            # package-docker.sh、check-docker.sh、ci-local.sh
 ├── resources/          # 图标
 ├── tools/              # 辅助脚本
 └── Doc/                # PRD、架构设计、构建发布、用户手册、测试、CHANGELOG

@@ -1,8 +1,8 @@
 //! Low-level mouse and keyboard hooks for the keyboard host.
 //!
 //! While grabbed, every physical mouse and key event is swallowed and queued,
-//! so it reaches only the remote computer. The cursor stays on the park point;
-//! each move is reported as the distance from that point.
+//! so it reaches only the remote computer. The cursor stays where the pointer
+//! crossed the screen edge. Motion is the raw device delta, not a warp.
 //! Windows drops a hook whose callback is slow, so callbacks only queue.
 //!
 //! The same thread reads raw mouse input (movement before the cursor is held
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use tracing::{info, warn};
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -39,6 +39,9 @@ const WM_KEYDOWN: u32 = 0x0100;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 
 static RAW_OK: AtomicBool = AtomicBool::new(false);
+/// A relative raw sample has been seen. Motion can be forwarded without
+/// moving the cursor, so the pointer stays on the edge it crossed.
+static RAW_SEEN: AtomicBool = AtomicBool::new(false);
 static RAW_DX: AtomicI32 = AtomicI32::new(0);
 static RAW_DY: AtomicI32 = AtomicI32::new(0);
 static PASTE_WANT: AtomicBool = AtomicBool::new(false);
@@ -118,6 +121,9 @@ unsafe extern "system" fn raw_proc(
         if got != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 {
             let mouse = raw.data.mouse;
             if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE == 0 {
+                if mouse.lLastX != 0 || mouse.lLastY != 0 {
+                    RAW_SEEN.store(true, Ordering::Release);
+                }
                 RAW_DX.fetch_add(mouse.lLastX, Ordering::AcqRel);
                 RAW_DY.fetch_add(mouse.lLastY, Ordering::AcqRel);
             }
@@ -146,13 +152,17 @@ fn held_modifiers() -> u32 {
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_RBUTTONUP: u32 = 0x0205;
+const WM_RBUTTONDBLCLK: u32 = 0x0206;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MBUTTONDBLCLK: u32 = 0x0209;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_XBUTTONDOWN: u32 = 0x020B;
 const WM_XBUTTONUP: u32 = 0x020C;
+const WM_XBUTTONDBLCLK: u32 = 0x020D;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const LLMHF_INJECTED: u32 = 0x01;
 const LLKHF_EXTENDED: u32 = 0x01;
@@ -218,9 +228,9 @@ fn hook_thread(ready: std::sync::mpsc::Sender<bool>) {
 }
 
 /// Start or stop swallowing input. `park` is the absolute screen point the
-/// cursor is held at while grabbed. Clip to a pad around that point so a fast
-/// flick cannot reach the desktop edge and stop, while hook deltas still work
-/// when raw input is silent.
+/// cursor already occupies: the edge it crossed. The cursor is not moved to
+/// the center, and it is not clipped into a box (that trap is what leaves the
+/// hand stuck while the other computer shows it is controlled).
 pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     if let Some((x, y)) = park {
         PARK_X.store(x, Ordering::SeqCst);
@@ -231,25 +241,15 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     }
     crate::keyrepeat::reset();
     GRAB.store(grab, Ordering::SeqCst);
-    unsafe {
-        if grab {
-            let x = PARK_X.load(Ordering::SeqCst);
-            let y = PARK_Y.load(Ordering::SeqCst);
-            const PAD: i32 = 96;
-            let _ = ClipCursor(Some(&RECT {
-                left: x - PAD,
-                top: y - PAD,
-                right: x + PAD + 1,
-                bottom: y + PAD + 1,
-            }));
-        } else {
+    if !grab {
+        // Release any clip a previous version left around the screen center.
+        unsafe {
             let _ = ClipCursor(None);
         }
     }
-    // Clear stale events when grab starts (Esc-cancel / pre-grab ups) and when
-    // it stops, so a leftover button-up cannot abort the remote virtual drag.
+    // Drop stale motion only. A button already queued is a click, not noise.
     if let Ok(mut q) = QUEUE.lock() {
-        q.clear();
+        q.retain(|ev| !matches!(ev, Captured::Move { .. }));
     }
 }
 
@@ -277,66 +277,78 @@ fn push(ev: Captured) {
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && GRAB.load(Ordering::Relaxed) {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if info.flags & LLMHF_INJECTED == 0 {
-            let high = (info.mouseData >> 16) as u16;
-            let ev = match wparam.0 as u32 {
-                WM_MOUSEMOVE => {
+        let injected = info.flags & LLMHF_INJECTED != 0;
+        let msg = wparam.0 as u32;
+        // Our own cursor correction. Let it through, and do not treat it as a hand move.
+        if injected && msg == WM_MOUSEMOVE {
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+        }
+        let high = (info.mouseData >> 16) as u16;
+        let ev = match msg {
+            WM_MOUSEMOVE => {
+                if RAW_SEEN.load(Ordering::Relaxed) {
+                    // Raw input has the delta. Swallowing the move leaves the
+                    // cursor on the edge; do not pull it anywhere.
+                    None
+                } else {
+                    // No relative raw samples yet (some devices report absolute
+                    // motion only). Measure from the edge and put the cursor back
+                    // there. Never to the center of the screen.
                     let park_x = PARK_X.load(Ordering::Relaxed);
                     let park_y = PARK_Y.load(Ordering::Relaxed);
                     let dx = info.pt.x - park_x;
                     let dy = info.pt.y - park_y;
                     if dx != 0 || dy != 0 {
-                        // Put it back before it reaches the clip pad or the
-                        // screen edge and stops. Needed even with raw input:
-                        // some devices report raw as zero, and a 1 px clip then
-                        // leaves the remote pointer unable to cover the screen.
                         let _ = SetCursorPos(park_x, park_y);
                     }
                     (dx != 0 || dy != 0).then_some(Captured::Move { dx, dy })
                 }
-                WM_LBUTTONDOWN => Some(Captured::Button {
-                    button: 0,
-                    down: true,
-                }),
-                WM_LBUTTONUP => Some(Captured::Button {
-                    button: 0,
-                    down: false,
-                }),
-                WM_RBUTTONDOWN => Some(Captured::Button {
-                    button: 1,
-                    down: true,
-                }),
-                WM_RBUTTONUP => Some(Captured::Button {
-                    button: 1,
-                    down: false,
-                }),
-                WM_MBUTTONDOWN => Some(Captured::Button {
-                    button: 2,
-                    down: true,
-                }),
-                WM_MBUTTONUP => Some(Captured::Button {
-                    button: 2,
-                    down: false,
-                }),
-                WM_XBUTTONDOWN | WM_XBUTTONUP => Some(Captured::Button {
-                    button: if high == 1 { 3 } else { 4 },
-                    down: wparam.0 as u32 == WM_XBUTTONDOWN,
-                }),
-                WM_MOUSEWHEEL => {
-                    let v = high as i16 as i32;
-                    (v != 0).then_some(Captured::Wheel { v, h: 0 })
-                }
-                WM_MOUSEHWHEEL => {
-                    let h = high as i16 as i32;
-                    (h != 0).then_some(Captured::Wheel { v: 0, h })
-                }
-                _ => None,
-            };
-            if let Some(ev) = ev {
-                push(ev);
             }
-            return LRESULT(1);
+            // DBLCLK is the second press. Ignoring it drops that click.
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => Some(Captured::Button {
+                button: 0,
+                down: true,
+            }),
+            WM_LBUTTONUP => Some(Captured::Button {
+                button: 0,
+                down: false,
+            }),
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => Some(Captured::Button {
+                button: 1,
+                down: true,
+            }),
+            WM_RBUTTONUP => Some(Captured::Button {
+                button: 1,
+                down: false,
+            }),
+            WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => Some(Captured::Button {
+                button: 2,
+                down: true,
+            }),
+            WM_MBUTTONUP => Some(Captured::Button {
+                button: 2,
+                down: false,
+            }),
+            WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => Some(Captured::Button {
+                button: if high == 1 { 3 } else { 4 },
+                down: msg != WM_XBUTTONUP,
+            }),
+            WM_MOUSEWHEEL => {
+                let v = high as i16 as i32;
+                (v != 0).then_some(Captured::Wheel { v, h: 0 })
+            }
+            WM_MOUSEHWHEEL => {
+                let h = high as i16 as i32;
+                (h != 0).then_some(Captured::Wheel { v: 0, h })
+            }
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            push(ev);
         }
+        // Driver-injected clicks (some mice) are forwarded above and swallowed
+        // here, so they are not delivered only to the window under the cursor.
+        return LRESULT(1);
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }

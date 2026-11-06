@@ -132,19 +132,24 @@ pub fn move_abs(x: i32, y: i32) {
 }
 
 pub fn move_rel(dx: i32, dy: i32) {
-    // One huge relative event is dropped by some compositors. Step across.
-    const STEP: i32 = 400;
-    let (mut left_x, mut left_y) = (dx, dy);
-    while left_x != 0 || left_y != 0 {
-        let sx = left_x.clamp(-STEP, STEP);
-        let sy = left_y.clamp(-STEP, STEP);
-        let _ = with(|c| unsafe {
-            (c.fake_rel)(c.dpy, c.screen, sx, sy, 0);
-            (c.flush)(c.dpy);
-        });
-        left_x -= sx;
-        left_y -= sy;
+    // A single enormous XTest event is dropped by some compositors. A screen
+    // crossing still fits in one event; flush once so the pointer does not
+    // step across the desktop.
+    const STEP: i32 = 16_384;
+    if dx == 0 && dy == 0 {
+        return;
     }
+    let _ = with(|c| unsafe {
+        let (mut left_x, mut left_y) = (dx, dy);
+        while left_x != 0 || left_y != 0 {
+            let sx = left_x.clamp(-STEP, STEP);
+            let sy = left_y.clamp(-STEP, STEP);
+            (c.fake_rel)(c.dpy, c.screen, sx, sy, 0);
+            left_x -= sx;
+            left_y -= sy;
+        }
+        (c.flush)(c.dpy);
+    });
 }
 
 pub fn button(button: u32, down: bool) {

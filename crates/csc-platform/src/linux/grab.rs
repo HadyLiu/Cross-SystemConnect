@@ -311,7 +311,9 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
         } else {
             None
         };
-        s.queue.clear();
+        // Drop stale motion only. Clearing buttons here discards a right-click
+        // that arrived in the same instant as the switch.
+        s.queue.retain(|ev| !matches!(ev, Captured::Move { .. }));
     }
     crate::keyrepeat::reset();
 }

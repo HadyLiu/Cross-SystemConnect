@@ -6,9 +6,19 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
+### 修复
+
+- **指针停在切换边缘，不再被拉到屏幕中心。** Windows 作为键鼠主机时，切到 Ubuntu 会把本机光标挪到显示器中心，并用 `ClipCursor` 锁在中心约 192×192 的区域里。于是出现「鼠标困在 Windows 正中、无法移到其他区域，同时 Ubuntu 托盘绿点在闪」（绿点闪烁表示那台电脑已经处于被控）。现在光标留在穿过的那条边上，位移用原始相对量转发，不再改指针位置。
+- **边缘切换不再把指针滑过整个桌面。** 被控端落到进入边内侧 1 像素，而不是向内 48 像素或屏幕中心。Wayland 上一次到位用一笔相对位移，不再拆成许多小步画过去。本地采样从 8 ms 改为 1 ms。越过边缘后的回弹抑制从 400 ms / 250 ms 改为 16 ms。
+- **右键不再在切换前后被丢掉。** 抓取开始和结束时会清空整个输入队列，队列里的右键因此消失；右键的第二次按下（`WM_*BUTTONDBLCLK`）没有转发；部分鼠标驱动注入的右键被当成程序自己的事件忽略；按钮松开如果对不上一次按下也会直接丢弃。现在只丢掉过期的移动，双击和驱动注入的按键都会转发。
+
 ### 变更
 
 - **打标签后直接发布 Release**：`ci.yml` 的 build 不再创建草稿，改为直接发布并显式绑定 `tag_name`，Linux/Windows 压缩包与 `SHA256SUMS` 挂在对应标签的 Release 上。
+- **本地可按 CI 摸底**：`bash scripts/ci-local.sh` 跑 check；加 `--build` 再编译并写出 `dist/SHA256SUMS`。不推送、不发布。远程只跑 check 用 `gh workflow run ci.yml`。
+- **检查脚本不再从源码编译 cargo-audit / cargo-deny**。工具链镜像里执行 `rustc` 会失败（`No such file or directory`），`cargo install` 因此过不了。clippy、rustfmt、`cargo-audit`、`cargo-deny` 放进工具链镜像，检查时不再下载。
 - **修复 cargo deny 检查**：`deny.toml` 许可证白名单加入 `Unlicense`（ksni，Linux 托盘）；tokio 1.53.1 → 1.54.1 修复 RUSTSEC-2026-0386；clipboard-win 5.4.1 → 5.4.3、yoke-derive 0.8.3 → 0.8.4 替换已 yank 版本。
 - **适配新版 cargo-deny 配置格式**：`deny.toml` 的 `[advisories]` 删除已移除的 `vulnerability`、`notice` 键（漏洞一律报错），`unmaintained` 改为作用范围值 `"none"`（无人维护的依赖不导致失败），`yanked = "warn"` 保持不变。
 - **被控提示改为托盘绿点**：不再显示屏幕右上角「Controlled · Ctrl+Alt+Shift+P」叠层（含 X11 override-redirect / 原计划的 Shell 顶栏指示）。已连接时主机与被控端托盘图标右下角常亮绿点；仅当本机正在被控时绿点闪烁；未连接不加绿点。状态字段 `status.beingControlled`；`ui.controlled_indicator` 与屏幕提示层不再使用。
@@ -194,6 +204,7 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
+[0.2.2]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.2
 [0.2.1]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.1
 [0.2.0]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.0
 [1.1]: TBD
