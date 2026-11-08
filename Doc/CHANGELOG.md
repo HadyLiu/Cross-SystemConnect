@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-09
+
 ### 修复
 
 - **穿屏与配对后连接状态抖动。** `3c923cd` 起配对码按 IP 直拨、发现按主机名拨号，同一台电脑会出现两条控制会话；IP→主机名 rekey 会误杀已有会话，界面不停「已连接/断开」，边缘切换因 `has_peer` 不稳而穿不过去。现在同一 IP 只保留一条会话，rekey 不再踢掉已有主机名会话，断开通知在仍有存活链路时抑制；`connected` 在 TCP 会话建立后立即为真（不再只等 HELLO 的 greeted 名）。
@@ -245,6 +247,7 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
+[0.2.4]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.4
 [0.2.3]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.3
 [0.2.2]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.2
 [0.2.1]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.1
