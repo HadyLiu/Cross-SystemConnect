@@ -32,7 +32,7 @@ mod imp {
             return Ok(());
         }
         let body = format!(
-            "[Desktop Entry]\nType=Application\nName={ENTRY}\nExec=\"{}\"\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName={ENTRY}\nExec=\"{}\" --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
             exe.display()
         );
         if std::fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
@@ -67,7 +67,7 @@ mod imp {
 
     pub fn apply(enabled: bool, exe: &Path) -> anyhow::Result<()> {
         if enabled {
-            let value = format!("\"{}\"", exe.display());
+            let value = format!("\"{}\" --background", exe.display());
             let status = reg(&[
                 "add", RUN_KEY, "/v", ENTRY, "/t", "REG_SZ", "/d", &value, "/f",
             ])?;

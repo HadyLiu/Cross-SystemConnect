@@ -18,24 +18,25 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
-
-tao = "0.30"
-wry = { version = "0.47", features = ["linux-body"] }
-open = "5"
+# glow：Windows mingw 交叉编译时默认 wgpu/DX12 编不过
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "x11",
+] }
+rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["png"] }
+open = "5"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = "0.19"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.2"
-gtk = "0.18"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 csc-core = { path = "../csc-core" }
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_System_Com",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-] }

@@ -29,7 +29,7 @@
 双进程：
 
 - **`Cross-SystemConnect-core`**：无界面内核（网络、切换、剪贴板、文件、本机 IPC）
-- **`Cross-SystemConnect`**：托盘 + 内嵌 WebView 设置；经 Named Pipe / Unix socket 控制内核；启动时自动拉起内核
+- **`Cross-SystemConnect`**：托盘 + egui 设置窗；经 Named Pipe / Unix socket 控制内核；启动时自动拉起内核
 
 不使用本机 HTTP 配置端口。Windows 与 Linux 的可执行文件由 Docker 镜像 `cross-systemconnect-packager` 一次生成，不在两端分别编译。Windows 目标仍是 GNU，不使用 MSVC。
 
@@ -82,7 +82,7 @@ Cross-SystemConnect/
 │   ├── csc-config/     # 配置与日志文件
 │   ├── csc-platform/   # 平台层：Windows 钩子/注入、Linux X11/uinput、剪贴板等
 │   ├── csc-core/       # 内核 Cross-SystemConnect-core：网络、TLS、切换、剪贴板、文件传输、IPC
-│   └── csc-ui/         # 界面 Cross-SystemConnect：托盘 + WebView 设置窗、传输窗口
+│   └── csc-ui/         # 界面 Cross-SystemConnect：托盘 + egui 设置窗、传输窗口
 ├── .github/workflows/  # GitHub Actions：检查 → 构建发布
 ├── packaging/          # Docker 镜像定义与编译脚本（一次生成 Windows 与 Linux）
 ├── scripts/            # package-docker.sh、check-docker.sh、ci-local.sh

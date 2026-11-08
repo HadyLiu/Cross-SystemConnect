@@ -122,6 +122,12 @@ pub trait ScreenInfo: Send {
             bottom: s.height,
         }]
     }
+
+    /// Desktop area not covered by a taskbar or panel, one rect per monitor.
+    /// The default is the full monitor: the pointer there still belongs to this computer.
+    fn work_areas(&self) -> Vec<Rect> {
+        self.monitors()
+    }
 }
 
 pub trait AutoStart: Send {

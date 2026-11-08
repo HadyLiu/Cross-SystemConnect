@@ -40,7 +40,11 @@ pub fn usable_unicast_v4(ip: &str) -> bool {
     let Some(p) = parse_v4(ip) else {
         return false;
     };
-    p[0] != 0 && p[0] != 127 && !(p[0] == 169 && p[1] == 254)
+    p[0] != 0
+        && p[0] != 127
+        && !(p[0] == 169 && p[1] == 254)
+        // 198.18.0.0/15 is the benchmarking range. Clash fake-ip uses it.
+        && !(p[0] == 198 && (p[1] == 18 || p[1] == 19))
 }
 
 pub fn looks_virtual(name: &str, description: &str) -> bool {
@@ -64,9 +68,21 @@ pub fn looks_virtual(name: &str, description: &str) -> bool {
         "pseudo",
         "npcap",
         "wan miniport",
+        // Clash / mihomo / sing-box bring up a Wintun adapter just by opening
+        // the app, even when the system proxy switch is off.
+        "wintun",
+        "mihomo",
+        "clash",
+        "sing-box",
+        "singbox",
+        "tun",
+        "openvpn",
+        "nordlynx",
     ]
     .iter()
     .any(|k| s.contains(k))
+        || name.trim().eq_ignore_ascii_case("meta")
+        || description.trim().eq_ignore_ascii_case("meta")
 }
 
 fn parse_v4(ip: &str) -> Option<[u8; 4]> {
@@ -181,6 +197,11 @@ mod tests {
         assert!(usable_unicast_v4("192.168.0.88"));
         assert!(!usable_unicast_v4("127.0.0.1"));
         assert!(!usable_unicast_v4("169.254.1.2"));
+        assert!(!usable_unicast_v4("198.18.0.1"));
+        assert!(!usable_unicast_v4("198.19.255.1"));
+        assert!(looks_virtual("Meta", "Wintun Userspace Tunnel"));
+        assert!(looks_virtual("mihomo", ""));
+        assert!(looks_virtual("Clash", "Clash Tunnel"));
         assert!(looks_virtual(
             "vEthernet (WSL)",
             "Hyper-V Virtual Ethernet Adapter"

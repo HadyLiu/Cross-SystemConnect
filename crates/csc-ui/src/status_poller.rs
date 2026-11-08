@@ -1,18 +1,14 @@
 //! One thread reading the core status for the transfer window and tray green dot.
 
-use crate::ipc_client;
-use crate::UserEvent;
+use crate::events::{EventBus, UiEvent};
 use serde_json::Value;
 use std::time::{Duration, Instant};
-use tao::event_loop::EventLoopProxy;
 
 const TICK: Duration = Duration::from_millis(80);
-/// Resend an unchanged, non-empty transfer list this often, so a window that
-/// finished loading after the last change still shows it.
 const REFRESH: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(500);
 
-pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
+pub fn spawn(bus: EventBus, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let mut transfers: Vec<Value> = Vec::new();
         let mut sent_at = Instant::now();
@@ -24,7 +20,7 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
         let mut blink_at = Instant::now();
         loop {
             std::thread::sleep(TICK);
-            let status = ipc_client::get_status().ok();
+            let status = crate::ipc_client::get_status().ok();
             let t = status
                 .as_ref()
                 .and_then(|s| s.get("transfers"))
@@ -35,9 +31,8 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
             if changed || (!t.is_empty() && sent_at.elapsed() >= REFRESH) {
                 transfers = t.clone();
                 sent_at = Instant::now();
-                if proxy.send_event(UserEvent::Transfers(t)).is_err() {
-                    return;
-                }
+                bus.send(UiEvent::Transfers(t));
+                ctx.request_repaint();
             }
 
             let connected = status
@@ -66,16 +61,12 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
             };
             if next != tray {
                 tray = next;
-                if proxy
-                    .send_event(UserEvent::TrayLink {
-                        connected,
-                        being_controlled,
-                        blink_on,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
+                bus.send(UiEvent::TrayLink {
+                    connected,
+                    being_controlled,
+                    blink_on,
+                });
+                ctx.request_repaint();
             }
         }
     });

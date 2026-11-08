@@ -1,14 +1,13 @@
 //! Linux tray via StatusNotifierItem.
 //!
-//! tray-icon on Linux never emits click or double-click. A left click arrives
-//! as Activate, which opens the settings window. Right click still shows the menu.
+//! Menu actions that must work while the settings window is minimized run here
+//! on the tray/dbus thread — the egui loop may be asleep and never drain events.
 
+use crate::events::{EventBus, UiEvent};
 use crate::icon::{self, GreenDot};
-use crate::UserEvent;
-use tao::event_loop::EventLoopProxy;
 
 pub struct LinuxTray {
-    pub proxy: EventLoopProxy<UserEvent>,
+    pub bus: EventBus,
     pub connected: bool,
     pub being_controlled: bool,
     pub blink_on: bool,
@@ -33,6 +32,15 @@ impl ksni::Tray for LinuxTray {
         crate::app_title()
     }
 
+    fn status(&self) -> ksni::Status {
+        // Passive items may be hidden by GNOME AppIndicator.
+        ksni::Status::Active
+    }
+
+    fn category(&self) -> ksni::Category {
+        ksni::Category::ApplicationStatus
+    }
+
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let Some((w, h, data)) = argb_icon(32, self.dot()) else {
             return Vec::new();
@@ -44,8 +52,40 @@ impl ksni::Tray for LinuxTray {
         }]
     }
 
+    fn tool_tip(&self) -> ksni::ToolTip {
+        let en = crate::locale::is_english();
+        let description = if !self.connected {
+            if en {
+                "Not connected"
+            } else {
+                "未连接"
+            }
+        } else if self.being_controlled {
+            if en {
+                "Being controlled"
+            } else {
+                "被控中"
+            }
+        } else if en {
+            "Connected"
+        } else {
+            "已连接"
+        }
+        .to_string();
+        ksni::ToolTip {
+            title: crate::app_title(),
+            description,
+            icon_pixmap: self.icon_pixmap(),
+            ..Default::default()
+        }
+    }
+
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.proxy.send_event(UserEvent::ShowSettings);
+        self.bus.show_settings_now();
+    }
+
+    fn secondary_activate(&mut self, x: i32, y: i32) {
+        self.activate(x, y);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -58,20 +98,72 @@ impl ksni::Tray for LinuxTray {
         } else {
             crate::locale::resume_sharing()
         };
-        vec![
-            item(crate::locale::settings(), UserEvent::ShowSettings),
-            item(crate::locale::paste(), UserEvent::PasteHere),
-            item(pause_label, UserEvent::ToggleSharing),
-            item(crate::locale::quit(), UserEvent::Quit),
-        ]
+        vec![settings_item(), sharing_item(pause_label), quit_item()]
     }
 }
 
-fn item(label: &str, event: UserEvent) -> ksni::MenuItem<LinuxTray> {
+/// Start the StatusNotifierItem on a dedicated thread (no unwrap panic on dbus errors).
+pub fn spawn(bus: EventBus) -> Option<ksni::Handle<LinuxTray>> {
+    let service = ksni::TrayService::new(LinuxTray {
+        bus,
+        connected: false,
+        being_controlled: false,
+        blink_on: true,
+    });
+    let handle = service.handle();
+    match std::thread::Builder::new()
+        .name("csc-linux-tray".into())
+        .spawn(move || {
+            if let Err(e) = service.run() {
+                tracing::error!("linux tray stopped: {e}");
+            }
+        }) {
+        Ok(_) => Some(handle),
+        Err(e) => {
+            tracing::error!("failed to spawn linux tray thread: {e}");
+            None
+        }
+    }
+}
+
+fn settings_item() -> ksni::MenuItem<LinuxTray> {
+    ksni::menu::StandardItem {
+        label: crate::locale::settings().into(),
+        activate: Box::new(|tray: &mut LinuxTray| {
+            tray.bus.show_settings_now();
+        }),
+        ..Default::default()
+    }
+    .into()
+}
+
+fn sharing_item(label: &str) -> ksni::MenuItem<LinuxTray> {
     ksni::menu::StandardItem {
         label: label.into(),
-        activate: Box::new(move |tray: &mut LinuxTray| {
-            let _ = tray.proxy.send_event(event.clone());
+        activate: Box::new(|tray: &mut LinuxTray| {
+            // Run on the tray thread — does not need the egui loop.
+            let sharing_on = crate::ipc_client::get_status()
+                .ok()
+                .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
+                .unwrap_or(true);
+            match crate::ipc_client::set_sharing_enabled(!sharing_on) {
+                Ok(_) => tray.bus.send(UiEvent::SharingToggled),
+                Err(e) => tracing::warn!("tray toggle sharing: {e:#}"),
+            }
+        }),
+        ..Default::default()
+    }
+    .into()
+}
+
+fn quit_item() -> ksni::MenuItem<LinuxTray> {
+    ksni::menu::StandardItem {
+        label: crate::locale::quit().into(),
+        activate: Box::new(|_tray: &mut LinuxTray| {
+            // Must not call blocking quit_core() on the dbus/tray thread — a hung
+            // IPC wait would swallow Quit. force_quit_now always ends the process.
+            crate::singleton::release();
+            crate::ipc_client::force_quit_now();
         }),
         ..Default::default()
     }

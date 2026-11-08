@@ -73,6 +73,24 @@ pub struct AppStatus {
     /// Six digits the keyboard host shows while a new computer is pairing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pairing_code: String,
+    /// Code shown on this computer's home page. A new one is chosen every 30 seconds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub home_code: String,
+    /// Previous home code, still accepted so a code that just changed can be typed.
+    #[serde(skip)]
+    pub home_code_prev: String,
+    /// Unix seconds when `home_code` would expire; `0` means no auto-rotation.
+    #[serde(default)]
+    pub home_code_until: u64,
+    /// Code this computer typed, kept off the status JSON so it is not logged.
+    #[serde(skip)]
+    pub offer_code: String,
+    /// Unix seconds until `offer_code` is forgotten.
+    #[serde(skip)]
+    pub offer_until: u64,
+    /// Bumps each time a code is typed, so discovery dials again at once.
+    #[serde(skip)]
+    pub offer_gen: u64,
     /// Unix seconds until which a new computer may start pairing. 0 means closed.
     #[serde(default)]
     pub pairing_open_until: u64,
@@ -196,6 +214,9 @@ pub struct PendingPeer {
     pub name: String,
     pub host_name: String,
     pub address: String,
+    /// The other computer already typed this computer's code. Click confirm.
+    #[serde(default)]
+    pub confirm_only: bool,
 }
 
 /// Filesystem path of the core's Unix socket.

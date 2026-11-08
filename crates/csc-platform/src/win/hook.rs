@@ -1,13 +1,14 @@
 //! Low-level mouse and keyboard hooks for the keyboard host.
 //!
-//! While grabbed, every physical mouse and key event is swallowed and queued,
-//! so it reaches only the remote computer. The cursor stays where the pointer
-//! crossed the screen edge. Motion is the raw device delta, not a warp.
+//! While grabbed, the pointer has left this computer. Mouse motion is held so
+//! the cursor stays on the edge it crossed. Buttons, wheels, and keys are
+//! queued for the other computer and are not delivered to the window under
+//! the parked cursor. When this computer is not grabbed, nothing is taken.
 //! Windows drops a hook whose callback is slow, so callbacks only queue.
 //!
 //! The same thread reads raw mouse input (movement before the cursor is held
-//! at the screen edge), notices the lock key, and, when asked, swallows Ctrl+V
-//! so a paste of files copied on another computer can start a transfer instead.
+//! at the screen edge), notices the lock key, and, when asked, counts Ctrl+V
+//! so a paste of files copied on another computer can start a transfer.
 
 use crate::keymap::hid_from_scan;
 use crate::lock::lock_key_down;
@@ -227,7 +228,7 @@ fn hook_thread(ready: std::sync::mpsc::Sender<bool>) {
     }
 }
 
-/// Start or stop swallowing input. `park` is the absolute screen point the
+/// Start or stop copying input to the other computer. `park` is the absolute screen point the
 /// cursor already occupies: the edge it crossed. The cursor is not moved to
 /// the center, and it is not clipped into a box (that trap is what leaves the
 /// hand stuck while the other computer shows it is controlled).
@@ -241,15 +242,17 @@ pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {
     }
     crate::keyrepeat::reset();
     GRAB.store(grab, Ordering::SeqCst);
-    if !grab {
-        // Release any clip a previous version left around the screen center.
-        unsafe {
-            let _ = ClipCursor(None);
-        }
-    }
-    // Drop stale motion only. A button already queued is a click, not noise.
     if let Ok(mut q) = QUEUE.lock() {
-        q.retain(|ev| !matches!(ev, Captured::Move { .. }));
+        if grab {
+            // Drop stale motion only. A button already queued is a click.
+            q.retain(|ev| !matches!(ev, Captured::Move { .. }));
+        } else {
+            // Buttons and keys were delivered here as they happened.
+            q.clear();
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+        }
     }
 }
 
@@ -279,8 +282,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         let injected = info.flags & LLMHF_INJECTED != 0;
         let msg = wparam.0 as u32;
-        // Our own cursor correction. Let it through, and do not treat it as a hand move.
-        if injected && msg == WM_MOUSEMOVE {
+        // Our own cursor correction or a replay after coming back. Let it
+        // through, and do not treat it as a hand move.
+        if injected {
             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
         let high = (info.mouseData >> 16) as u16;
@@ -343,12 +347,15 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             _ => None,
         };
+        let hold = msg == WM_MOUSEMOVE || ev.is_some();
         if let Some(ev) = ev {
             push(ev);
         }
-        // Driver-injected clicks (some mice) are forwarded above and swallowed
-        // here, so they are not delivered only to the window under the cursor.
-        return LRESULT(1);
+        // The pointer is on the other computer. Do not also click, scroll,
+        // or move the window under the parked cursor.
+        if hold {
+            return LRESULT(1);
+        }
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
@@ -365,6 +372,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     push(Captured::Key { hid, down });
                 }
             }
+            // A real key must not also type into the window on this computer.
             return LRESULT(1);
         }
     }
@@ -393,6 +401,8 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             if down {
                 PASTE_HITS.fetch_add(1, Ordering::AcqRel);
             }
+            // The core turns this into a file transfer. The window under the
+            // cursor must not also paste whatever is on the local clipboard.
             return LRESULT(1);
         }
     }

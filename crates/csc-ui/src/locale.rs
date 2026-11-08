@@ -22,8 +22,12 @@ pub fn apply(code: &str) {
     ENGLISH.store(english, Ordering::Relaxed);
 }
 
-fn english() -> bool {
+pub fn is_english() -> bool {
     ENGLISH.load(Ordering::Relaxed)
+}
+
+fn english() -> bool {
+    is_english()
 }
 
 pub fn settings() -> &'static str {
@@ -31,14 +35,6 @@ pub fn settings() -> &'static str {
         "Settings"
     } else {
         "设置"
-    }
-}
-
-pub fn paste() -> &'static str {
-    if english() {
-        "Paste files copied on the other computer"
-    } else {
-        "粘贴其他电脑复制的文件到这里"
     }
 }
 

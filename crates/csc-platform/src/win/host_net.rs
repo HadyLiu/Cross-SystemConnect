@@ -10,6 +10,63 @@ use windows::Win32::NetworkManagement::IpHelper::{
 use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 
+/// Interface index that owns `ip`, for pinning egress away from a TUN route.
+pub fn ipv4_if_index(ip: &str) -> Option<u32> {
+    let wanted = ip.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    unsafe {
+        let flags = GAA_FLAG_SKIP_ANYCAST
+            | GAA_FLAG_SKIP_MULTICAST
+            | GAA_FLAG_SKIP_DNS_SERVER
+            | GAA_FLAG_INCLUDE_ALL_INTERFACES;
+        let mut size = 16 * 1024u32;
+        for _ in 0..4 {
+            let mut buf = vec![0u8; size as usize];
+            let addrs = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+            let rc = GetAdaptersAddresses(AF_INET.0 as u32, flags, None, Some(addrs), &mut size);
+            if rc == 111 {
+                continue;
+            }
+            if rc != 0 {
+                return None;
+            }
+            let mut p = addrs;
+            while !p.is_null() {
+                let a = &*p;
+                let mut u = a.FirstUnicastAddress;
+                while !u.is_null() {
+                    let ua = &*u;
+                    if !ua.Address.lpSockaddr.is_null() {
+                        let sa = ua.Address.lpSockaddr;
+                        if (*sa).sa_family == AF_INET {
+                            let sin = &*(sa as *const SOCKADDR_IN);
+                            let raw = u32::from_be(sin.sin_addr.S_un.S_addr);
+                            let s = format!(
+                                "{}.{}.{}.{}",
+                                (raw >> 24) & 0xff,
+                                (raw >> 16) & 0xff,
+                                (raw >> 8) & 0xff,
+                                raw & 0xff
+                            );
+                            // IfIndex sits in the leading anonymous union of this struct.
+                            let index = a.Anonymous1.Anonymous.IfIndex;
+                            if s == wanted && index != 0 {
+                                return Some(index);
+                            }
+                        }
+                    }
+                    u = ua.Next;
+                }
+                p = a.Next;
+            }
+            return None;
+        }
+    }
+    None
+}
+
 pub fn fill_host_net(info: &mut HostNetInfo) {
     unsafe {
         let mut buf = [0u16; 256];

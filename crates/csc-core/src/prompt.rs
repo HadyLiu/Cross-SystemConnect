@@ -20,6 +20,7 @@ struct Pending {
     name: String,
     host_name: String,
     address: String,
+    confirm_only: bool,
     tx: oneshot::Sender<Choice>,
 }
 
@@ -35,6 +36,7 @@ impl PeerPrompt {
         name: &str,
         host_name: &str,
         address: &str,
+        confirm_only: bool,
     ) -> Choice {
         let (tx, rx) = oneshot::channel();
         {
@@ -44,6 +46,7 @@ impl PeerPrompt {
                 name: name.to_string(),
                 host_name: host_name.to_string(),
                 address: address.to_string(),
+                confirm_only,
                 tx,
             });
             if show {
@@ -99,5 +102,6 @@ fn head_peer(q: &VecDeque<Pending>) -> Option<PendingPeer> {
         name: p.name.clone(),
         host_name: p.host_name.clone(),
         address: p.address.clone(),
+        confirm_only: p.confirm_only,
     })
 }

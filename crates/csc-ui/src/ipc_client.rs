@@ -257,8 +257,17 @@ pub fn rescan() -> anyhow::Result<Value> {
     call("rescan", json!({}))
 }
 
+#[allow(dead_code)]
 pub fn open_pairing() -> anyhow::Result<Value> {
     call("open_pairing", json!({}))
+}
+
+pub fn roll_home_code() -> anyhow::Result<Value> {
+    call("roll_home_code", json!({}))
+}
+
+pub fn pair_offer(code: &str) -> anyhow::Result<Value> {
+    call("pair_offer", json!({"code": code}))
 }
 
 pub fn reset_data(keep_pairing: bool) -> anyhow::Result<Value> {
@@ -337,6 +346,21 @@ pub fn quit_core() -> anyhow::Result<()> {
         kill_core_by_lock(true);
     }
     Ok(())
+}
+
+/// Tray / taskbar Quit: never block on IPC. Notify core in the background, force-kill,
+/// then exit this process. Title-bar ✕ with `close_to_tray` must not call this.
+pub fn force_quit_now() -> ! {
+    QUITTING.store(true, Ordering::SeqCst);
+    let _ = std::thread::Builder::new()
+        .name("csc-quit-ipc".into())
+        .spawn(|| {
+            let _ = call_raw("quit", &json!({}));
+        });
+    // Brief window for the quit IPC to leave the socket before we die.
+    std::thread::sleep(Duration::from_millis(80));
+    kill_core_by_lock(true);
+    std::process::exit(0);
 }
 
 #[cfg(test)]

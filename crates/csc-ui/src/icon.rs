@@ -11,13 +11,13 @@ pub enum GreenDot {
     On,
 }
 
+#[allow(dead_code)]
 pub fn app_png_bytes() -> &'static [u8] {
     ICON_PNG
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn app_tray_icon(dot: GreenDot) -> tray_icon::Icon {
-    /// Preferred tray size on Windows (sharp at 100%/125% DPI).
     const TRAY_SIZE: u32 = 32;
     match tray_rgba(TRAY_SIZE, dot) {
         Ok((rgba, w, h)) => {
@@ -27,9 +27,31 @@ pub fn app_tray_icon(dot: GreenDot) -> tray_icon::Icon {
     }
 }
 
-pub fn app_window_icon() -> Option<tao::window::Icon> {
+pub fn egui_icon_data() -> Option<eframe::egui::IconData> {
     let (rgba, w, h) = load_rgba(256).ok()?;
-    tao::window::Icon::from_rgba(rgba, w, h).ok()
+    Some(eframe::egui::IconData {
+        rgba,
+        width: w,
+        height: h,
+    })
+}
+
+/// Load `resources/app.png` as an egui color image (for sidebar / about logo).
+pub fn color_image(size: u32) -> Option<eframe::egui::ColorImage> {
+    let (rgba, w, h) = load_rgba(size).ok()?;
+    Some(eframe::egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &rgba,
+    ))
+}
+
+/// Texture for in-app logo; call once from App::new.
+pub fn load_logo_texture(
+    ctx: &eframe::egui::Context,
+    size: u32,
+) -> Option<eframe::egui::TextureHandle> {
+    let image = color_image(size)?;
+    Some(ctx.load_texture("csc_app_logo", image, eframe::egui::TextureOptions::LINEAR))
 }
 
 pub(crate) fn load_rgba(size: u32) -> Result<(Vec<u8>, u32, u32), ()> {
@@ -54,7 +76,6 @@ fn paint_green_dot(rgba: &mut image::RgbaImage) {
     if w < 8 || h < 8 {
         return;
     }
-    // ~22% of the edge, inset 1 px so the panel does not clip it.
     let r = ((w.min(h) as f32) * 0.22).round().max(3.0) as i32;
     let cx = w as i32 - r - 1;
     let cy = h as i32 - r - 1;
@@ -72,7 +93,6 @@ fn paint_green_dot(rgba: &mut image::RgbaImage) {
                 continue;
             }
             let px = rgba.get_pixel_mut(x as u32, y as u32);
-            // Soft white rim so the green reads on light and dark panels.
             if d2 > rim2 {
                 px.0 = [0xff, 0xff, 0xff, 0xff];
             } else {

@@ -2,7 +2,7 @@
 
 一套键盘鼠标控制多台 Windows / Linux 电脑，并在电脑之间同步剪贴板、用复制粘贴互传文件。所有操作在后台自动完成，不需要在软件里点「发送」或「接收」。
 
-> 当前文档对应 **v0.2.2**，协议版本 2，与 v1.x 不互通。变更见 [CHANGELOG](CHANGELOG.md)。
+> 当前文档对应 **v0.2.3**，协议版本 2，与 v1.x 不互通。变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 特性
 
@@ -25,7 +25,7 @@
 
 | 平台 | 状态 |
 |---|---|
-| Windows 10/11 x86_64 | 支持（设置窗需 WebView2 Runtime） |
+| Windows 10/11 x86_64 | 支持（原生 egui 设置窗，无需 WebView2） |
 | Linux GNOME Wayland 会话 x86_64（Ubuntu 24.04 LTS / 26.04 LTS 默认会话） | 支持（GNOME 46+；首次需允许系统“远程交互/输入捕获”授权，并启用随包的 GNOME Shell 扩展） |
 | Linux X11 会话 x86_64（Deepin/UOS、Ubuntu 24.04 的“Ubuntu on Xorg”等） | 支持（需 `libx11-6`、`libxtst6`、`libxi6`、`libxfixes3`） |
 | KDE Plasma 6 Wayland | 尽力支持，未验证（TBD，计划 M6） |
@@ -90,7 +90,7 @@ Cross-SystemConnect/
 │   ├── csc-config/            # 配置读写与迁移
 │   ├── csc-platform/          # 平台 trait 与 Windows / X11 / Wayland(GNOME) 实现
 │   ├── csc-core/              # 二进制：内核 Cross-SystemConnect-core
-│   └── csc-ui/                # 二进制：托盘 + WebView Cross-SystemConnect
+│   └── csc-ui/                # 二进制：托盘 + egui Cross-SystemConnect
 │       └── ui/                # Clash 风格 HTML/CSS/JS
 └── resources/                 # 图标、i18n/zh-CN.json、i18n/en-US.json 等
 ```
@@ -102,7 +102,8 @@ Cross-SystemConnect/
 | 文档 | 内容 |
 |---|---|
 | [PRD.md](PRD.md) | 背景、目标用户、功能需求 F1–F34（含 F32 Wayland、F33 共享控制、F34 指针一致性）、非功能指标、平台范围、里程碑、固有限制 |
-| [界面设计.md](界面设计.md) | 信息架构、各窗口线框图与控件映射（含配对窗、托盘绿点、Wayland 授权）、状态设计、视觉规范、交互、多语言与无障碍、前端架构与 WebView 加固、界面测试 T-UI-01～40（T-UI-24/25 已取消） |
+| [设置与控件.md](设置与控件.md) | 当前实现：各页控件、配置字段与 IPC（不含视觉设计） |
+| [界面设计.md](界面设计.md) | 信息架构、线框与功能编号、托盘绿点、状态/视觉/交互、多语言、界面测试 T-UI-01～40（T-UI-24/25 已取消） |
 | [架构设计.md](架构设计.md) | 进程/模块、数据流、平台实现（Windows / X11 / GNOME Wayland）、配置与 IPC（含推送 JSON 结构）、威胁模型、完整通信协议、Wayland 设计（§13）、安全加固（§14） |
 | [测试用例.md](测试用例.md) | 按模块编号的单元/集成/真机用例，有效约 205 条（含 T-SEC、T-UX、T-WL；跨屏拖拽相关已取消） |
 | [构建发布流程.md](构建发布流程.md) | 工具链、交叉编译、签名、打包、CI、版本号、发布清单 |
@@ -111,7 +112,7 @@ Cross-SystemConnect/
 
 ## 参考
 
-Deskflow、Input Leap、LAN Mouse（同类项目）；Tokio、rustls、serde；tao / wry / tray-icon；Windows `SetWindowsHookEx`、`SendInput`；X11 XInput2、XTest、XFixes、XDND；xdg-desktop-portal（InputCapture、RemoteDesktop、Clipboard）、libei。
+Deskflow、Input Leap、LAN Mouse（同类项目）；Tokio、rustls、serde；eframe / egui / tray-icon / ksni；Windows `SetWindowsHookEx`、`SendInput`；X11 XInput2、XTest、XFixes、XDND；xdg-desktop-portal（InputCapture、RemoteDesktop、Clipboard）、libei。
 
 ## 许可证
 

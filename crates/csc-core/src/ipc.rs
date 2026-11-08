@@ -450,6 +450,39 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             info!("rescan requested from UI");
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
+        "roll_home_code" => {
+            let mut s = state.status.write().await;
+            crate::rotate_home(&mut s);
+            let until = s.home_code_until;
+            drop(s);
+            info!("home pairing code changed");
+            IpcResponse::ok(req.id, json!({"ok": true, "until": until}))
+        }
+        "pair_offer" => {
+            let code: String = req
+                .params
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if code.len() != 6 {
+                return IpcResponse::err(req.id, "code must be six digits");
+            }
+            let until = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_add(120);
+            let mut s = state.status.write().await;
+            s.offer_code = code;
+            s.offer_until = until;
+            s.offer_gen = s.offer_gen.wrapping_add(1);
+            drop(s);
+            info!("pairing code entered; connecting");
+            IpcResponse::ok(req.id, json!({"ok": true}))
+        }
         "open_pairing" => {
             let until = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

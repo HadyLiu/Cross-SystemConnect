@@ -237,6 +237,20 @@ impl PeerTable {
         names
     }
 
+    /// Sessions whose HELLO has arrived. Before that a link may still be pairing.
+    async fn greeted_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .txs
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, l)| l.info.lock().is_ok_and(|i| !i.host_name.is_empty()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     async fn info(&self, name: &str) -> Option<PeerInfo> {
         let link = Self::find(&*self.txs.lock().await, name)?;
         let info = link.info.lock().map(|i| i.clone()).unwrap_or_default();
@@ -246,7 +260,6 @@ impl PeerTable {
 
 #[derive(Clone)]
 pub struct NetHub {
-    pub status: Arc<RwLock<NetStatus>>,
     peers: PeerTable,
 }
 
@@ -262,6 +275,10 @@ impl NetHub {
 
     pub async fn peer_names(&self) -> Vec<String> {
         self.peers.names().await
+    }
+
+    pub async fn greeted_names(&self) -> Vec<String> {
+        self.peers.greeted_names().await
     }
 
     pub async fn send_raw(&self, frame: Vec<u8>) {
@@ -416,7 +433,7 @@ pub async fn spawn_network(
         }
     });
 
-    Ok(NetHub { status, peers })
+    Ok(NetHub { peers })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,7 +530,7 @@ async fn run_server(
     config_path: &Path,
     identity: &Arc<crate::tls::Identity>,
     app_status: &Arc<RwLock<AppStatus>>,
-    _prompt: &Arc<PeerPrompt>,
+    prompt: &Arc<PeerPrompt>,
     local_host: &str,
     local_ips: &[String],
     status: &Arc<RwLock<NetStatus>>,
@@ -523,6 +540,7 @@ async fn run_server(
     let port = cfg.control_port;
     let discover = udp_port(cfg);
     let bind = effective_bind(cfg);
+    remember_lan_bind(parse_bind(&bind, port));
     let udp = bind_udp(parse_bind(&bind, discover)).await?;
     spawn_data_listener(identity, parse_bind(&bind, cfg.data_port), cfg.data_port).await;
     let listener = match TcpListener::bind(parse_bind(&bind, port)).await {
@@ -583,6 +601,7 @@ async fn run_server(
                         inbound.clone(),
                         status.clone(),
                         app_status.clone(),
+                        prompt.clone(),
                         inflight.clone(),
                         stop_rx.clone(),
                         key,
@@ -619,6 +638,7 @@ async fn run_server(
                         inbound.clone(),
                         status.clone(),
                         app_status.clone(),
+                        prompt.clone(),
                         inflight.clone(),
                         stop_rx.clone(),
                         key,
@@ -637,7 +657,10 @@ async fn run_server(
                     continue;
                 };
                 let src_ip = src.ip().to_string();
-                if is_own_announce(&ann.host_name, local_host, &src_ip, local_ips) {
+                if is_own_announce(&ann.host_name, local_host, &src_ip, local_ips)
+                    || is_own_announce(&ann.name, &cfg.name, &src_ip, local_ips)
+                    || is_own_announce(&ann.host_name, &cfg.name, &src_ip, local_ips)
+                {
                     continue;
                 }
                 if !cfg.search_address.is_empty() && !same_subnet24(&src_ip, &cfg.search_address) {
@@ -660,6 +683,15 @@ async fn run_server(
                 // A direct reply passes firewalls that drop unsolicited datagrams,
                 // so the client dials back now instead of after its own refresh.
                 let _ = udp.send_to(&search_unlinked, src).await;
+                let eager = offer_ready(app_status).await;
+                let known = {
+                    let saved = live.read().await;
+                    saved.is_trusted_peer(&display) || saved.peer_fingerprint(&display).is_some()
+                };
+                // No code yet: try once, then back off. A typed code dials immediately.
+                if !eager && !known && !redial.due(&key, Instant::now()) {
+                    continue;
+                }
                 if inflight.lock().await.contains(&key) {
                     continue;
                 }
@@ -675,6 +707,7 @@ async fn run_server(
                     inbound.clone(),
                     status.clone(),
                     app_status.clone(),
+                    prompt.clone(),
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
@@ -718,6 +751,7 @@ async fn run_server(
                     inbound.clone(),
                     status.clone(),
                     app_status.clone(),
+                    prompt.clone(),
                     inflight.clone(),
                     stop_rx.clone(),
                     key,
@@ -750,6 +784,7 @@ fn spawn_server_link(
     inbound: Wires,
     status: Arc<RwLock<NetStatus>>,
     app_status: Arc<RwLock<AppStatus>>,
+    prompt: Arc<PeerPrompt>,
     inflight: Arc<Mutex<HashSet<String>>>,
     mut stop: watch::Receiver<bool>,
     key: String,
@@ -795,6 +830,7 @@ fn spawn_server_link(
                         peer_cert,
                         &status,
                         &app_status,
+                        &prompt,
                         key.clone(),
                         rx,
                         inbound,
@@ -843,6 +879,7 @@ async fn run_client(
     let port = cfg.control_port;
     let discover = udp_port(cfg);
     let bind = effective_bind(cfg);
+    remember_lan_bind(parse_bind(&bind, port));
     spawn_data_listener(identity, parse_bind(&bind, cfg.data_port), cfg.data_port).await;
     let listener = TcpListener::bind(parse_bind(&bind, port)).await?;
     let udp = match bind_udp(parse_bind(&bind, discover)).await {
@@ -901,9 +938,12 @@ async fn run_client(
                     dial_client_manual(&ctx, &dialing).await;
                 }
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &announce, &targets).await)?;
+                let eager = offer_ready(&ctx.app_status).await;
                 let due: Vec<(String, SocketAddr)> = host_wait
                     .iter()
-                    .filter(|(_, (at, _))| at.elapsed() >= Duration::from_secs(1))
+                    .filter(|(_, (at, _))| {
+                        eager || at.elapsed() >= Duration::from_secs(1)
+                    })
                     .map(|(key, (_, addr))| (key.clone(), *addr))
                     .collect();
                 for (key, addr) in due {
@@ -924,11 +964,15 @@ async fn run_client(
                 let Some((n, src)) = udp_datagram(res)? else {
                     continue;
                 };
-                if !cfg.search_address.is_empty() {
-                    let src_ip = src.ip().to_string();
-                    if !same_subnet24(&src_ip, &cfg.search_address) && src_ip != "255.255.255.255" {
-                        continue;
-                    }
+                let src_ip = src.ip().to_string();
+                if is_own_announce("", local_host, &src_ip, local_ips) {
+                    continue;
+                }
+                if !cfg.search_address.is_empty()
+                    && !same_subnet24(&src_ip, &cfg.search_address)
+                    && src_ip != "255.255.255.255"
+                {
+                    continue;
                 }
                 let datagram = decode_datagram(&buf[..n]);
                 if let Some(Datagram::Search(probe)) = datagram {
@@ -1070,6 +1114,7 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
             peer_cert,
             &ctx.status,
             &ctx.app_status,
+            &ctx.prompt,
             key.clone(),
             rx,
             ctx.inbound.clone(),
@@ -1227,6 +1272,30 @@ fn parse_bind(bind: &str, port: u16) -> SocketAddr {
     }
 }
 
+static LAN_BIND: std::sync::Mutex<Option<std::net::Ipv4Addr>> = std::sync::Mutex::new(None);
+
+fn remember_lan_bind(addr: SocketAddr) {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    };
+    if let Ok(mut slot) = LAN_BIND.lock() {
+        *slot = ip;
+    }
+}
+
+fn pin_udp(sock: &UdpSocket, addr: SocketAddr) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        csc_platform::pin_ipv4_egress(sock.as_raw_socket(), addr);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (sock, addr);
+    }
+}
+
 async fn bind_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr).await?;
     sock.set_broadcast(true)?;
@@ -1237,6 +1306,7 @@ async fn bind_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
         use std::os::windows::io::AsRawSocket;
         csc_platform::tune_udp_socket(sock.as_raw_socket());
     }
+    pin_udp(&sock, addr);
     Ok(sock)
 }
 
@@ -1275,9 +1345,22 @@ async fn send_to_targets(sock: &UdpSocket, packet: &[u8], targets: &[SocketAddr]
 }
 
 async fn connect_peer(addr: SocketAddr) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(addr))
+    let local = LAN_BIND.lock().ok().and_then(|g| *g);
+    let stream = if cfg!(windows) && local.is_some() {
+        let std_stream = tokio::task::spawn_blocking(move || {
+            csc_platform::connect_tcp_from(local, addr, Duration::from_secs(4))
+        })
         .await
-        .map_err(|_| anyhow::anyhow!("connect {addr} timed out"))??;
+        .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))??;
+        // Tokio needs a non-blocking socket. A blocking one stalls the reader
+        // and starves the writer, so HELLO and heartbeats never go out.
+        std_stream.set_nonblocking(true)?;
+        TcpStream::from_std(std_stream)?
+    } else {
+        tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect {addr} timed out"))??
+    };
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -1360,6 +1443,7 @@ async fn session<S>(
     peer_cert: Vec<u8>,
     status: &Arc<RwLock<NetStatus>>,
     app_status: &Arc<RwLock<AppStatus>>,
+    prompt: &Arc<PeerPrompt>,
     peer: String,
     mut outbound: LinkRx,
     mut inbound: Wires,
@@ -1414,8 +1498,9 @@ where
     // The keyboard host speaks first. The controlled computer answers only after trust,
     // so a cancelled prompt never pins a certificate on the host.
     if admit.is_none() {
-        let mut w = writer.lock().await;
-        w.write_all(&encode_hello_bin(&hello)).await?;
+        // Flush. A TLS write left in the buffer is invisible to the other side,
+        // and both then wait until this 10s hello limit and drop the link.
+        write_locked(&writer, &encode_hello_bin(&hello)).await?;
     }
 
     let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -1460,86 +1545,54 @@ where
             saved.certificate_trusted(&name, &peer_fp)
                 || saved.certificate_trusted(&remote.host_name, &peer_fp)
         };
-        let expect = if trusted {
-            None
+        if trusted {
+            match allow_control(&admit, &remote, &peer_fp, None).await {
+                Gate::Ok => {}
+                Gate::Rejected | Gate::Mismatch => return Ok(()),
+            }
         } else if !pairing_window_open(app_status).await {
             warn!("pairing window is closed on this computer");
             return Ok(());
         } else {
-            match client_sas(
+            let who = if remote.host_name.is_empty() {
+                name.clone()
+            } else {
+                remote.host_name.clone()
+            };
+            match client_pair(
                 &mut reader,
                 &writer,
                 &mut buf,
+                app_status,
+                prompt,
+                &cfg.name,
+                &cfg.device_id,
                 &remote.device_id,
+                &who,
+                &admit.address,
                 &data_token,
             )
             .await
             {
-                Ok(code) => Some(code),
+                Ok(()) => {
+                    let mut saved = admit.live.write().await;
+                    saved.remember_peer(&name, &peer_fp);
+                    if let Err(e) = saved.save(&admit.config_path) {
+                        warn!("save trusted peer: {e:#}");
+                    }
+                }
                 Err(e) => {
-                    info!("pairing with {} failed: {e:#}", admit.address);
+                    let text = format!("{e:#}");
+                    if text.contains("no_pair_code") {
+                        debug!("pairing with {} is waiting for a code", admit.address);
+                    } else {
+                        info!("pairing with {} failed: {text}", admit.address);
+                    }
                     return Ok(());
                 }
             }
-        };
-        let mut decision = std::pin::pin!(allow_control(&admit, &remote, &peer_fp, expect.clone()));
-        let mut discard = [0u8; 4096];
-        let mut waiting = tokio::time::interval(HELLO_KEEPALIVE);
-        loop {
-            while try_decode_frame(&mut buf)?.is_some() {}
-            tokio::select! {
-                allowed = &mut decision => {
-                    match allowed {
-                        Gate::Ok => {
-                            if expect.is_some() {
-                                let confirm = csc_proto::PairConfirmPayload { accepted: true };
-                                if let Ok(frame) = encode_json_frame(MsgType::PairConfirm, &confirm) {
-                                    let mut w = writer.lock().await;
-                                    w.write_all(&frame).await?;
-                                }
-                            }
-                            break;
-                        }
-                        Gate::Mismatch => {
-                            let result = csc_proto::PairResultPayload {
-                                status: "pair_code_mismatch".into(),
-                            };
-                            if let Ok(frame) = encode_json_frame(MsgType::PairResult, &result) {
-                                let mut w = writer.lock().await;
-                                let _ = w.write_all(&frame).await;
-                            }
-                            return Ok(());
-                        }
-                        Gate::Rejected => {
-                            let result = csc_proto::PairResultPayload {
-                                status: "rejected".into(),
-                            };
-                            if let Ok(frame) = encode_json_frame(MsgType::PairResult, &result) {
-                                let mut w = writer.lock().await;
-                                let _ = w.write_all(&frame).await;
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                _ = waiting.tick() => {
-                    let mut w = writer.lock().await;
-                    w.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await?;
-                }
-                read = reader.read(&mut discard) => {
-                    let n = read?;
-                    if n == 0 {
-                        info!("keyboard host {} closed while waiting", admit.address);
-                        return Ok(());
-                    }
-                    buf.extend_from_slice(&discard[..n]);
-                }
-            }
         }
-        {
-            let mut w = writer.lock().await;
-            w.write_all(&encode_hello_bin(&hello)).await?;
-        }
+        write_locked(&writer, &encode_hello_bin(&hello)).await?;
         remember(&announced);
         let _ = inbound.events.send(InboundEvent::Hello(announced)).await;
     } else {
@@ -1552,12 +1605,26 @@ where
             app_status,
             &cfg.device_id,
             &data_token,
+            prompt,
+            &peer,
         )
         .await
         {
             Ok(found) => found,
             Err(e) => {
-                info!("client {peer} did not accept control: {e:#}");
+                let text = format!("{e:#}");
+                if text.contains("no_pair_code") {
+                    let note = format!(
+                        "{peer} 还没有信任本机。请在下方「添加对方配对码」输入 {peer} 首页上的六位配对码。"
+                    );
+                    let mut s = app_status.write().await;
+                    if s.peer_note != note {
+                        info!("client {peer} does not trust this host; enter its pairing code");
+                        s.peer_note = note;
+                    }
+                } else {
+                    info!("client {peer} did not accept control: {text}");
+                }
                 return Ok(());
             }
         };
@@ -1625,7 +1692,7 @@ where
             tick.tick().await;
             let frame = encode_frame(MsgType::Heartbeat, &[], 0);
             let mut w = hb_writer.lock().await;
-            if w.write_all(&frame).await.is_err() {
+            if w.write_all(&frame).await.is_err() || w.flush().await.is_err() {
                 break;
             }
         }
@@ -1674,6 +1741,14 @@ where
             frame = outbound.rx.recv() => {
                 match frame {
                     Some(frame) => {
+                        let frame = if rides_data(&frame) && !bulk_on_control {
+                            match send_on_data(&peer_fp, frame) {
+                                Ok(()) => continue,
+                                Err(frame) => frame,
+                            }
+                        } else {
+                            frame
+                        };
                         let mut w = writer.lock().await;
                         if w.write_all(&frame).await.is_err() {
                             break;
@@ -1805,12 +1880,16 @@ fn udp_port(cfg: &Config) -> u16 {
 }
 
 async fn pairing_window_open(app_status: &Arc<RwLock<AppStatus>>) -> bool {
-    let until = app_status.read().await.pairing_open_until;
+    let s = app_status.read().await;
+    // 0 = always open (stable home pairing code). Non-zero is a timed window.
+    if s.pairing_open_until == 0 {
+        return !s.home_code.is_empty();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    until > now
+    s.pairing_open_until > now
 }
 
 fn random_nonce() -> [u8; 32] {
@@ -1825,6 +1904,7 @@ where
 {
     let mut w = writer.lock().await;
     w.write_all(frame).await?;
+    w.flush().await?;
     Ok(())
 }
 
@@ -1866,22 +1946,91 @@ where
     }
 }
 
-async fn client_sas<R, W>(
+async fn offer_ready(status: &Arc<RwLock<AppStatus>>) -> bool {
+    let s = status.read().await;
+    s.offer_until > unix_now() && s.offer_code.len() == 6
+}
+
+async fn current_offer(status: &Arc<RwLock<AppStatus>>) -> String {
+    if offer_ready(status).await {
+        status.read().await.offer_code.clone()
+    } else {
+        String::new()
+    }
+}
+
+async fn clear_offer(status: &Arc<RwLock<AppStatus>>) {
+    let mut s = status.write().await;
+    s.offer_code.clear();
+    s.offer_until = 0;
+}
+
+async fn home_hit(status: &Arc<RwLock<AppStatus>>, typed: &str) -> bool {
+    let s = status.read().await;
+    let hit = |shown: &str| shown.len() == 6 && code_matches(typed, shown);
+    hit(&s.home_code) || hit(&s.home_code_prev)
+}
+
+/// Keep the socket moving while the user clicks confirm.
+async fn wait_choice<R, W>(
     reader: &mut R,
     writer: &Mutex<W>,
     buf: &mut BytesMut,
-    host_device_id: &str,
-    exporter: &[u8; 32],
-) -> anyhow::Result<String>
+    choice: impl std::future::Future<Output = Choice>,
+) -> anyhow::Result<Choice>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut choice = std::pin::pin!(choice);
+    let mut discard = [0u8; 4096];
+    let mut waiting = tokio::time::interval(HELLO_KEEPALIVE);
+    loop {
+        while try_decode_frame(buf)?.is_some() {}
+        tokio::select! {
+            biased;
+            picked = &mut choice => return Ok(picked),
+            _ = waiting.tick() => {
+                let mut w = writer.lock().await;
+                w.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await?;
+            }
+            read = reader.read(&mut discard) => {
+                let n = read?;
+                if n == 0 {
+                    anyhow::bail!("closed during pairing");
+                }
+                buf.extend_from_slice(&discard[..n]);
+            }
+        }
+    }
+}
+
+/// Send the code this computer typed. The computer that owns the code must click confirm.
+#[allow(clippy::too_many_arguments)]
+async fn client_pair<R, W>(
+    reader: &mut R,
+    writer: &Mutex<W>,
+    buf: &mut BytesMut,
+    app_status: &Arc<RwLock<AppStatus>>,
+    prompt: &PeerPrompt,
+    local_name: &str,
+    local_device: &str,
+    host_device_id: &str,
+    host_name: &str,
+    address: &str,
+    exporter: &[u8; 32],
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let offer = current_offer(app_status).await;
     let req = csc_proto::PairRequestPayload {
-        device_id: String::new(),
-        name: String::new(),
+        device_id: local_device.to_string(),
+        name: local_name.to_string(),
         role: "client".into(),
         protocol_version: 2,
+        code: offer.clone(),
     };
     write_locked(writer, &encode_json_frame(MsgType::PairRequest, &req)?).await?;
     let commit_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairCommit).await?;
@@ -1898,10 +2047,69 @@ where
     if !csc_proto::pair_commit_matches(&got, &na, host_device_id) {
         anyhow::bail!("bad_commit");
     }
-    let code = csc_proto::pair_code(exporter, &na, &nb);
-    Ok(format!("{code:06}"))
+    let _sas = csc_proto::pair_code(exporter, &na, &nb);
+    let confirm = if home_hit(app_status, &commit.code).await {
+        let choice = wait_choice(
+            reader,
+            writer,
+            buf,
+            prompt.ask(app_status, host_name, host_name, address, true),
+        )
+        .await?;
+        let accepted = matches!(choice, Choice::Trust { .. });
+        csc_proto::PairConfirmPayload {
+            accepted,
+            code: if accepted {
+                String::new()
+            } else {
+                "cancel".into()
+            },
+        }
+    } else {
+        let code = if offer.len() == 6 {
+            offer
+        } else {
+            tokio::time::timeout(Duration::from_millis(1500), async {
+                loop {
+                    let ready = current_offer(app_status).await;
+                    if ready.len() == 6 {
+                        return ready;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if code.len() != 6 {
+            let deny = csc_proto::PairConfirmPayload {
+                accepted: false,
+                code: String::new(),
+            };
+            write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
+            anyhow::bail!("no_pair_code");
+        }
+        csc_proto::PairConfirmPayload {
+            accepted: true,
+            code,
+        }
+    };
+    write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &confirm)?).await?;
+    if !confirm.accepted {
+        anyhow::bail!("pairing cancelled");
+    }
+    let answer = read_typed(reader, buf, Duration::from_secs(120), MsgType::PairResult).await?;
+    let result: csc_proto::PairResultPayload = serde_json::from_slice(&answer.payload)?;
+    if result.status != "ok" {
+        clear_offer(app_status).await;
+        app_status.write().await.peer_note = "对方没有确认这次配对".into();
+        anyhow::bail!("pairing rejected");
+    }
+    clear_offer(app_status).await;
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn host_wait_hello<R, W>(
     reader: &mut R,
     writer: &Mutex<W>,
@@ -1909,6 +2117,8 @@ async fn host_wait_hello<R, W>(
     app_status: &Arc<RwLock<AppStatus>>,
     device_id: &str,
     exporter: &[u8; 32],
+    prompt: &PeerPrompt,
+    peer_label: &str,
 ) -> anyhow::Result<(HelloPayload, Vec<csc_proto::Frame>)>
 where
     R: AsyncRead + Unpin,
@@ -1917,9 +2127,6 @@ where
     let mut early = Vec::new();
     let mut tmp = [0u8; 4096];
     let mut last = tokio::time::Instant::now();
-    // Code this attempt put on screen. Another attempt (a second address, a
-    // redial) may show its own code meanwhile; only clear ours.
-    let mut shown = String::new();
     let result = async {
         loop {
             if let Some(frame) = try_decode_frame(buf)? {
@@ -1936,9 +2143,19 @@ where
                             .await?;
                         anyhow::bail!("pairing window closed");
                     }
+                    let ask: csc_proto::PairRequestPayload = serde_json::from_slice(&frame.payload)
+                        .unwrap_or(csc_proto::PairRequestPayload {
+                            device_id: String::new(),
+                            name: String::new(),
+                            role: "client".into(),
+                            protocol_version: 2,
+                            code: String::new(),
+                        });
+                    let offer = current_offer(app_status).await;
                     let na = random_nonce();
                     let commit = csc_proto::PairCommitPayload {
                         commit: hex_encode(&csc_proto::pair_commit(&na, device_id)),
+                        code: offer.clone(),
                     };
                     write_locked(writer, &encode_json_frame(MsgType::PairCommit, &commit)?).await?;
                     let nb_frame = read_typed(reader, buf, HELLO_IDLE, MsgType::PairNonce).await?;
@@ -1949,20 +2166,64 @@ where
                         nonce: hex_encode(&na),
                     };
                     write_locked(writer, &encode_json_frame(MsgType::PairNonce, &reveal)?).await?;
-                    let code = csc_proto::pair_code(exporter, &na, &nb);
-                    shown = format!("{code:06}");
-                    app_status.write().await.pairing_code = shown.clone();
-                    info!("pairing code {code:06}");
+                    let _sas = csc_proto::pair_code(exporter, &na, &nb);
                     let confirm =
                         read_typed(reader, buf, Duration::from_secs(120), MsgType::PairConfirm)
                             .await?;
                     let ok: csc_proto::PairConfirmPayload =
                         serde_json::from_slice(&confirm.payload)?;
-                    release_code(&mut app_status.write().await.pairing_code, &shown);
-                    shown.clear();
-                    if !ok.accepted {
-                        anyhow::bail!("pair_code_mismatch");
+                    if ok.code == "cancel" {
+                        clear_offer(app_status).await;
+                        app_status.write().await.peer_note = "对方取消了这次配对".into();
+                        let result = csc_proto::PairResultPayload {
+                            status: "rejected".into(),
+                        };
+                        write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?)
+                            .await?;
+                        anyhow::bail!("pairing cancelled");
                     }
+                    if !ok.accepted {
+                        anyhow::bail!("no_pair_code");
+                    }
+                    let typed_ours = home_hit(app_status, &ok.code).await
+                        || home_hit(app_status, &ask.code).await;
+                    let confirmed_ours =
+                        !offer.is_empty() && (ok.code.is_empty() || code_matches(&ok.code, &offer));
+                    let accept = if typed_ours {
+                        let who = if ask.name.is_empty() {
+                            peer_label.to_string()
+                        } else {
+                            ask.name.clone()
+                        };
+                        let choice = wait_choice(
+                            reader,
+                            writer,
+                            buf,
+                            prompt.ask(app_status, &who, &who, peer_label, true),
+                        )
+                        .await?;
+                        matches!(choice, Choice::Trust { .. })
+                    } else {
+                        confirmed_ours
+                    };
+                    let result = csc_proto::PairResultPayload {
+                        status: if accept {
+                            "ok".into()
+                        } else {
+                            "rejected".into()
+                        },
+                    };
+                    write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?).await?;
+                    if !accept {
+                        if typed_ours {
+                            app_status.write().await.peer_note = "已取消这次配对".into();
+                        } else {
+                            clear_offer(app_status).await;
+                            app_status.write().await.peer_note = "配对码不对".into();
+                        }
+                        anyhow::bail!("pairing rejected");
+                    }
+                    clear_offer(app_status).await;
                     last = tokio::time::Instant::now();
                     continue;
                 }
@@ -1992,11 +2253,11 @@ where
         }
     }
     .await;
-    release_code(&mut app_status.write().await.pairing_code, &shown);
     result
 }
 
 /// Clear the displayed pairing code only if it is still the one this attempt showed.
+#[cfg(test)]
 fn release_code(slot: &mut String, mine: &str) {
     if !mine.is_empty() && slot == mine {
         slot.clear();
@@ -2041,24 +2302,18 @@ async fn allow_control(
     loop {
         let choice = admit
             .prompt
-            .ask(&admit.app_status, &name, &name, &admit.address)
+            .ask(&admit.app_status, &name, &name, &admit.address, false)
             .await;
         match choice {
             Choice::Trust { code } => {
-                if let Some(expect) = expect_code.as_deref() {
-                    if !code_matches(&code, expect) {
-                        misses += 1;
-                        info!("pairing code from {name} did not match ({misses}/3)");
-                        if misses >= 3 {
-                            return Gate::Mismatch;
-                        }
-                        continue;
+                let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+                if expect_code.is_some() && digits.len() != 6 {
+                    misses += 1;
+                    info!("pairing code from {name} was not six digits ({misses}/3)");
+                    if misses >= 3 {
+                        return Gate::Mismatch;
                     }
-                }
-                let mut cfg = admit.live.write().await;
-                cfg.remember_peer(&name, fingerprint);
-                if let Err(e) = cfg.save(&admit.config_path) {
-                    warn!("save trusted peer: {e:#}");
+                    continue;
                 }
                 return Gate::Ok;
             }
@@ -2293,6 +2548,38 @@ impl DataReg {
             .insert(fingerprint.clone(), slot);
         DataReg(fingerprint)
     }
+}
+
+/// The control connection keeps input, switching, and session upkeep. Clipboard,
+/// paste, file, lock-screen and activity messages go on the data connection.
+fn rides_data(frame: &[u8]) -> bool {
+    let Some(kind) = frame.get(3).copied().and_then(MsgType::from_u8) else {
+        return false;
+    };
+    matches!(
+        kind,
+        MsgType::ClipOffer
+            | MsgType::ClipRequest
+            | MsgType::ClipData
+            | MsgType::PasteRequest
+            | MsgType::PasteLocated
+            | MsgType::ClipEnd
+            | MsgType::DragBegin
+            | MsgType::DragCancel
+            | MsgType::DragRetarget
+            | MsgType::FileRequest
+            | MsgType::FileData
+            | MsgType::FileEnd
+            | MsgType::FileCancel
+            | MsgType::FileError
+            | MsgType::FileOffer
+            | MsgType::FileBegin
+            | MsgType::FileDone
+            | MsgType::FileAck
+            | MsgType::FileBatch
+            | MsgType::LockScreen
+            | MsgType::Activity
+    )
 }
 
 /// Queue `frame` on the data connection. Gives it back when that connection is not up yet.
@@ -2619,6 +2906,42 @@ mod tests {
         let n = count_udp_failure(n, false).unwrap();
         assert_eq!(count_udp_failure(n, true).unwrap(), 0);
         assert!(count_udp_failure(n, false).is_err());
+    }
+
+    #[test]
+    fn only_input_and_session_frames_stay_on_control() {
+        let on_data = |t| rides_data(&encode_frame(t, b"{}", 0));
+        for t in [
+            MsgType::Hello,
+            MsgType::Heartbeat,
+            MsgType::PairRequest,
+            MsgType::SwitchEnter,
+            MsgType::SwitchLeave,
+            MsgType::EdgeHit,
+            MsgType::ScreenUpdate,
+            MsgType::MouseMove,
+            MsgType::MouseButton,
+            MsgType::MouseWheel,
+            MsgType::Key,
+            MsgType::InputReset,
+        ] {
+            assert!(!on_data(t), "{t:?} must stay on control");
+        }
+        for t in [
+            MsgType::ClipOffer,
+            MsgType::ClipRequest,
+            MsgType::ClipData,
+            MsgType::PasteRequest,
+            MsgType::PasteLocated,
+            MsgType::FileOffer,
+            MsgType::FileCancel,
+            MsgType::FileAck,
+            MsgType::LockScreen,
+            MsgType::Activity,
+        ] {
+            assert!(on_data(t), "{t:?} must go on data");
+        }
+        assert!(!rides_data(&[]));
     }
 
     #[tokio::test]

@@ -13,6 +13,11 @@ targets = [
 # 设为 none：不因无人维护的依赖失败（原意图为仅警告，cargo audit 仍会提示）。
 unmaintained = "none"
 yanked = "warn"
+# cargo deny keeps the RustSec checkout in a subdirectory of this path, named
+# from the database URL. check.sh points that subdirectory at the checkout
+# cargo audit already loaded, so deny does not clone the repository again.
+db-path = "$CARGO_HOME/advisory-dbs"
+git-fetch-with-cli = false
 
 [licenses]
 version = 2
@@ -32,6 +37,9 @@ allow = [
     # ksni（csc-ui 的 Linux 托盘依赖）使用 Unlicense（公共领域），与 Apache-2.0 兼容
     "Unlicense",
     "Zlib",
+    # epaint_default_fonts（egui 默认字体）
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.8
 

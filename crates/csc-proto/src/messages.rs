@@ -325,11 +325,18 @@ pub struct PairRequestPayload {
     pub role: String,
     #[serde(rename = "proto", default = "proto_floor")]
     pub protocol_version: u16,
+    /// Six digits this computer typed from the other screen. Empty when it did not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairConfirmPayload {
     pub accepted: bool,
+    /// Six digits typed from the other computer's home page.
+    /// `cancel` when this computer clicked cancel. Empty when it is only confirming.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +348,9 @@ pub struct PairResultPayload {
 pub struct PairCommitPayload {
     /// Hex SHA-256 of the commitment.
     pub commit: String,
+    /// Six digits the keyboard host typed. Empty when it did not type one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

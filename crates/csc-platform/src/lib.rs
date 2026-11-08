@@ -485,3 +485,50 @@ pub fn create_auto_start() -> Box<dyn AutoStart> {
 pub fn tune_udp_socket(raw: std::os::windows::io::RawSocket) {
     win::disable_udp_connreset(raw);
 }
+
+/// Force this bound IPv4 socket to send on the NIC that owns `local`.
+/// No effect for an unspecified address, or on systems other than Windows.
+pub fn pin_ipv4_egress(raw: RawSock, local: std::net::SocketAddr) {
+    #[cfg(windows)]
+    {
+        let std::net::IpAddr::V4(ip) = local.ip() else {
+            return;
+        };
+        if ip.is_unspecified() {
+            return;
+        }
+        if let Some(idx) = win::ipv4_if_index(&ip.to_string()) {
+            win::pin_ipv4_interface(raw, idx);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (raw, local);
+    }
+}
+
+/// TCP connect that leaves the real LAN NIC. `local` empty uses the default route.
+pub fn connect_tcp_from(
+    local: Option<std::net::Ipv4Addr>,
+    remote: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    #[cfg(windows)]
+    {
+        if let Some(ip) = local {
+            if !ip.is_unspecified() {
+                return win::connect_from(ip, remote, timeout);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = local;
+    }
+    std::net::TcpStream::connect_timeout(&remote, timeout)
+}
+
+#[cfg(windows)]
+type RawSock = std::os::windows::io::RawSocket;
+#[cfg(not(windows))]
+type RawSock = i32;

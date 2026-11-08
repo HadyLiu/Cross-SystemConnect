@@ -70,6 +70,7 @@ fn peer_size(
 /// position along it, and `m` the local monitor the pointer returns to.
 /// The pointer stays on that edge (one pixel in, so the crossing itself does not
 /// immediately switch back).
+#[cfg(test)]
 fn reentry_point(leave: csc_proto::Edge, pct: f32, m: csc_platform::Rect) -> (i32, i32) {
     let inset = 1;
     let pct = pct.clamp(0.0, 1.0);
@@ -165,10 +166,9 @@ fn x11_pointer() -> Option<(i32, i32)> {
     Some((ax - ox, ay - oy))
 }
 
-/// One pixel in from the edge that was just crossed, so the pointer stays
-/// where the hand crossed and a later outward push can leave again.
+/// Land on the edge that was just crossed.
 fn inset_from_edge(edge: csc_proto::Edge, x: &mut i32, y: &mut i32, m: &csc_platform::Rect) {
-    const N: i32 = 1;
+    const N: i32 = 0;
     match edge {
         csc_proto::Edge::Left | csc_proto::Edge::TopLeft | csc_proto::Edge::BottomLeft => {
             *x = (*x + N).min(m.right - 1);
@@ -203,13 +203,14 @@ fn local_lock_releases(state: &str) -> bool {
     matches!(state, "locked" | "secure_desktop")
 }
 
-/// A button or wheel the hook swallowed in the same batch as a screen change.
-/// Play it on this computer once the pointer is back here.
+/// A button, wheel, or key the hook swallowed in the same batch as a screen
+/// change. Play it on this computer once the pointer is back here.
 fn replay_swallowed(injector: &mut dyn csc_platform::InputInjector, step: Captured) {
     match step {
         Captured::Button { button, down } => injector.mouse_button(button, down),
         Captured::Wheel { v, h } => injector.mouse_wheel(v, h),
-        Captured::Move { .. } | Captured::Key { .. } => {}
+        Captured::Key { hid, down } => injector.key(hid, down),
+        Captured::Move { .. } => {}
     }
 }
 
@@ -225,6 +226,21 @@ fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
     if let Some((x, y)) = target {
         let (ox, oy) = csc_platform::virtual_origin();
         csc_platform::warp_cursor(ox + x, oy + y);
+    }
+}
+
+/// On the shared edge pixel, drop keys, buttons, and wheels. A release of a
+/// key or button the remote already has is kept, so it does not stay down.
+/// Ctrl+C and Ctrl+V work only after the pointer moves off this pixel.
+fn shared_pixel_drops(held: &HeldInput, step: &Captured) -> bool {
+    match step {
+        Captured::Move { .. } => false,
+        Captured::Key { hid, down: false } => !held.keys.contains(hid),
+        Captured::Button {
+            button,
+            down: false,
+        } => !held.buttons.contains(button),
+        _ => true,
     }
 }
 
@@ -370,6 +386,7 @@ struct Core {
     screen_info: Box<dyn csc_platform::ScreenInfo>,
     screen: csc_platform::ScreenSize,
     monitors: Vec<csc_platform::Rect>,
+    work_areas: Vec<csc_platform::Rect>,
     switch: SwitchController,
     hooked: bool,
     remote_x: i32,
@@ -414,6 +431,8 @@ struct Core {
     power_rx: std::sync::mpsc::Receiver<csc_platform::PowerEvent>,
     /// Computers that paused sharing, or are on a secure desktop.
     paused_peers: HashSet<String>,
+    /// Peers whose HELLO arrived in the current session, lower-cased.
+    greeted: HashSet<String>,
     sharing_announced: bool,
     remap: Vec<(u32, u32)>,
     sync_locks: bool,
@@ -666,7 +685,7 @@ impl Core {
                 cfg.switch_cfg.clone(),
                 ScreenLayout::load(&cfg.layout),
             );
-            self.switch.set_screen(self.screen, self.monitors.clone());
+            self.publish_screen();
             (self.return_hotkey, self.lock_hotkey) = hotkeys_of(&cfg);
             (self.stay_hotkey, self.pause_hotkey) = watch_local(&cfg);
             self.load_input_prefs(&cfg);
@@ -719,10 +738,13 @@ impl Core {
             self.poll_system().await;
         }
         {
-            let ns = self.net.status.read().await.clone();
+            let up = self.net.greeted_names().await;
+            for n in &up {
+                self.greeted.insert(n.to_lowercase());
+            }
             let mut s = self.status.write().await;
-            s.connected = ns.connected;
-            s.peer_name = ns.peer_name.clone();
+            s.connected = !up.is_empty();
+            s.peer_name = up.join(", ");
             self.switch.set_enabled(s.sharing_enabled);
             // Being controlled earlier (as a client) leaves the switch in Remote.
             // A keyboard host is only Remote while it holds the grab.
@@ -761,12 +783,19 @@ impl Core {
         }
     }
 
+    fn publish_screen(&mut self) {
+        self.switch.set_screen(self.screen, self.monitors.clone());
+        self.switch.set_work_areas(self.work_areas.clone());
+    }
+
     /// Screens, adapters and the link supervisor, every few seconds.
     async fn poll_system(&mut self) {
         if !self.grab {
             let now_screen = self.screen_info.virtual_size();
             let now_monitors = self.screen_info.monitors();
+            let now_work = self.screen_info.work_areas();
             if now_monitors != self.monitors
+                || now_work != self.work_areas
                 || now_screen.width != self.screen.width
                 || now_screen.height != self.screen.height
             {
@@ -776,7 +805,8 @@ impl Core {
                 );
                 self.screen = now_screen;
                 self.monitors = now_monitors;
-                self.switch.set_screen(self.screen, self.monitors.clone());
+                self.work_areas = now_work;
+                self.publish_screen();
             }
         }
         let Ok(host) = tokio::task::spawn_blocking(query_host_net_info).await else {
@@ -862,6 +892,12 @@ impl Core {
 
     /// One captured event while grabbed. True once input is back on this computer.
     async fn grab_input(&mut self, step: Captured) -> bool {
+        // The edge pixel belongs to both computers. Keys and buttons are
+        // dropped there; a release of a key already held inside still goes
+        // out, so it does not stick. Mouse movement is the only way off it.
+        if self.on_shared_pixel() && shared_pixel_drops(&self.held, &step) {
+            return false;
+        }
         if let Captured::Key { hid, down: true } = step {
             // Win+L must never reach the remote: GNOME treats Super+L as lock,
             // then further L presses land in the password field as "lll".
@@ -936,6 +972,16 @@ impl Core {
             return false;
         };
         self.leave_remote(leave).await
+    }
+
+    /// True while the remote pointer sits on a pixel shared with a neighbor.
+    fn on_shared_pixel(&self) -> bool {
+        if !self.grab {
+            return false;
+        }
+        let remote = peer_size(&self.peer_screens, self.switch.active_remote(), self.screen);
+        self.switch
+            .cursor_on_shared_pixel(self.remote_x, self.remote_y, remote)
     }
 
     /// Bring input back to this computer from the active remote, crossing no edge.
@@ -1041,10 +1087,7 @@ impl Core {
                     .await;
             }
             self.switch.confirm_returned();
-            let m = self
-                .switch
-                .monitor_at(self.enter_point.0, self.enter_point.1);
-            let back = reentry_point(leave.edge, leave.position_pct, m);
+            let back = self.switch.local_reentry(leave.edge, leave.position_pct);
             release_pointer(&mut self.grab, Some(back));
             self.grab_armed = false;
             self.set_active_screen(None).await;
@@ -1143,8 +1186,7 @@ impl Core {
         let reports = self.net.peer_caps(&dec.neighbor).await & CAP_EDGE_REPORT != 0;
         self.switch.set_remote_reports(reports);
         self.enter_point = (x, y);
-        let m = self.switch.monitor_at(x, y);
-        self.home_point = reentry_point(entry, dec.position_pct, m);
+        self.home_point = self.switch.local_reentry(entry, dec.position_pct);
         self.held = HeldInput::default();
         // Leave the cursor on the edge it just crossed. Warping it to the
         // monitor center is the stutter, and clipping that center traps the
@@ -1167,12 +1209,11 @@ impl Core {
         self.flush_pending_clip(&dec.neighbor).await;
         self.last_local_activity = Instant::now();
         info!(
-            "switch enter -> {} at {:?} {:.2} from ({x},{y}) on {:?}, pushed {} px{}",
+            "switch enter -> {} at {:?} {:.2} from ({x},{y}), return at {:?}{}",
             dec.neighbor,
             dec.edge,
             dec.position_pct,
-            m,
-            self.switch.edge_push_px(),
+            self.home_point,
             if reports {
                 "; remote reports its edges"
             } else {
@@ -1882,8 +1923,13 @@ impl Core {
         match ev {
             None => return false,
             Some(InboundEvent::Disconnected { peer }) => {
-                info!("session {peer} disconnected");
+                let was_up = self.greeted.remove(&peer.to_lowercase());
                 let mut s = self.status.write().await;
+                if was_up {
+                    info!("session {peer} disconnected");
+                } else {
+                    debug!("connection to {peer} closed before the handshake finished");
+                }
                 let active = self.grab
                     && (self.switch.active_remote().eq_ignore_ascii_case(&peer)
                         || s.active_screen.eq_ignore_ascii_case(&peer));
@@ -1923,7 +1969,7 @@ impl Core {
                 }
                 let sleeping = s.host_state == "host_sleeping";
                 drop(s);
-                if !sleeping {
+                if was_up && !sleeping {
                     notice::tell(
                         notice::Kind::Disconnect,
                         "Cross-SystemConnect",
@@ -1940,8 +1986,14 @@ impl Core {
                     "HELLO from {} ({}x{}, capabilities {:#x})",
                     h.host_name, h.screen_width, h.screen_height, h.capabilities
                 );
-                if self.status.read().await.role != "server" {
-                    self.status.write().await.host_state = "connected".into();
+                {
+                    let mut s = self.status.write().await;
+                    if s.role != "server" {
+                        s.host_state = "connected".into();
+                    }
+                    if s.peer_note.contains("还没有信任本机") {
+                        s.peer_note.clear();
+                    }
                 }
                 if !h.host_name.is_empty() {
                     notice::tell(
@@ -2041,12 +2093,9 @@ impl Core {
                 self.switch.confirm_returned();
                 if self.grab {
                     self.held.release_all(&self.net).await;
-                    let m = self
-                        .switch
-                        .monitor_at(self.enter_point.0, self.enter_point.1);
                     release_pointer(
                         &mut self.grab,
-                        Some(reentry_point(p.edge, p.position_pct, m)),
+                        Some(self.switch.local_reentry(p.edge, p.position_pct)),
                     );
                 }
                 self.grab_armed = false;
@@ -2187,6 +2236,7 @@ pub async fn run() -> anyhow::Result<()> {
     let screen_info = create_screen_info();
     let screen = screen_info.virtual_size();
     let monitors = screen_info.monitors();
+    let work_areas = screen_info.work_areas();
     info!(
         "screen {}x{}, monitors {:?}",
         screen.width, screen.height, monitors
@@ -2199,6 +2249,7 @@ pub async fn run() -> anyhow::Result<()> {
         ScreenLayout::load(&cfg.layout),
     );
     switch.set_screen(screen, monitors.clone());
+    switch.set_work_areas(work_areas.clone());
     let hooked = csc_platform::capture_start();
 
     let status = AppStatus {
@@ -2223,6 +2274,12 @@ pub async fn run() -> anyhow::Result<()> {
         },
         pending_peer: None,
         pairing_code: String::new(),
+        home_code: String::new(),
+        home_code_prev: String::new(),
+        home_code_until: 0,
+        offer_code: String::new(),
+        offer_until: 0,
+        offer_gen: 0,
         pairing_open_until: 0,
         peer_note: String::new(),
         host_state: "no_host".into(),
@@ -2286,13 +2343,25 @@ pub async fn run() -> anyhow::Result<()> {
         });
     {
         let mut cfg = config.write().await;
-        if cfg.search_address.is_empty() {
+        let known = host.nics.iter().any(|n| n.address == cfg.search_address);
+        // A saved Clash fake-ip is not a real NIC. Opening Clash must not
+        // leave the keyboard link bound to that adapter.
+        if !host.nics.is_empty() && (cfg.search_address.is_empty() || !known) {
             if let Some(nic) = host
                 .nics
                 .iter()
                 .find(|n| n.kind == "ethernet")
                 .or(host.nics.first())
             {
+                info!(
+                    "using {} for the keyboard link (was {})",
+                    nic.address,
+                    if cfg.search_address.is_empty() {
+                        "unset"
+                    } else {
+                        cfg.search_address.as_str()
+                    }
+                );
                 cfg.search_address = nic.address.clone();
                 if let Err(e) = cfg.save(&config_path) {
                     warn!("save default search address: {e:#}");
@@ -2328,6 +2397,13 @@ pub async fn run() -> anyhow::Result<()> {
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
     let clip = crate::clipboard::spawn(clip_tx);
     tokio::spawn(watch_memory(state.clone(), board.clone()));
+    {
+        let mut s = state.status.write().await;
+        // Stable until the user clicks「更换」; pairing stays open while the code exists.
+        s.home_code = fresh_home_code();
+        s.home_code_until = 0;
+        s.pairing_open_until = 0;
+    }
     crate::transfer::spawn(transfer_rx, net.clone(), config.clone(), board);
     // Sequence numbers start from the clock so a restarted core is never mistaken for a repeat.
     let clip_seq = std::time::SystemTime::now()
@@ -2347,6 +2423,7 @@ pub async fn run() -> anyhow::Result<()> {
         screen_info,
         screen,
         monitors,
+        work_areas,
         switch,
         hooked,
         remote_x: 0,
@@ -2366,6 +2443,7 @@ pub async fn run() -> anyhow::Result<()> {
         pause_hotkey,
         stay_on: false,
         paused_peers: HashSet::new(),
+        greeted: HashSet::new(),
         sharing_announced: true,
         remap: Vec::new(),
         sync_locks: true,
@@ -2389,7 +2467,7 @@ pub async fn run() -> anyhow::Result<()> {
         shared: SharedClip::default(),
         my_files: None,
         remote_files: None,
-        probe: EdgePush::default(),
+        probe: EdgePush,
         last_real: None,
         commanded: None,
         control_ready: Instant::now(),
@@ -2424,6 +2502,22 @@ pub async fn run() -> anyhow::Result<()> {
     info!("Cross-SystemConnect-core exiting");
     // Ensure network/IPC tasks die with the process (do not leave a stray kernel).
     std::process::exit(0);
+}
+
+/// Home-page pairing code. Stable until the user clicks「更换」; the previous
+/// code stays valid once so a just-changed code can still be typed.
+fn fresh_home_code() -> String {
+    let mut buf = [0u8; 4];
+    let _ = getrandom::getrandom(&mut buf);
+    format!("{:06}", u32::from_le_bytes(buf) % 1_000_000)
+}
+
+pub(crate) fn rotate_home(s: &mut csc_proto::AppStatus) {
+    s.home_code_prev = std::mem::take(&mut s.home_code);
+    s.home_code = fresh_home_code();
+    // 0 = no auto-expiry; previous code still accepted once via home_code_prev.
+    s.home_code_until = 0;
+    s.pairing_open_until = 0;
 }
 
 /// Resident-memory self-check every minute (`limits.rss_*`). Over the restart

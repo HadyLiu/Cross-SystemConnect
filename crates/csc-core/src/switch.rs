@@ -21,13 +21,22 @@ pub struct EnterDecision {
     pub position_pct: f32,
 }
 
-/// How far the pointer pushes outward after it reached an edge.
-/// The system holds the cursor at the edge, so the push is measured as the
-/// part of the raw hand movement that did not move the cursor.
-#[derive(Debug, Default, Clone)]
-pub struct EdgePush {
-    edge: Option<Edge>,
-    acc: i32,
+/// Reset when the pointer leaves an outer edge. The outer pixel itself
+/// switches; there is no extra push past it.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgePush;
+
+fn pixel_on_edge(edge: Edge, x: i32, y: i32, w: i32, h: i32) -> bool {
+    match edge {
+        Edge::Left => x <= 0,
+        Edge::Right => x >= w - 1,
+        Edge::Top => y <= 0,
+        Edge::Bottom => y >= h - 1,
+        Edge::TopLeft => x <= 0 && y <= 0,
+        Edge::TopRight => x >= w - 1 && y <= 0,
+        Edge::BottomLeft => x <= 0 && y >= h - 1,
+        Edge::BottomRight => x >= w - 1 && y >= h - 1,
+    }
 }
 
 fn outward(edge: Edge, dx: i32, dy: i32) -> i32 {
@@ -44,26 +53,7 @@ fn outward(edge: Edge, dx: i32, dy: i32) -> i32 {
 }
 
 impl EdgePush {
-    /// Add one step at `edge`: `raw` is the hand movement, `moved` how far the
-    /// cursor actually went. True once the push reaches `need` pixels.
-    pub fn step(&mut self, edge: Edge, raw: (i32, i32), moved: (i32, i32), need: i32) -> bool {
-        if self.edge != Some(edge) {
-            self.edge = Some(edge);
-            self.acc = 0;
-        }
-        let push = outward(edge, raw.0, raw.1);
-        if push < 0 {
-            self.acc = 0;
-        } else {
-            self.acc += (push - outward(edge, moved.0, moved.1).max(0)).max(0);
-        }
-        self.acc >= need.max(0)
-    }
-
-    pub fn reset(&mut self) {
-        self.edge = None;
-        self.acc = 0;
-    }
+    pub fn reset(&mut self) {}
 }
 
 /// An outer edge the real pointer of this (controlled) computer pushed through.
@@ -80,6 +70,9 @@ pub struct SwitchController {
     screen: ScreenSize,
     /// Local monitors. Empty means one monitor covering `screen`.
     monitors: Vec<Rect>,
+    /// Area of each monitor that is not a taskbar. Same order as `monitors`.
+    /// Empty, or a different length, means the whole monitor.
+    work: Vec<Rect>,
     cfg: SwitchConfig,
     layout: ScreenLayout,
     state: SwitchState,
@@ -94,14 +87,14 @@ pub struct SwitchController {
     push: EdgePush,
     last_local: Option<(i32, i32)>,
     /// Consecutive steps where the cursor moved but raw motion stayed silent.
+    /// Silent raw still switches; it only stops raw from picking a corner side.
     raw_misses: u8,
     /// The active remote reports its own edge contact (EdgeHit).
     remote_reports: bool,
 }
 
-/// Raw motion that missed this many cursor movements in a row is not used:
-/// touchpads, tablets and remote sessions may deliver none, and the edge
-/// must then switch on contact instead of waiting for a push it cannot see.
+/// Raw motion that missed this many cursor movements in a row is not used
+/// to choose which side a corner press is aimed at.
 const RAW_MISS_LIMIT: u8 = 3;
 
 impl Default for SwitchController {
@@ -110,6 +103,7 @@ impl Default for SwitchController {
             local_name: String::new(),
             screen: ScreenSize::default(),
             monitors: Vec::new(),
+            work: Vec::new(),
             cfg: SwitchConfig::default(),
             layout: ScreenLayout::default(),
             state: SwitchState::Local,
@@ -119,7 +113,7 @@ impl Default for SwitchController {
             pending_edge: None,
             pending_since: None,
             pending_second_tap: false,
-            push: EdgePush::default(),
+            push: EdgePush,
             last_local: None,
             raw_misses: RAW_MISS_LIMIT,
             remote_reports: false,
@@ -144,6 +138,51 @@ impl SwitchController {
     pub fn set_screen(&mut self, screen: ScreenSize, monitors: Vec<Rect>) {
         self.screen = screen;
         self.monitors = monitors;
+    }
+
+    /// Work areas aligned with `set_screen`'s monitor list. A point on the
+    /// taskbar is still on this computer, so it does not switch.
+    pub fn set_work_areas(&mut self, areas: Vec<Rect>) {
+        self.work = areas;
+    }
+
+    fn work_for(&self, monitor: &Rect) -> Rect {
+        let list = self.monitor_list();
+        if self.work.len() != list.len() {
+            return *monitor;
+        }
+        let work = list
+            .iter()
+            .zip(self.work.iter())
+            .find(|(m, _)| **m == *monitor)
+            .map(|(_, work)| *work)
+            .unwrap_or(*monitor);
+        // A work rect that misses this monitor is not its taskbar.
+        let overlaps = work.left < monitor.right
+            && monitor.left < work.right
+            && work.top < monitor.bottom
+            && monitor.top < work.bottom;
+        if overlaps {
+            work
+        } else {
+            *monitor
+        }
+    }
+
+    /// Pointer is on this computer's taskbar or panel, not past the screen.
+    fn on_shell_bar(&self, x: i32, y: i32) -> bool {
+        let monitor = self.monitor_at(x, y);
+        monitor.contains(x, y) && !self.work_for(&monitor).contains(x, y)
+    }
+
+    /// Outer pixel of a side that leads to another computer. The taskbar covers
+    /// that pixel, but it is still the way off this screen.
+    fn shell_edge_leads(&self, x: i32, y: i32) -> bool {
+        let leads = |e: Edge| self.layout.neighbor(&self.local_name, e).is_some();
+        if self.diagonal_at(x, y).is_some_and(leads) {
+            return true;
+        }
+        self.touched_outer_edges(x, y).into_iter().any(leads)
     }
 
     fn monitor_list(&self) -> Vec<Rect> {
@@ -227,10 +266,6 @@ impl SwitchController {
         self.remote_reports = on;
     }
 
-    pub fn edge_push_px(&self) -> i32 {
-        self.cfg.edge_push_px
-    }
-
     /// Keyboard host: the active remote pushed through `edge`. Picks the side
     /// the pointer leaves through, as `on_remote_relative` would.
     pub fn on_remote_edge(&self, report: &EdgeReport) -> Option<EnterDecision> {
@@ -257,24 +292,26 @@ impl SwitchController {
     }
 
     /// Controlled computer: the real pointer is at (x, y) after moving by
-    /// `moved`, while the host sent `raw`. Reports an outer edge once the
-    /// pointer pushed `edge_push_px` past it. Any outer edge counts; the
-    /// keyboard host knows which ones lead somewhere.
+    /// `moved`, while the host sent `raw`. The outer pixel is shared with the
+    /// neighbor, so occupying it is not a leave. A move that pushes outward
+    /// off that pixel is. Any outer edge counts; the keyboard host knows
+    /// which ones lead somewhere.
     pub fn probe_edge(
         &self,
         push: &mut EdgePush,
         x: i32,
         y: i32,
         raw: (i32, i32),
-        moved: (i32, i32),
+        _moved: (i32, i32),
     ) -> Option<EdgeReport> {
         let Some(edge) = pick_edge(&self.touched_outer_edges(x, y), raw, |_| true) else {
             push.reset();
             return None;
         };
         let corner = self.diagonal_at(x, y);
-        let along = corner.unwrap_or(edge);
-        if !push.step(along, raw, moved, self.cfg.edge_push_px) {
+        // Sliding along the shared pixel is still movement. Only a push
+        // outward, off that pixel, leaves this screen.
+        if outward(edge, raw.0, raw.1) <= 0 {
             return None;
         }
         push.reset();
@@ -288,6 +325,32 @@ impl SwitchController {
 
     pub fn active_remote(&self) -> &str {
         &self.active_remote
+    }
+
+    /// The pointer is on an outer pixel that is also the facing pixel of a
+    /// neighbor. Bottom pixel 0 of one screen and the other screen's last
+    /// pixel (for a 1024-tall screen, y = 0x3FF) are that same pixel.
+    pub fn cursor_on_shared_pixel(&self, x: i32, y: i32, remote: ScreenSize) -> bool {
+        if self.active_remote.is_empty() {
+            return false;
+        }
+        let w = remote.width.max(1);
+        let h = remote.height.max(1);
+        [
+            Edge::Left,
+            Edge::Right,
+            Edge::Top,
+            Edge::Bottom,
+            Edge::TopLeft,
+            Edge::TopRight,
+            Edge::BottomLeft,
+            Edge::BottomRight,
+        ]
+        .into_iter()
+        .any(|edge| {
+            self.layout.neighbor(&self.active_remote, edge).is_some()
+                && pixel_on_edge(edge, x, y, w, h)
+        })
     }
 
     /// Neighbor of the active remote screen on `edge`, if the layout has one.
@@ -314,6 +377,15 @@ impl SwitchController {
             self.active_remote = remote_host.to_string();
         }
         let pct = position_pct.clamp(0.0, 1.0);
+        // This computer is being entered: map onto the monitors that form the
+        // edge. A remote peer is only a width and height, so the host keeps a
+        // bounding-box estimate and the controlled computer places the pointer.
+        if remote.width == self.screen.width && remote.height == self.screen.height {
+            let (x, y) = self.place_on_edge(entry_edge, pct);
+            *cursor_x = x;
+            *cursor_y = y;
+            return;
+        }
         match entry_edge {
             Edge::Left => {
                 *cursor_x = 0;
@@ -348,6 +420,176 @@ impl SwitchController {
                 *cursor_y = remote.height.saturating_sub(1);
             }
         }
+    }
+
+    /// Where `pct` (0 at the top or left) lands on this computer's outer edge.
+    /// The percentage runs along the monitors that actually form that side,
+    /// skipping gaps. It does not use the bounding box, so a shorter monitor
+    /// beside a taller one keeps the same fraction of its own edge.
+    pub fn place_on_edge(&self, edge: Edge, pct: f32) -> (i32, i32) {
+        let pct = pct.clamp(0.0, 1.0);
+        if is_corner(edge) {
+            return self.corner_pixel(edge);
+        }
+        let spans = self.edge_spans(edge);
+        let total: i32 = spans.iter().map(|(from, to, _)| to - from).sum();
+        if total <= 0 {
+            return self.box_point(edge, pct);
+        }
+        let mut cursor = ((total as f32) * pct).round() as i32;
+        cursor = cursor.clamp(0, total - 1);
+        for (from, to, at) in spans {
+            let len = to - from;
+            if cursor < len {
+                let along = from + cursor;
+                return match edge {
+                    Edge::Left | Edge::Right => (at, along),
+                    _ => (along, at),
+                };
+            }
+            cursor -= len;
+        }
+        self.box_point(edge, pct)
+    }
+
+    /// Pointer back on the local side opposite `remote_edge`, one pixel in
+    /// so the crossing itself does not immediately switch again.
+    pub fn local_reentry(&self, remote_edge: Edge, pct: f32) -> (i32, i32) {
+        let local = remote_edge.opposite();
+        let (mut x, mut y) = self.place_on_edge(local, pct);
+        let m = self.monitor_at(x, y);
+        const INSET: i32 = 1;
+        match local {
+            Edge::Left | Edge::TopLeft | Edge::BottomLeft => {
+                x = (x + INSET).min(m.right - 1);
+            }
+            Edge::Right | Edge::TopRight | Edge::BottomRight => {
+                x = (x - INSET).max(m.left);
+            }
+            _ => {}
+        }
+        match local {
+            Edge::Top | Edge::TopLeft | Edge::TopRight => {
+                y = (y + INSET).min(m.bottom - 1);
+            }
+            Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => {
+                y = (y - INSET).max(m.top);
+            }
+            _ => {}
+        }
+        (x, y)
+    }
+
+    /// Bounding-box point. Used when this computer has no monitor geometry.
+    fn box_point(&self, edge: Edge, pct: f32) -> (i32, i32) {
+        let w = self.screen.width.max(1);
+        let h = self.screen.height.max(1);
+        let pct = pct.clamp(0.0, 1.0);
+        match edge {
+            Edge::Left => (0, ((h as f32) * pct) as i32),
+            Edge::Right => (w - 1, ((h as f32) * pct) as i32),
+            Edge::Top => (((w as f32) * pct) as i32, 0),
+            Edge::Bottom => (((w as f32) * pct) as i32, h - 1),
+            Edge::TopLeft => (0, 0),
+            Edge::TopRight => (w - 1, 0),
+            Edge::BottomLeft => (0, h - 1),
+            Edge::BottomRight => (w - 1, h - 1),
+        }
+    }
+
+    fn corner_pixel(&self, edge: Edge) -> (i32, i32) {
+        let list = self.monitor_list();
+        let (min_left, max_right, min_top, max_bottom) = desk_bounds(&list);
+        match edge {
+            Edge::TopLeft => list
+                .iter()
+                .find(|m| m.left <= min_left && m.top <= min_top)
+                .map(|m| (m.left, m.top))
+                .unwrap_or((min_left, min_top)),
+            Edge::TopRight => list
+                .iter()
+                .find(|m| m.right >= max_right && m.top <= min_top)
+                .map(|m| (m.right - 1, m.top))
+                .unwrap_or((max_right.saturating_sub(1), min_top)),
+            Edge::BottomLeft => list
+                .iter()
+                .find(|m| m.left <= min_left && m.bottom >= max_bottom)
+                .map(|m| (m.left, m.bottom - 1))
+                .unwrap_or((min_left, max_bottom.saturating_sub(1))),
+            Edge::BottomRight => list
+                .iter()
+                .find(|m| m.right >= max_right && m.bottom >= max_bottom)
+                .map(|m| (m.right - 1, m.bottom - 1))
+                .unwrap_or((max_right.saturating_sub(1), max_bottom.saturating_sub(1))),
+            _ => self.box_point(edge, 0.5),
+        }
+    }
+
+    /// Exposed pieces of one outer side, `(from, to, at)` in along-edge order.
+    /// `from..to` is the span; `at` is the outer pixel. Gaps are not included.
+    fn edge_spans(&self, edge: Edge) -> Vec<(i32, i32, i32)> {
+        let list = self.monitor_list();
+        let (min_left, max_right, min_top, max_bottom) = desk_bounds(&list);
+        let mut spans = Vec::new();
+        for m in &list {
+            let (from, to, at, exposed) = match edge {
+                Edge::Left => (m.top, m.bottom, m.left, m.left <= min_left),
+                Edge::Right => (m.top, m.bottom, m.right - 1, m.right >= max_right),
+                Edge::Top => (m.left, m.right, m.top, m.top <= min_top),
+                Edge::Bottom => (m.left, m.right, m.bottom - 1, m.bottom >= max_bottom),
+                _ => continue,
+            };
+            if exposed && to > from {
+                spans.push((from, to, at));
+            }
+        }
+        spans.sort_by_key(|span| (span.0, span.2));
+        let mut merged: Vec<(i32, i32, i32)> = Vec::new();
+        for (from, to, at) in spans {
+            if let Some(last) = merged.last_mut() {
+                if last.2 == at && from <= last.1 {
+                    last.1 = last.1.max(to);
+                    continue;
+                }
+            }
+            merged.push((from, to, at));
+        }
+        merged
+    }
+
+    /// Fraction along the outer side, 0 at the top or the left. Segments are
+    /// joined in order and gaps between them are skipped.
+    fn fraction_on_edge(&self, edge: Edge, x: i32, y: i32) -> f32 {
+        if is_corner(edge) {
+            return 0.5;
+        }
+        let along = match edge {
+            Edge::Left | Edge::Right => y,
+            _ => x,
+        };
+        let spans = self.edge_spans(edge);
+        let total: i32 = spans.iter().map(|(from, to, _)| to - from).sum();
+        if total <= 0 {
+            return self.monitor_fraction(edge, x, y);
+        }
+        let mut acc = 0i32;
+        for (from, to, _) in spans {
+            if along >= from && along < to {
+                return ((acc + (along - from)) as f32 / total as f32).clamp(0.0, 1.0);
+            }
+            acc += to - from;
+        }
+        self.monitor_fraction(edge, x, y)
+    }
+
+    fn monitor_fraction(&self, edge: Edge, x: i32, y: i32) -> f32 {
+        let m = self.monitor_at(x, y);
+        let pct = match edge {
+            Edge::Left | Edge::Right if m.height() > 0 => (y - m.top) as f32 / m.height() as f32,
+            Edge::Top | Edge::Bottom if m.width() > 0 => (x - m.left) as f32 / m.width() as f32,
+            _ => 0.5,
+        };
+        pct.clamp(0.0, 1.0)
     }
 
     pub fn confirm_returned(&mut self) {
@@ -416,7 +658,8 @@ impl SwitchController {
     }
 
     /// Local pointer at (x, y). `raw` is the hand movement since the last call
-    /// when the platform can measure it; without it the edge switches on contact.
+    /// when the platform can measure it. It only chooses a side at a corner.
+    /// The outer pixel switches either way.
     fn usable_raw(&mut self, raw: Option<(i32, i32)>, moved: (i32, i32)) -> Option<(i32, i32)> {
         let r = raw?;
         if moved != (0, 0) {
@@ -429,14 +672,9 @@ impl SwitchController {
             let now_trusted = self.raw_misses < RAW_MISS_LIMIT;
             if trusted != now_trusted {
                 if now_trusted {
-                    tracing::info!(
-                        "raw mouse motion available; edges need a push of {} px",
-                        self.cfg.edge_push_px
-                    );
+                    tracing::info!("raw mouse motion available");
                 } else {
-                    tracing::info!(
-                        "raw mouse motion silent while the cursor moves; edges switch on contact"
-                    );
+                    tracing::info!("raw mouse motion silent while the cursor moves");
                 }
             }
         }
@@ -458,6 +696,14 @@ impl SwitchController {
             .map(|(lx, ly)| (x - lx, y - ly))
             .unwrap_or((0, 0));
         self.last_local = Some((x, y));
+        // Inside the taskbar, but not on an outer edge that leads somewhere.
+        // That edge is how the pointer reaches the other computer.
+        if self.on_shell_bar(x, y) && !self.shell_edge_leads(x, y) {
+            self.pending_edge = None;
+            self.pending_second_tap = false;
+            self.push.reset();
+            return None;
+        }
         let raw = self.usable_raw(raw, moved);
         let diagonal = self
             .diagonal_at(x, y)
@@ -477,11 +723,8 @@ impl SwitchController {
             return None;
         };
         let neighbor = self.layout.neighbor(&self.local_name, edge)?.to_string();
-        if let Some(raw) = raw {
-            if !self.push.step(edge, raw, moved, self.cfg.edge_push_px) {
-                return None;
-            }
-        }
+        // The cursor is on the outer pixel. That pixel is the other computer.
+        self.push.reset();
 
         if self.cfg.double_tap_edge {
             if self.pending_edge == Some(edge) && self.pending_second_tap {
@@ -525,28 +768,10 @@ impl SwitchController {
     }
 
     fn make_decision(&self, neighbor: String, edge: Edge, x: i32, y: i32) -> EnterDecision {
-        let m = self.monitor_at(x, y);
-        let pct = match edge {
-            Edge::Left | Edge::Right => {
-                if m.height() > 0 {
-                    (y - m.top) as f32 / m.height() as f32
-                } else {
-                    0.5
-                }
-            }
-            Edge::Top | Edge::Bottom => {
-                if m.width() > 0 {
-                    (x - m.left) as f32 / m.width() as f32
-                } else {
-                    0.5
-                }
-            }
-            Edge::TopLeft | Edge::TopRight | Edge::BottomLeft | Edge::BottomRight => 0.5,
-        };
         EnterDecision {
             neighbor,
             edge,
-            position_pct: pct.clamp(0.0, 1.0),
+            position_pct: self.fraction_on_edge(edge, x, y),
         }
     }
 
@@ -661,6 +886,15 @@ fn pick_edge(touched: &[Edge], raw: (i32, i32), ok: impl Fn(Edge) -> bool) -> Op
     best.map(|(e, _)| e)
 }
 
+fn desk_bounds(list: &[Rect]) -> (i32, i32, i32, i32) {
+    (
+        list.iter().map(|r| r.left).min().unwrap_or(0),
+        list.iter().map(|r| r.right).max().unwrap_or(0),
+        list.iter().map(|r| r.top).min().unwrap_or(0),
+        list.iter().map(|r| r.bottom).max().unwrap_or(0),
+    )
+}
+
 fn is_corner(e: Edge) -> bool {
     matches!(
         e,
@@ -693,12 +927,12 @@ mod tests {
             ScreenLayout::load(&layout_map),
         );
         let t = Instant::now();
-        // Pressed into the top-left pixel, pushing up only: the top side leads somewhere.
-        let mut got = None;
-        for _ in 0..20 {
-            got = got.or(sw.on_local_cursor(0, 0, Some((0, -4)), t));
-        }
-        assert_eq!(got.expect("switches up").edge, Edge::Top);
+        // Still inside. The top-left pixel is the other computer.
+        assert!(sw.on_local_cursor(2, 2, Some((0, -4)), t).is_none());
+        let got = sw
+            .on_local_cursor(0, 0, Some((0, -4)), t)
+            .expect("switches up");
+        assert_eq!(got.edge, Edge::Top);
     }
 
     #[test]
@@ -717,7 +951,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn edge_needs_a_push_past_it() {
+    fn edge_switches_on_the_outer_pixel() {
         let mut layout_map = csc_config::LayoutMap::new();
         let mut e = BTreeMap::new();
         e.insert("right".into(), "REMOTE".into());
@@ -733,19 +967,48 @@ mod tests {
             ScreenLayout::load(&layout_map),
         );
         let t = Instant::now();
-        // Arriving at the edge: the cursor moved as far as the hand did.
         assert!(sw.on_local_cursor(95, 50, Some((0, 0)), t).is_none());
-        assert!(sw.on_local_cursor(99, 50, Some((4, 0)), t).is_none());
-        // Sliding along the edge does not count.
-        assert!(sw.on_local_cursor(99, 60, Some((0, 10)), t).is_none());
-        assert!(sw.on_local_cursor(99, 60, Some((5, 0)), t).is_none());
-        // Pulling back resets the push.
-        assert!(sw.on_local_cursor(99, 60, Some((-1, 0)), t).is_none());
-        assert!(sw.on_local_cursor(99, 60, Some((5, 0)), t).is_none());
         let d = sw
-            .on_local_cursor(99, 60, Some((3, 0)), t)
-            .expect("pushed 8 px");
+            .on_local_cursor(99, 50, Some((4, 0)), t)
+            .expect("outer pixel");
         assert_eq!(d.edge, Edge::Right);
+    }
+
+    #[test]
+    fn fast_arrival_waits_until_the_pointer_is_drawn_on_the_edge() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut e = BTreeMap::new();
+        e.insert("top".into(), "REMOTE".into());
+        layout_map.insert("LOCAL".into(), e);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 100,
+                height: 100,
+            },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        let t = Instant::now();
+        // One sample carries the cursor from mid-screen onto the top edge.
+        assert!(sw.on_local_cursor(50, 40, Some((0, -10)), t).is_none());
+        let d = sw
+            .on_local_cursor(50, 0, Some((0, -80)), t)
+            .expect("outer pixel");
+        assert_eq!(d.edge, Edge::Top);
+    }
+
+    /// Move onto `(x, y)` along `out`. The sample that lands there switches.
+    fn touch_edge(sw: &mut SwitchController, x: i32, y: i32, out: (i32, i32)) -> EnterDecision {
+        let t = Instant::now();
+        assert!(
+            sw.on_local_cursor(x - out.0, y - out.1, Some(out), t)
+                .is_none(),
+            "one pixel inside stays on this screen"
+        );
+        sw.on_local_cursor(x, y, Some(out), t)
+            .expect("outer pixel switches")
     }
 
     #[test]
@@ -765,21 +1028,11 @@ mod tests {
             ScreenLayout::load(&layout_map),
         );
         let t = Instant::now();
-        // A touchpad whose raw input never arrives: the cursor moves, raw stays zero.
+        // A touchpad whose raw input never arrives still switches on the outer pixel.
         for x in [80, 85, 90, 95] {
             assert!(sw.on_local_cursor(x, 50, Some((0, 0)), t).is_none());
         }
-        let d = sw
-            .on_local_cursor(99, 50, Some((0, 0)), t)
-            .expect("contact is enough");
-        assert_eq!(d.edge, Edge::Right);
-
-        // Once raw motion follows the hand again, the push is required.
-        sw.unlock_to_local();
-        assert!(sw.on_local_cursor(90, 50, Some((0, 0)), t).is_none());
-        assert!(sw.on_local_cursor(95, 50, Some((5, 0)), t).is_none());
-        assert!(sw.on_local_cursor(99, 50, Some((4, 0)), t).is_none());
-        assert!(sw.on_local_cursor(99, 50, Some((8, 0)), t).is_some());
+        assert!(sw.on_local_cursor(99, 50, Some((0, 0)), t).is_some());
     }
 
     #[test]
@@ -814,18 +1067,22 @@ mod tests {
                 },
             ],
         );
-        let mut push = EdgePush::default();
+        let mut push = EdgePush;
         assert!(
             sw.probe_edge(&mut push, 1919, 500, (50, 0), (0, 0))
                 .is_none(),
             "inner border"
         );
+        // Sitting on the shared pixel, or sliding along it, does not leave.
         assert!(sw
-            .probe_edge(&mut push, 3359, 450, (4, 0), (4, 0))
+            .probe_edge(&mut push, 3359, 450, (0, 8), (0, 8))
+            .is_none());
+        assert!(sw
+            .probe_edge(&mut push, 3359, 450, (-3, 0), (0, 0))
             .is_none());
         let r = sw
-            .probe_edge(&mut push, 3359, 450, (9, 0), (0, 0))
-            .expect("pushed through the right side");
+            .probe_edge(&mut push, 3359, 450, (4, 0), (0, 0))
+            .expect("pushed outward off the shared pixel");
         assert_eq!((r.edge, r.corner), (Edge::Right, None));
         assert!((r.position_pct - 0.5).abs() < 0.01);
     }
@@ -882,9 +1139,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw
-            .on_local_cursor(99, 50, None, Instant::now())
-            .expect("enter");
+        let d = touch_edge(&mut sw, 99, 50, (1, 0));
         assert_eq!(d.neighbor, "REMOTE");
         assert_eq!(d.edge, Edge::Right);
     }
@@ -906,9 +1161,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let d = sw
-            .on_local_cursor(99, 0, None, Instant::now())
-            .expect("diagonal");
+        let d = touch_edge(&mut sw, 99, 0, (1, -1));
         assert_eq!(d.neighbor, "CORNER");
         assert_eq!(d.edge, Edge::TopRight);
     }
@@ -965,9 +1218,7 @@ mod tests {
             .on_local_cursor(1919, 1000, None, Instant::now())
             .is_none());
         // Right side of the right monitor switches, with the position on that monitor.
-        let d = sw
-            .on_local_cursor(3359, 450, None, Instant::now())
-            .expect("right edge");
+        let d = touch_edge(&mut sw, 3359, 450, (1, 0));
         assert_eq!(d.edge, Edge::Right);
         assert!((d.position_pct - 0.5).abs() < 0.01);
     }
@@ -1018,9 +1269,7 @@ mod tests {
             SwitchConfig::default(),
             ScreenLayout::load(&layout_map),
         );
-        let side = sw
-            .on_local_cursor(99, 0, None, Instant::now())
-            .expect("right edge");
+        let side = touch_edge(&mut sw, 99, 0, (1, 0));
         assert_eq!(side.neighbor, "SIDE");
         assert_eq!(side.edge, Edge::Right);
     }
@@ -1065,9 +1314,7 @@ mod tests {
             ],
         );
         // Right side of the shorter monitor, near its bottom.
-        let d = sw
-            .on_local_cursor(3359, 860, None, Instant::now())
-            .expect("diagonal");
+        let d = touch_edge(&mut sw, 3359, 860, (1, 1));
         assert_eq!(d.edge, Edge::BottomRight);
         // Bottom side of the taller monitor, near its right end is inner: no switch.
         assert!(sw
@@ -1098,5 +1345,184 @@ mod tests {
             .on_remote_relative(0, -20, &mut x, &mut y, remote_size)
             .expect("return");
         assert_eq!(back.edge, Edge::TopLeft);
+    }
+
+    #[test]
+    fn taskbar_keeps_the_pointer_on_this_computer() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut host = BTreeMap::new();
+        host.insert("bottom".into(), "BELOW".into());
+        host.insert("right".into(), "SIDE".into());
+        host.insert("bottom_right".into(), "CORNER".into());
+        layout_map.insert("LOCAL".into(), host);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 1920,
+                height: 1080,
+            },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        sw.set_screen(
+            ScreenSize {
+                width: 1920,
+                height: 1080,
+            },
+            vec![Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            }],
+        );
+        // 40px taskbar along the bottom. The show-desktop corner is inside it.
+        sw.set_work_areas(vec![Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        }]);
+        let now = Instant::now();
+        // Icons in the taskbar are not the outer edge.
+        assert!(sw.on_local_cursor(1910, 1070, Some((8, 20)), now).is_none());
+        assert!(sw.on_local_cursor(1910, 1070, Some((8, 20)), now).is_none());
+        // The outer corner pixel still reaches the computer placed there.
+        let corner = touch_edge(&mut sw, 1919, 1079, (1, 1));
+        assert_eq!(corner.neighbor, "CORNER");
+        assert_eq!(corner.edge, Edge::BottomRight);
+        // The right edge above the taskbar still leaves this computer.
+        let side = touch_edge(&mut sw, 1919, 500, (1, 0));
+        assert_eq!(side.neighbor, "SIDE");
+        assert_eq!(side.edge, Edge::Right);
+        // The bottom pixel under the taskbar still reaches the computer below.
+        let below = touch_edge(&mut sw, 960, 1079, (0, 1));
+        assert_eq!(below.neighbor, "BELOW");
+        assert_eq!(below.edge, Edge::Bottom);
+    }
+
+    #[test]
+    fn bottom_pixel_and_other_screen_last_pixel_are_one() {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut upper = BTreeMap::new();
+        upper.insert("bottom".into(), "LOWER".into());
+        layout_map.insert("UPPER".into(), upper);
+        let mut lower = BTreeMap::new();
+        lower.insert("top".into(), "UPPER".into());
+        layout_map.insert("LOWER".into(), lower);
+        let layout = ScreenLayout::load(&layout_map);
+        let upper_size = ScreenSize {
+            width: 1920,
+            height: 1024,
+        };
+        let lower_size = ScreenSize {
+            width: 1920,
+            height: 800,
+        };
+        let mut sw = SwitchController::default();
+        sw.configure("LOWER".into(), lower_size, SwitchConfig::default(), layout);
+        let (mut x, mut y) = (0, 0);
+        // Entering the upper screen from below lands on its bottom pixel, 0x3FF.
+        sw.confirm_entered(Edge::Bottom, 0.25, upper_size, &mut x, &mut y, "UPPER");
+        assert_eq!((x, y), (480, 0x3FF));
+        assert!(sw.cursor_on_shared_pixel(x, y, upper_size));
+        assert!(!sw.cursor_on_shared_pixel(x, 0x3FF - 1, upper_size));
+        // The lower screen's top pixel is that same seam.
+        sw.confirm_entered(Edge::Top, 0.25, lower_size, &mut x, &mut y, "LOWER");
+        assert_eq!(y, 0);
+        assert!(sw.cursor_on_shared_pixel(x, 0, lower_size));
+        assert!(!sw.cursor_on_shared_pixel(x, 1, lower_size));
+    }
+
+    #[test]
+    fn different_heights_keep_the_fraction_of_the_real_edge() {
+        let mut sw = SwitchController::default();
+        let wide = ScreenSize {
+            width: 4480,
+            height: 1440,
+        };
+        sw.configure(
+            "LOCAL".into(),
+            wide,
+            SwitchConfig::default(),
+            ScreenLayout::default(),
+        );
+        // 1080p on the left, vertically centered beside a 1440p panel.
+        // The bounding box is 1440 tall, so 25% of the box is y=360.
+        sw.set_screen(
+            wide,
+            vec![
+                Rect {
+                    left: 0,
+                    top: 180,
+                    right: 1920,
+                    bottom: 1260,
+                },
+                Rect {
+                    left: 1920,
+                    top: 0,
+                    right: 4480,
+                    bottom: 1440,
+                },
+            ],
+        );
+        let (mut x, mut y) = (0, 0);
+        sw.confirm_entered(Edge::Left, 0.25, wide, &mut x, &mut y, "");
+        assert_eq!((x, y), (0, 180 + 270));
+        // Leaving that pixel reports the same fraction, and lands back on it.
+        let pct = sw.fraction_on_edge(Edge::Left, x, y);
+        assert!((pct - 0.25).abs() < 0.001);
+        assert_eq!(sw.place_on_edge(Edge::Left, pct), (x, y));
+
+        // Top-aligned: the left edge is only the shorter monitor. Its middle
+        // is y=540, not the middle of the 1440 box (y=720).
+        sw.set_screen(
+            wide,
+            vec![
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                Rect {
+                    left: 1920,
+                    top: 0,
+                    right: 4480,
+                    bottom: 1440,
+                },
+            ],
+        );
+        sw.confirm_entered(Edge::Left, 0.5, wide, &mut x, &mut y, "");
+        assert_eq!((x, y), (0, 540));
+        // The bottom edge belongs to the taller monitor only.
+        sw.confirm_entered(Edge::Bottom, 0.0, wide, &mut x, &mut y, "");
+        assert_eq!((x, y), (1920, 1439));
+
+        // Two left monitors with a gap. Halfway skips the gap.
+        let gapped = ScreenSize {
+            width: 100,
+            height: 250,
+        };
+        sw.set_screen(
+            gapped,
+            vec![
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100,
+                },
+                Rect {
+                    left: 0,
+                    top: 150,
+                    right: 100,
+                    bottom: 250,
+                },
+            ],
+        );
+        sw.confirm_entered(Edge::Left, 0.5, gapped, &mut x, &mut y, "");
+        assert_eq!((x, y), (0, 150));
     }
 }

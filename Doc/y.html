@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CrossConnect - macOS Design Preview</title>
+    <style>
+        :root {
+            --mac-bg: rgba(30, 32, 38, 0.85);
+            --mac-sidebar: rgba(24, 25, 29, 0.7);
+            --mac-card: rgba(40, 44, 52, 0.5);
+            --mac-card-hover: rgba(50, 54, 63, 0.6);
+            --mac-border: rgba(255, 255, 255, 0.08);
+            --mac-accent: #007aff; /* Apple Classic Blue */
+            --mac-accent-glow: rgba(0, 122, 255, 0.3);
+            --text-main: rgba(255, 255, 255, 0.85);
+            --text-muted: rgba(255, 255, 255, 0.45);
+            --font-mac: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        
+        body {
+            font-family: var(--font-mac);
+            background: #111215;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+            font-size: 13px;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* 模拟 macOS 独立应用窗口 */
+        .window-container {
+            width: 880px;
+            height: 580px;
+            background: var(--mac-bg);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            border: 1px solid var(--mac-border);
+            border-radius: 12px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255,255,255,0.05) inset;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* 侧边栏 Sidebar */
+        .sidebar {
+            width: 210px;
+            background: var(--mac-sidebar);
+            border-right: 1px solid var(--mac-border);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 12px 10px;
+            flex-shrink: 0;
+        }
+
+        /* macOS 红黄绿窗口控件按钮 */
+        .mac-traffic-lights {
+            display: flex;
+            gap: 7px;
+            padding: 4px 6px 14px 6px;
+        }
+        .light { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+        .light-close { background: #ff5f56; border: 0.5px solid #e0443e; }
+        .light-min { background: #ffbd2e; border: 0.5px solid #dea123; }
+        .light-max { background: #27c93f; border: 0.5px solid #1aab29; }
+
+        .nav-list { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+        .nav-item {
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-muted);
+            font-weight: 400;
+            transition: all 0.15s cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+        .nav-item svg { width: 15px; height: 15px; fill: currentColor; opacity: 0.8; }
+        .nav-item:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
+        .nav-item.active {
+            background: var(--mac-accent);
+            color: #ffffff;
+            font-weight: 500;
+            box-shadow: 0 2px 8px var(--mac-accent-glow);
+        }
+        .nav-item.active svg { opacity: 1; fill: #fff; }
+
+        .sidebar-footer {
+            padding: 8px 10px;
+            border-top: 1px solid var(--mac-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #34c759; box-shadow: 0 0 6px #34c759; }
+
+        /* 主内容区域 */
+        .main-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: transparent;
+            overflow: hidden;
+        }
+
+        .header-bar {
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            border-bottom: 1px solid var(--mac-border);
+        }
+        .header-title { font-size: 14px; font-weight: 600; letter-spacing: -0.2px; }
+
+        .content-area {
+            flex: 1;
+            padding: 16px 20px;
+            overflow-y: auto;
+        }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; animation: macFade 0.2s ease-out; }
+
+        @keyframes macFade {
+            from { opacity: 0; transform: scale(0.995); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        /* 卡片 & 布局 */
+        .two-column-layout { display: flex; gap: 14px; align-items: stretch; margin-bottom: 14px; }
+        .col-half { flex: 1; min-width: 0; }
+
+        .mac-card {
+            background: var(--mac-card);
+            border: 1px solid var(--mac-border);
+            border-radius: 10px;
+            padding: 14px 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            transition: all 0.2s;
+        }
+        .mac-card:hover { border-color: rgba(255,255,255,0.15); }
+        .two-column-layout .mac-card { height: 100%; margin-bottom: 0; }
+
+        .card-header {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-main);
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* 紧凑对齐 Form */
+        .grid-form {
+            display: grid;
+            grid-template-columns: 130px 1fr;
+            gap: 12px 10px;
+            align-items: center;
+        }
+        .grid-form label { color: var(--text-muted); font-size: 12px; }
+
+        /* macOS 风格输入框与下拉控件 */
+        .mac-input, select.mac-input {
+            width: 170px !important;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--mac-border);
+            color: var(--text-main);
+            padding: 5px 10px;
+            border-radius: 6px;
+            outline: none;
+            font-size: 12px;
+            font-family: var(--font-mac);
+            transition: all 0.15s;
+        }
+        .mac-input:focus, select.mac-input:focus {
+            border-color: var(--mac-accent);
+            box-shadow: 0 0 0 3px var(--mac-accent-glow);
+        }
+
+        /* 按钮与 Key 标签 */
+        .btn-mac {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--mac-border);
+            color: var(--text-main);
+            padding: 5px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+        .btn-mac:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+        .btn-mac-primary {
+            background: var(--mac-accent);
+            border: none;
+            color: #fff;
+        }
+        .btn-mac-primary:hover { background: #0063d1; }
+
+        /* macOS 经典分段数字输入 */
+        .pin-wrapper { display: flex; gap: 4px; }
+        .pin-box {
+            width: 24px; height: 28px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--mac-border);
+            border-radius: 5px;
+            text-align: center;
+            font-family: monospace;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--mac-accent);
+            outline: none;
+            transition: all 0.15s;
+        }
+        .pin-box:focus { border-color: var(--mac-accent); box-shadow: 0 0 0 2px var(--mac-accent-glow); }
+
+        /* macOS 经典 Toggle 开关 */
+        .mac-switch { position: relative; display: inline-block; width: 34px; height: 20px; }
+        .mac-switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: rgba(255,255,255,0.15); transition: .2s; border-radius: 20px;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px;
+            background-color: white; transition: .2s; border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        input:checked + .slider { background-color: #34c759; }
+        input:checked + .slider:before { transform: translateX(14px); }
+
+        /* macOS 屏幕拓扑 3x3 优雅高光 */
+        .topology-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            width: 100%;
+            height: 155px;
+            background: rgba(0,0,0,0.2);
+            padding: 8px;
+            border-radius: 8px;
+            border: 1px solid var(--mac-border);
+        }
+        .topology-slot {
+            border: 1px dashed rgba(255,255,255,0.12);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+        .topology-slot.drag-over { background: rgba(0, 122, 255, 0.15); border-color: var(--mac-accent); }
+        
+        .screen-card {
+            width: 100%; height: 100%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 5px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-main);
+            font-size: 11px;
+            cursor: grab;
+            gap: 2px;
+            backdrop-filter: blur(5px);
+            transition: all 0.15s;
+        }
+        .screen-card:hover { border-color: var(--mac-accent); transform: translateY(-1px); }
+        .screen-card.is-self {
+            border-color: #34c759;
+            background: rgba(52, 199, 89, 0.1);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="window-container">
+        <!-- 左侧 macOS 风格 SidePanel -->
+        <div class="sidebar">
+            <div>
+                <!-- macOS 三色红黄绿控制点 -->
+                <div class="mac-traffic-lights">
+                    <span class="light light-close"></span>
+                    <span class="light light-min"></span>
+                    <span class="light light-max"></span>
+                </div>
+
+                <ul class="nav-list">
+                    <li class="nav-item active" onclick="switchTab('tab-devices')">
+                        <svg viewBox="0 0 24 24"><path d="M4 6h16v10H4z M2 18h20v2H2z"/></svg>
+                        设备与拓扑
+                    </li>
+                    <li class="nav-item" onclick="switchTab('tab-sharing')">
+                        <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2z"/></svg>
+                        共享与文件
+                    </li>
+                    <li class="nav-item" onclick="switchTab('tab-switch')">
+                        <svg viewBox="0 0 24 24"><path d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
+                        切换与热键
+                    </li>
+                    <li class="nav-item" onclick="switchTab('tab-system')">
+                        <svg viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>
+                        系统与网络
+                    </li>
+                    <li class="nav-item" onclick="switchTab('tab-about')">
+                        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        关于软件
+                    </li>
+                </ul>
+            </div>
+
+            <div class="sidebar-footer">
+                <span>无界无缝接入</span>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <div class="status-dot"></div>
+                    <span style="color: var(--text-main); font-size: 10px;">就绪</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 主面板 CentralPanel -->
+        <div class="main-panel">
+            <div class="header-bar">
+                <span class="header-title" id="tab-title">设备与拓扑</span>
+                <button class="btn-mac" onclick="alert('重新扫描完成')">刷新节点</button>
+            </div>
+
+            <div class="content-area">
+                
+                <!-- Tab 1: 设备与拓扑 -->
+                <div id="tab-devices" class="tab-content active">
+                    <div class="two-column-layout">
+                        <div class="col-half">
+                            <div class="mac-card">
+                                <div class="card-header">基础参数与配对</div>
+                                <div class="grid-form">
+                                    <label>计算机名称</label>
+                                    <input type="text" class="mac-input" value="MacBook-Pro-M2">
+
+                                    <label>当前角色</label>
+                                    <select class="mac-input">
+                                        <option>主机 (控制端)</option>
+                                        <option>从机 (被控端)</option>
+                                    </select>
+
+                                    <label>搜索 IP 范围</label>
+                                    <select class="mac-input">
+                                        <option>Wi-Fi: 192.168.1.100</option>
+                                        <option>Thunderbolt: 10.0.0.5</option>
+                                    </select>
+
+                                    <label>本机配对码</label>
+                                    <div style="display:flex; gap:6px;">
+                                        <input type="text" class="mac-input" value="849 201" readonly style="width: 105px !important; text-align: center; font-weight: bold; color: var(--mac-accent);">
+                                        <button class="btn-mac">更换</button>
+                                    </div>
+
+                                    <label>输入对方配对码</label>
+                                    <div>
+                                        <div class="pin-wrapper" id="pinInputs">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                            <input type="text" class="pin-box" maxlength="1">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-half">
+                            <div class="mac-card">
+                                <div class="card-header">屏幕拓扑 (3×3 矩阵)</div>
+                                <div class="topology-grid" id="topologyGrid"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mac-card">
+                        <div class="card-header">已连接设备</div>
+                        <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 11px;">
+                            <thead>
+                                <tr style="color: var(--text-muted); border-bottom: 1px solid var(--mac-border);">
+                                    <th style="padding-bottom: 6px;">设备名</th>
+                                    <th>IP 地址</th>
+                                    <th>延迟</th>
+                                    <th>指针灵敏度</th>
+                                    <th style="text-align: right;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
+                                    <td style="padding: 8px 0; color: #fff;">Studio-Display</td>
+                                    <td>192.168.1.5</td>
+                                    <td style="color: #34c759;">1.2 ms</td>
+                                    <td>
+                                        <input type="range" min="0.5" max="2.0" step="0.1" value="1.0" style="width: 90px;">
+                                    </td>
+                                    <td style="text-align: right;"><button class="btn-mac" style="color: #ff453a;">断开</button></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Tab 2: 共享与文件 -->
+                <div id="tab-sharing" class="tab-content">
+                    <div class="two-column-layout">
+                        <div class="col-half">
+                            <div class="mac-card">
+                                <div class="card-header">剪贴板无缝同步</div>
+                                <div class="grid-form">
+                                    <label>启用剪贴板共享</label>
+                                    <label class="mac-switch">
+                                        <input type="checkbox" checked>
+                                        <span class="slider"></span>
+                                    </label>
+
+                                    <label>同步内容格式</label>
+                                    <div style="display:flex; gap:12px; color:var(--text-main);">
+                                        <label><input type="checkbox" checked> 富文本</label>
+                                        <label><input type="checkbox" checked> 图像/截图</label>
+                                    </div>
+
+                                    <label>文字上限 (MB)</label>
+                                    <input type="number" class="mac-input" value="10">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-half">
+                            <div class="mac-card">
+                                <div class="card-header">跨屏拖拽文件传输</div>
+                                <div class="grid-form">
+                                    <label>启用跨屏传输</label>
+                                    <label class="mac-switch">
+                                        <input type="checkbox" checked>
+                                        <span class="slider"></span>
+                                    </label>
+
+                                    <label>单文件上限 (MB)</label>
+                                    <input type="number" class="mac-input" value="1024">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 其他 Tab 保持精致骨架... -->
+                <div id="tab-switch" class="tab-content">
+                    <div class="mac-card">
+                        <div class="card-header">快捷键 & 撞边边缘行为</div>
+                        <p style="color: var(--text-muted);">针对 macOS 动态边缘触碰算法，无缝顺滑穿透。</p>
+                    </div>
+                </div>
+
+                <div id="tab-system" class="tab-content">
+                    <div class="mac-card">
+                        <div class="card-header">系统网络参数</div>
+                        <p style="color: var(--text-muted);">端口监听与 macOS 开机启动项控制。</p>
+                    </div>
+                </div>
+
+                <div id="tab-about" class="tab-content">
+                    <div class="mac-card">
+                        <div class="card-header">关于 CrossConnect</div>
+                        <p style="color: var(--text-muted);">基于 Rust 核心与 egui 极其轻量渲染构筑。</p>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            
+            document.getElementById(tabId).classList.add('active');
+            
+            const activeNav = Array.from(document.querySelectorAll('.nav-item')).find(el => el.getAttribute('onclick').includes(tabId));
+            if(activeNav) activeNav.classList.add('active');
+
+            const titles = {
+                'tab-devices': '设备与拓扑',
+                'tab-sharing': '共享与文件',
+                'tab-switch': '切换与热键',
+                'tab-system': '系统与网络',
+                'tab-about': '关于软件'
+            };
+            document.getElementById('tab-title').innerText = titles[tabId];
+        }
+
+        // 6位 Pin 跳格
+        const boxes = document.querySelectorAll('.pin-box');
+        boxes.forEach((box, idx) => {
+            box.addEventListener('input', () => {
+                box.value = box.value.replace(/[^\d]/g, '');
+                if(box.value && idx < boxes.length - 1) boxes[idx + 1].focus();
+            });
+        });
+
+        // 3x3 拓扑
+        const topologyData = [
+            null, { name: 'Studio-Display', ip: '192.168.1.5', isSelf: false }, null,
+            null, { name: 'MacBook-Pro', ip: '(本机)', isSelf: true }, null,
+            null, null, null
+        ];
+
+        const gridContainer = document.getElementById('topologyGrid');
+        function renderTopology() {
+            gridContainer.innerHTML = '';
+            topologyData.forEach((item, index) => {
+                const slot = document.createElement('div');
+                slot.className = 'topology-slot';
+                if (item) {
+                    const card = document.createElement('div');
+                    card.className = `screen-card ${item.isSelf ? 'is-self' : ''}`;
+                    card.innerHTML = `<div><strong>${item.name}</strong></div><div style="font-size:9px; opacity:0.6;">${item.ip}</div>`;
+                    slot.appendChild(card);
+                }
+                gridContainer.appendChild(slot);
+            });
+        }
+        renderTopology();
+    </script>
+</body>
+</html>

@@ -21,33 +21,50 @@ impl ScreenInfo for WinScreenInfo {
     }
 
     fn monitors(&self) -> Vec<Rect> {
-        let (ox, oy) = virtual_origin();
-        let mut out: Vec<Rect> = Vec::new();
-        unsafe {
-            let _ = EnumDisplayMonitors(
-                HDC::default(),
-                None,
-                Some(collect_monitor),
-                LPARAM(&mut out as *mut Vec<Rect> as isize),
-            );
-        }
-        for r in &mut out {
-            r.left -= ox;
-            r.right -= ox;
-            r.top -= oy;
-            r.bottom -= oy;
-        }
-        if out.is_empty() {
-            let s = self.virtual_size();
-            out.push(Rect {
-                left: 0,
-                top: 0,
-                right: s.width,
-                bottom: s.height,
-            });
-        }
-        out
+        monitor_rects(false)
     }
+
+    fn work_areas(&self) -> Vec<Rect> {
+        monitor_rects(true)
+    }
+}
+
+/// `work` selects the area not covered by the taskbar (`rcWork`).
+fn monitor_rects(work: bool) -> Vec<Rect> {
+    let (ox, oy) = virtual_origin();
+    let mut out: Vec<Rect> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut Collect {
+                out: &mut out,
+                work,
+            } as *mut Collect as isize),
+        );
+    }
+    for r in &mut out {
+        r.left -= ox;
+        r.right -= ox;
+        r.top -= oy;
+        r.bottom -= oy;
+    }
+    if out.is_empty() {
+        let s = WinScreenInfo.virtual_size();
+        out.push(Rect {
+            left: 0,
+            top: 0,
+            right: s.width,
+            bottom: s.height,
+        });
+    }
+    out
+}
+
+struct Collect<'a> {
+    out: &'a mut Vec<Rect>,
+    work: bool,
 }
 
 unsafe extern "system" fn collect_monitor(
@@ -56,14 +73,18 @@ unsafe extern "system" fn collect_monitor(
     _clip: *mut RECT,
     data: LPARAM,
 ) -> BOOL {
-    let out = &mut *(data.0 as *mut Vec<Rect>);
+    let collect = &mut *(data.0 as *mut Collect);
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
-        let r = info.rcMonitor;
-        out.push(Rect {
+        let r = if collect.work {
+            info.rcWork
+        } else {
+            info.rcMonitor
+        };
+        collect.out.push(Rect {
             left: r.left,
             top: r.top,
             right: r.right,
