@@ -3,13 +3,13 @@ mod pages;
 mod transfer;
 pub mod widgets;
 
-pub use home::draw_home;
+pub use home::{draw_home, draw_pair_confirm_modal};
 pub use pages::{draw_about, draw_sharing, draw_switch, draw_system};
 pub use transfer::TransferUi;
 
 use crate::app::{App, Page};
 use crate::theme::Palette;
-use eframe::egui::{self, Order, RichText};
+use eframe::egui::{self, Color32, Order, RichText};
 
 const TITLE_H: f32 = 36.0;
 const NAV_W: f32 = 210.0;
@@ -20,7 +20,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let full = ctx.content_rect();
 
-    ui.painter().rect_filled(full, 0.0, p.bg);
+    // Rounded window chrome (frameless).
+    let win_r = 12.0;
+    ui.painter().rect(
+        full,
+        win_r,
+        p.bg,
+        egui::Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
 
     // Page body on the root layer (normal layout so cards/controls paint correctly).
     let content_rect = egui::Rect::from_min_max(
@@ -35,6 +43,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // Chrome on a foreground layer — never scrolls with the page body.
     draw_titlebar(app, &ctx, &p, full);
     draw_nav(app, &ctx, &p, full);
+
+    // Pairing confirm as a modal over any page.
+    draw_pair_confirm_modal(app, &ctx);
 }
 
 fn draw_titlebar(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Rect) {
@@ -52,7 +63,16 @@ fn draw_titlebar(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Re
             let rect = ui.max_rect();
             ui.set_clip_rect(rect);
 
-            ui.painter().rect_filled(rect, 0.0, p.bg);
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 12,
+                    ne: 12,
+                    sw: 0,
+                    se: 0,
+                },
+                p.sidebar,
+            );
             ui.painter().hline(
                 rect.x_range(),
                 rect.bottom() - 0.5,
@@ -156,11 +176,24 @@ fn draw_nav(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Rect) {
             let rect = ui.max_rect();
             ui.set_clip_rect(rect);
 
-            ui.painter()
-                .vline(rect.right() - 0.5, rect.y_range(), egui::Stroke::new(1.0, p.border));
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 12,
+                    se: 0,
+                },
+                p.sidebar,
+            );
+            ui.painter().vline(
+                rect.right() - 0.5,
+                rect.y_range(),
+                egui::Stroke::new(1.0, p.border),
+            );
 
             egui::Frame::new()
-                .fill(p.sidebar)
+                .fill(Color32::TRANSPARENT)
                 .inner_margin(egui::Margin::symmetric(10, 12))
                 .show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
@@ -212,28 +245,52 @@ fn draw_nav(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Rect) {
                         );
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(app.t("无界无缝接入", "Seamless access"))
-                                    .size(11.0)
-                                    .color(p.text_2),
+                            let server = matches!(app.cfg.role, csc_config::Role::Server);
+                            let role = if server {
+                                app.t("主机", "Host")
+                            } else {
+                                app.t("从机", "Client")
+                            };
+                            let tip = if server {
+                                app.t("主机 · 点击切换为从机", "Host · click to become client")
+                            } else {
+                                app.t("从机 · 点击切换为主机", "Client · click to become host")
+                            };
+                            if ui
+                                .add(
+                                    egui::Label::new(RichText::new(role).size(11.0).color(p.text))
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                app.cfg.role = if server {
+                                    csc_config::Role::Client
+                                } else {
+                                    csc_config::Role::Server
+                                };
+                                app.queue_save();
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let connected = app
+                                        .status
+                                        .get("connected")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    widgets::status_pill(
+                                        ui,
+                                        p,
+                                        connected,
+                                        if connected {
+                                            app.t("已连接", "Connected")
+                                        } else {
+                                            app.t("就绪", "Ready")
+                                        },
+                                    );
+                                },
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let connected = app
-                                    .status
-                                    .get("connected")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                widgets::status_pill(
-                                    ui,
-                                    p,
-                                    connected,
-                                    if connected {
-                                        app.t("已连接", "Connected")
-                                    } else {
-                                        app.t("就绪", "Ready")
-                                    },
-                                );
-                            });
                         });
                     });
                 });
@@ -260,18 +317,12 @@ fn draw_content(app: &mut App, ui: &mut egui::Ui, p: &Palette, rect: egui::Rect)
                     ui.add_space(20.0);
                     ui.label(
                         RichText::new(app.page_title())
-                            .size(20.0)
+                            .size(18.0)
                             .strong()
                             .color(p.text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(20.0);
-                        if widgets::ghost_button(ui, p, app.t("刷新节点", "Refresh nodes")).clicked()
-                        {
-                            let _ = crate::ipc_client::rescan();
-                            app.reload_status();
-                            app.set_ok(app.t("已重新搜索", "Rescanned"));
-                        }
                         if !app.message.is_empty() {
                             let color = if app.message_ok { p.ok } else { p.danger };
                             ui.label(RichText::new(&app.message).size(11.0).color(color));

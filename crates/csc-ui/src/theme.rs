@@ -18,6 +18,7 @@ pub struct Palette {
     pub border: Color32,
     pub border_strong: Color32,
     pub accent: Color32,
+    #[allow(dead_code)] // reserved for pressed/hover accents
     pub accent_hover: Color32,
     pub accent_soft: Color32,
     pub ok: Color32,
@@ -28,23 +29,24 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// 应用中心暗黑：深灰底、卡片面、蓝强调（界面设计 §4.1 深色）。
+    /// Cursor-style settings: near-black canvas, raised cards, blue accent.
     pub fn app() -> Self {
         Self {
-            bg: Color32::from_rgb(0x1e, 0x1f, 0x22),
-            sidebar: Color32::from_rgb(0x2b, 0x2d, 0x31),
-            card: Color32::from_rgb(0x2b, 0x2d, 0x31),
-            card_hover: Color32::from_rgb(0x35, 0x38, 0x3e),
-            input: Color32::from_rgb(0x24, 0x26, 0x2a),
-            text: Color32::from_rgb(0xe6, 0xe7, 0xea),
-            text_2: Color32::from_rgb(0xa3, 0xa8, 0xb3),
-            border: Color32::from_rgb(0x3a, 0x3d, 0x44),
-            border_strong: Color32::from_rgb(0x4a, 0x4e, 0x56),
-            accent: Color32::from_rgb(0x5b, 0x8f, 0xf9),
-            accent_hover: Color32::from_rgb(0x4a, 0x7e, 0xe8),
-            accent_soft: Color32::from_rgba_unmultiplied(0x5b, 0x8f, 0xf9, 40),
-            ok: Color32::from_rgb(0x3c, 0xc2, 0x7a),
-            ok_soft: Color32::from_rgba_unmultiplied(0x3c, 0xc2, 0x7a, 40),
+            bg: Color32::from_rgb(0x14, 0x14, 0x14),
+            sidebar: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            card: Color32::from_rgb(0x21, 0x21, 0x21),
+            card_hover: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            // Recessed field well — darker than the card face.
+            input: Color32::from_rgb(0x16, 0x16, 0x16),
+            text: Color32::from_rgb(0xe8, 0xe8, 0xe8),
+            text_2: Color32::from_rgb(0x8b, 0x8b, 0x8b),
+            border: Color32::from_rgb(0x3a, 0x3a, 0x3a),
+            border_strong: Color32::from_rgb(0x4a, 0x4a, 0x4a),
+            accent: Color32::from_rgb(0x3b, 0x82, 0xf6),
+            accent_hover: Color32::from_rgb(0x25, 0x6e, 0xeb),
+            accent_soft: Color32::from_rgba_unmultiplied(0x3b, 0x82, 0xf6, 36),
+            ok: Color32::from_rgb(0x22, 0xc5, 0x5e),
+            ok_soft: Color32::from_rgba_unmultiplied(0x22, 0xc5, 0x5e, 40),
             warn: Color32::from_rgb(0xe0, 0xa2, 0x3b),
             danger: Color32::from_rgb(0xf0, 0x6a, 0x5d),
             on_accent: Color32::WHITE,
@@ -82,37 +84,42 @@ pub fn apply_style(ctx: &egui::Context, p: Palette) {
     v.panel_fill = p.bg;
     v.window_fill = p.card;
     v.extreme_bg_color = p.input;
-    v.faint_bg_color = Color32::from_rgb(0x28, 0x2a, 0x2e);
+    v.text_edit_bg_color = Some(p.input);
+    v.faint_bg_color = Color32::from_rgb(0x28, 0x28, 0x28);
     v.code_bg_color = p.input;
     v.hyperlink_color = p.accent;
     v.warn_fg_color = p.warn;
     v.error_fg_color = p.danger;
-    v.window_corner_radius = CornerRadius::same(8);
-    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(10);
     v.window_stroke = Stroke::new(1.0, p.border);
+    // Inset rounded fields (ports / text / combos).
+    let field_r = CornerRadius::same(10);
     v.widgets.noninteractive.bg_fill = p.card;
     v.widgets.noninteractive.weak_bg_fill = p.sidebar;
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text_2);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    v.widgets.inactive.bg_fill = p.card;
+    v.widgets.noninteractive.corner_radius = field_r;
+    v.widgets.inactive.bg_fill = p.input;
     v.widgets.inactive.weak_bg_fill = p.input;
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    v.widgets.inactive.corner_radius = CornerRadius::same(6);
-    v.widgets.hovered.bg_fill = p.card_hover;
-    v.widgets.hovered.weak_bg_fill = p.card_hover;
+    v.widgets.inactive.corner_radius = field_r;
+    v.widgets.hovered.bg_fill = p.input;
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x1c, 0x1c, 0x1c);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
-    v.widgets.hovered.corner_radius = CornerRadius::same(6);
-    v.widgets.active.bg_fill = p.accent_hover;
-    v.widgets.active.weak_bg_fill = p.accent;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, p.on_accent);
+    v.widgets.hovered.corner_radius = field_r;
+    v.widgets.active.bg_fill = p.input;
+    v.widgets.active.weak_bg_fill = p.input;
+    v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    v.widgets.active.corner_radius = CornerRadius::same(6);
-    v.widgets.open.bg_fill = p.card;
+    v.widgets.active.corner_radius = field_r;
+    v.widgets.open.bg_fill = p.input;
+    v.widgets.open.weak_bg_fill = p.input;
     v.widgets.open.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.open.bg_stroke = Stroke::new(1.0, p.accent);
-    v.widgets.open.corner_radius = CornerRadius::same(6);
+    v.widgets.open.corner_radius = field_r;
     v.selection.bg_fill = p.accent_soft;
     v.selection.stroke = Stroke::new(1.0, p.accent);
     v.button_frame = true;
@@ -121,14 +128,6 @@ pub fn apply_style(ctx: &egui::Context, p: Palette) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     ctx.set_style_of(egui::Theme::Light, style);
-}
-
-pub fn section_frame(p: &Palette) -> egui::Frame {
-    egui::Frame::new()
-        .fill(p.card)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(18, 16))
 }
 
 fn font_candidates() -> Vec<(std::path::PathBuf, u32)> {

@@ -95,10 +95,15 @@ pub fn take_raw_motion() -> Option<(i32, i32)> {
     if !RAW_OK.load(Ordering::Relaxed) {
         return None;
     }
-    Some((
+    let delta = (
         RAW_DX.swap(0, Ordering::AcqRel),
         RAW_DY.swap(0, Ordering::AcqRel),
-    ))
+    );
+    // XWayland only sees motion over X11 windows; libei carries all of it.
+    if super::wayland_session() && super::portal::ready() {
+        return None;
+    }
+    Some(delta)
 }
 
 pub fn paste_watch(enable: bool) {
@@ -253,7 +258,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
 });
 static STARTED: Mutex<Option<bool>> = Mutex::new(None);
 
-fn push(ev: Captured) {
+pub(super) fn push(ev: Captured) {
     let Ok(mut s) = SHARED.lock() else { return };
     if s.want.is_none() {
         return;
@@ -269,18 +274,22 @@ fn push(ev: Captured) {
 }
 
 /// Open the X display and start the capture thread. False without X11.
+/// On Wayland: true once the InputCapture portal session is enabled, which
+/// happens after the first `set_edges` from a keyboard host.
 pub fn start() -> bool {
+    if super::wayland_session() {
+        static UINPUT: std::sync::Once = std::sync::Once::new();
+        UINPUT.call_once(|| {
+            info!("Wayland session: controlled through /dev/uinput; host capture uses the InputCapture portal");
+            let _ = std::thread::Builder::new()
+                .name("uinput-access".into())
+                .spawn(super::uinput::grant_access);
+        });
+        return super::portal::ready();
+    }
     let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ok) = *started {
         return ok;
-    }
-    if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland")) {
-        warn!("Wayland session: X11 cannot grab native windows; this screen is controlled through /dev/uinput and does not ask for remote interaction");
-        let _ = std::thread::Builder::new()
-            .name("uinput-access".into())
-            .spawn(super::uinput::grant_access);
-        *started = Some(false);
-        return false;
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -302,6 +311,39 @@ pub fn start() -> bool {
     }
     *started = Some(ok);
     ok
+}
+
+static PORTAL_TRIED: AtomicBool = AtomicBool::new(false);
+
+/// Wayland keyboard host: put pointer barriers on the desktop sides that lead
+/// to another computer. The first call opens the InputCapture portal session.
+pub fn set_edges(edges: super::portal::Edges) {
+    if !super::wayland_session() {
+        return;
+    }
+    if !PORTAL_TRIED.swap(true, Ordering::AcqRel) {
+        let size = super::xdo::screen_size().unwrap_or((1920, 1080));
+        if !super::portal::start(size) {
+            warn!(
+                "Wayland keyboard host without the InputCapture portal (GNOME 45+ or \
+                 KDE Plasma 6.1+): screen edges cannot be detected"
+            );
+        }
+    }
+    super::portal::set_edges(edges);
+}
+
+/// Give the pointer back to this computer at `at`; only the portal path needs it.
+pub fn return_to(at: Option<(i32, i32)>) {
+    if super::wayland_session() {
+        super::portal::release(at);
+    }
+}
+
+/// True when the desktop ended a portal capture on its own (for example a
+/// compositor shortcut) while the core still forwards input.
+pub fn released_by_desktop() -> bool {
+    super::wayland_session() && super::portal::ready() && !super::portal::active()
 }
 
 pub fn set_grab(grab: bool, park: Option<(i32, i32)>) {

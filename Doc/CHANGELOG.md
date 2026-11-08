@@ -6,8 +6,24 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **穿屏与配对后连接状态抖动。** `3c923cd` 起配对码按 IP 直拨、发现按主机名拨号，同一台电脑会出现两条控制会话；IP→主机名 rekey 会误杀已有会话，界面不停「已连接/断开」，边缘切换因 `has_peer` 不稳而穿不过去。现在同一 IP 只保留一条会话，rekey 不再踢掉已有主机名会话，断开通知在仍有存活链路时抑制；`connected` 在 TCP 会话建立后立即为真（不再只等 HELLO 的 greeted 名）。
+- **日志等级过滤器按设置生效。** 默认仍是 `info`（`default_log_level` / `log.level` 不变）。用户在设置里选 `debug` 时，全局用该等级，所有模块的 DEBUG/INFO/WARN/ERROR 都会写出（兼容 `csc_core` / 旧名 `Cross_SystemConnect_core`）。配对拨号早退、PairCommit/Confirm、offer 映射失败等路径补齐 debug。
+- **谁输入配对码谁发起连接。** 输入六位码的这台机器必须主动拨出；发现侧未完成 HELLO 的 TCP 不得吞掉配对拨号。配对拨号会顶替未完成会话，发现/重拨在配对目标 IP 上让路。
+- **配对拨号不再卡死发现循环。** `session_keys_for_ip` / `session_key_for_ip` 不再在持有 `last_peers` 锁时 `.await`（避免与会话任务形成死锁）；`try_dial_offer_ip` 改为 spawn，发现 select 不会被拨号堵住。发现侧 `PairRequest` 若本机尚未输入配对码则立即拒绝，不再空等 120 秒在发现套接字上发 PairCommit。
+- **配对成功后自动进桌面布局。** 信任对端时补上屏幕位并刷新 switch 邻接，避免有会话却无邻居。
+- **GNOME Wayland 当主机能穿屏。** 用 InputCapture portal 放指针屏障、libei 收键鼠（参照 Deskflow）。屏障改为在会话未启用时设置（`Disable → SetPointerBarriers → Enable`），以前 mutter 一律拒绝（“Session already enabled”）。portal ≥ 2 时保存恢复令牌免弹窗；GNOME 50 只有 version 1，每次启动 core 仍会弹「捕获输入」（架构设计 §13.2）。
+- **穿屏后指针跳动。** 远端态只用 libei 位移，丢弃 XWayland 的 XI2 原始位移；libei 位移按 区域→core 像素比例换算（例 ×2）。
+- **配对码只能用一次。** 用过后码的持有方自动换新码。
+
+### 新增
+
+- 诊断：debug 日志每秒记录 `libei motion` / `pointer moves sent` 的事件数与最长间隔（架构设计 §4.1、§11.1）。
+
 ### 变更
 
+- **指针灵敏度改为滑块 + 输入框。** 首页「已信任设备」每行：滑块 0.6–2.0、步进 0.2，右侧可输入精确值；修正该列对齐。
 - **设置窗与传输进度窗改为 eframe/egui。** 去掉 tao/wry 与内嵌 HTML；Windows 不再需要 WebView2 Runtime。托盘仍用 tray-icon（Windows）/ ksni（Linux），绿点闪烁逻辑不变。内核与 IPC 不变。
 
 ## [0.2.3] - 2026-11-06

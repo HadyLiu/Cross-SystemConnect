@@ -19,15 +19,18 @@ pub struct LogControl {
 }
 
 fn filter_for(level: &str) -> EnvFilter {
-    let level = if level.trim().is_empty() {
+    let lowered = level.trim().to_ascii_lowercase();
+    let level = if lowered.is_empty() {
         "info"
     } else {
-        level.trim()
+        lowered.as_str()
     };
-    EnvFilter::try_new(format!(
-        "info,Cross_SystemConnect_core={level},csc_platform={level},csc_config={level}"
-    ))
-    .unwrap_or_else(|_| EnvFilter::new("info"))
+    // Global level = user setting so `debug` shows every crate's DEBUG/INFO/WARN/ERROR.
+    // Keep legacy binary crate name and current package names so reloads still match.
+    let expr = format!(
+        "{level},Cross_SystemConnect_core={level},csc_core={level},csc_platform={level},csc_config={level},csc_proto={level}"
+    );
+    EnvFilter::try_new(&expr).unwrap_or_else(|_| EnvFilter::new(level))
 }
 
 /// The configured file, or the fallback when it cannot be opened.
@@ -61,6 +64,8 @@ impl LogControl {
             .with(
                 fmt::layer()
                     .with_ansi(false)
+                    .with_target(true)
+                    .with_level(true)
                     .with_writer(move || writer.clone()),
             )
             .try_init();

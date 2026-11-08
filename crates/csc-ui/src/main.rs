@@ -106,6 +106,7 @@ fn main() -> eframe::Result {
         .with_inner_size([880.0, 580.0])
         .with_min_inner_size([760.0, 500.0])
         .with_decorations(false)
+        .with_transparent(true)
         .with_app_id("cross-systemconnect");
     if let Some(icon) = icon::egui_icon_data() {
         viewport = viewport.with_icon(icon);

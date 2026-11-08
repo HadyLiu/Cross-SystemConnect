@@ -31,8 +31,10 @@ pub struct App {
     pub message_ok: bool,
     pub pair_digits: [String; 6],
     pub last_pair_sent: String,
-    pub desk_pick: Option<(i32, i32)>,
-    pub desk_pending: Option<String>,
+    /// Peer being dragged on the topology desk: name + pointer grab offset.
+    pub desk_drag: Option<(String, egui::Vec2)>,
+    /// Free-drag center while moving a peer (desk-local coords).
+    pub desk_drag_pos: Option<egui::Pos2>,
     pub log_text: String,
     pub transfer: TransferUi,
     /// Sidebar / about logo from `resources/app.png`.
@@ -121,8 +123,8 @@ impl App {
             message_ok: true,
             pair_digits: std::array::from_fn(|_| String::new()),
             last_pair_sent: String::new(),
-            desk_pick: None,
-            desk_pending: None,
+            desk_drag: None,
+            desk_drag_pos: None,
             log_text: String::new(),
             transfer: TransferUi::default(),
             logo,
@@ -176,6 +178,7 @@ impl App {
     }
 
     pub fn reload_status(&mut self) {
+        let before = trust_sync_key(&self.status);
         match crate::ipc_client::get_status() {
             Ok(v) => self.status = v,
             Err(e) => {
@@ -187,6 +190,31 @@ impl App {
             }
         }
         self.last_status_at = Instant::now();
+        // Core writes trusted_peers on pin/remember; refresh so the device list
+        // and topology unplaced names update without a manual save.
+        let after = trust_sync_key(&self.status);
+        if before != after {
+            self.sync_trusted_from_core();
+        }
+    }
+
+    /// Pull trusted peers (and screens when idle) from core after a link change.
+    fn sync_trusted_from_core(&mut self) {
+        let Ok(v) = crate::ipc_client::get_config() else {
+            return;
+        };
+        let Ok(remote) = serde_json::from_value::<Config>(v) else {
+            return;
+        };
+        self.cfg.trusted_peers = remote.trusted_peers;
+        self.cfg.peer_fingerprints = remote.peer_fingerprints;
+        if !self.save_pending {
+            self.cfg.screens = remote.screens;
+            self.cfg.layout = remote.layout;
+            if self.cfg.ensure_trusted_screen_places() {
+                self.queue_save();
+            }
+        }
     }
 
     pub fn reload_config(&mut self) {
@@ -214,6 +242,8 @@ impl App {
             return;
         }
         self.save_pending = false;
+        // Rebuild switch edges from desk placements before writing.
+        self.cfg.sync_layout_from_screens();
         let Ok(body) = serde_json::to_value(&self.cfg) else {
             self.set_err("serialize config failed");
             return;
@@ -221,7 +251,7 @@ impl App {
         match crate::ipc_client::save_config(body) {
             Ok(_) => {
                 self.reload_config();
-                let _ = crate::ipc_client::rescan();
+                // Do not rescan here — rediscovery after every save flaps dual-dial sessions.
                 self.reload_status();
                 self.set_ok(self.t("已保存", "Saved"));
                 self.refresh_tray_labels();
@@ -341,7 +371,8 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        crate::theme::Palette::app().bg.to_normalized_gamma_f32()
+        // Transparent so the painted rounded window chrome shows through.
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -411,6 +442,33 @@ fn load_config() -> Config {
         Ok(v) => serde_json::from_value(v).unwrap_or_default(),
         Err(_) => Config::default(),
     }
+}
+
+/// Detect when core likely wrote trust / link state that the UI config cache misses.
+fn trust_sync_key(status: &Value) -> String {
+    let connected = status
+        .get("connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let peer = status
+        .get("peerName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let host_state = status
+        .get("hostState")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let pending = status
+        .get("pendingPeer")
+        .and_then(|p| p.get("hostName"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let discovered = status
+        .get("discovered")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    format!("{connected}|{peer}|{host_state}|{pending}|{discovered}")
 }
 
 /// What should pop the settings window: a client asking to connect, or a

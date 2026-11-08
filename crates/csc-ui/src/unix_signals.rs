@@ -11,14 +11,8 @@ pub fn install() {
         QUIT_REQUESTED.store(true, Ordering::SeqCst);
     }
     unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            on_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            on_signal as *const () as libc::sighandler_t,
-        );
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
 
     let _ = std::thread::Builder::new()

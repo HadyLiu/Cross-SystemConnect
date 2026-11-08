@@ -253,10 +253,6 @@ pub fn resolve_conflict(id: u64, decisions: Value) -> anyhow::Result<Value> {
     )
 }
 
-pub fn rescan() -> anyhow::Result<Value> {
-    call("rescan", json!({}))
-}
-
 #[allow(dead_code)]
 pub fn open_pairing() -> anyhow::Result<Value> {
     call("open_pairing", json!({}))

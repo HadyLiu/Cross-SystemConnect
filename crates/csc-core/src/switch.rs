@@ -354,6 +354,22 @@ impl SwitchController {
     }
 
     /// Neighbor of the active remote screen on `edge`, if the layout has one.
+    /// Sides of this screen (left, right, top, bottom) that lead to a neighbor.
+    /// A corner neighbor needs both sides that meet there.
+    pub fn local_sides(&self) -> (bool, bool, bool, bool) {
+        let leads = |e: Edge| self.layout.neighbor(&self.local_name, e).is_some();
+        let tl = leads(Edge::TopLeft);
+        let tr = leads(Edge::TopRight);
+        let bl = leads(Edge::BottomLeft);
+        let br = leads(Edge::BottomRight);
+        (
+            leads(Edge::Left) || tl || bl,
+            leads(Edge::Right) || tr || br,
+            leads(Edge::Top) || tl || tr,
+            leads(Edge::Bottom) || bl || br,
+        )
+    }
+
     pub fn neighbor_from_active(&self, edge: Edge) -> Option<String> {
         if self.active_remote.is_empty() {
             return None;

@@ -82,8 +82,8 @@ pub struct HelloPorts {
 impl Default for HelloPorts {
     fn default() -> Self {
         Self {
-            control: 24900,
-            data: 24901,
+            control: 45277,
+            data: 45278,
         }
     }
 }

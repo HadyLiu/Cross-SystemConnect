@@ -290,16 +290,16 @@ pub struct HotkeyConfig {
 }
 
 fn default_lock() -> String {
-    "Ctrl+Alt+Shift+L".into()
+    "Ctrl+Shift+L".into()
 }
 fn default_lock_to_screen() -> String {
-    "Ctrl+Alt+Shift+K".into()
+    "Ctrl+Shift+K".into()
 }
 fn default_return() -> String {
     "Ctrl+Alt+/".into()
 }
 fn default_emergency_pause() -> String {
-    "Ctrl+Alt+Shift+P".into()
+    "Ctrl+Shift+P".into()
 }
 /// Keys of earlier versions, replaced wherever they are still found.
 const RETIRED_RETURN_KEY: &str = "Ctrl+Alt+Home";
@@ -514,7 +514,8 @@ impl Default for PowerConfig {
 /// layout[host][edge] = neighbor
 pub type LayoutMap = BTreeMap<String, BTreeMap<String, String>>;
 
-/// One screen block. `x`/`y` are pixels from the keyboard host at the center; up is negative `y`.
+/// One screen block. `x`/`y` are offsets from the keyboard host at (0,0); up is negative `y`.
+/// Values are usually ring slots (−1…1); farther peers may stack as multiples of a slot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScreenPlace {
     pub name: String,
@@ -522,6 +523,102 @@ pub struct ScreenPlace {
     pub x: i32,
     #[serde(default)]
     pub y: i32,
+}
+
+/// Ring-1 empty slots around the host (right, left, bottom, top, then corners).
+pub const SCREEN_SLOTS: [(i32, i32); 8] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (-1, 1),
+    (1, -1),
+    (-1, -1),
+];
+
+/// Which edge of the host a place sits on (same rules as the old desk UI).
+pub fn sector_of(x: i32, y: i32) -> &'static str {
+    let ax = x.unsigned_abs();
+    let ay = y.unsigned_abs();
+    let horiz = ax as f32 >= ay as f32 * 0.55;
+    let vert = ay as f32 >= ax as f32 * 0.55;
+    if horiz && vert {
+        if y < 0 {
+            if x >= 0 {
+                "top_right"
+            } else {
+                "top_left"
+            }
+        } else if x >= 0 {
+            "bottom_right"
+        } else {
+            "bottom_left"
+        }
+    } else if ax >= ay {
+        if x >= 0 {
+            "right"
+        } else {
+            "left"
+        }
+    } else if y >= 0 {
+        "bottom"
+    } else {
+        "top"
+    }
+}
+
+fn opposite_edge(edge: &str) -> &'static str {
+    match edge {
+        "right" => "left",
+        "left" => "right",
+        "top" => "bottom",
+        "bottom" => "top",
+        "top_right" => "bottom_left",
+        "top_left" => "bottom_right",
+        "bottom_right" => "top_left",
+        "bottom_left" => "top_right",
+        _ => "left",
+    }
+}
+
+/// Nearest free ring slot for `name`. Occupied slots (other names) are skipped.
+pub fn nearest_screen_slot(x: i32, y: i32, name: &str, places: &[ScreenPlace]) -> (i32, i32) {
+    let taken: std::collections::HashSet<(i32, i32)> = places
+        .iter()
+        .filter(|p| !p.name.eq_ignore_ascii_case(name))
+        .map(|p| (p.x, p.y))
+        .collect();
+    let mut best = None;
+    let mut best_d = i64::MAX;
+    for &(sx, sy) in &SCREEN_SLOTS {
+        if taken.contains(&(sx, sy)) {
+            continue;
+        }
+        let d = i64::from(sx - x).pow(2) + i64::from(sy - y).pow(2);
+        if d < best_d {
+            best_d = d;
+            best = Some((sx, sy));
+        }
+    }
+    if let Some(slot) = best {
+        return slot;
+    }
+    let mut near = SCREEN_SLOTS[0];
+    let mut nd = i64::MAX;
+    for &(sx, sy) in &SCREEN_SLOTS {
+        let d = i64::from(sx - x).pow(2) + i64::from(sy - y).pow(2);
+        if d < nd {
+            nd = d;
+            near = (sx, sy);
+        }
+    }
+    let side = sector_of(near.0, near.1);
+    let n = places
+        .iter()
+        .filter(|p| !p.name.eq_ignore_ascii_case(name) && sector_of(p.x, p.y) == side)
+        .count() as i32;
+    (near.0 * (n + 1), near.1 * (n + 1))
 }
 
 /// Version written by this build. Files without the field are version 1.
@@ -609,10 +706,13 @@ fn default_bind() -> String {
     "0.0.0.0".into()
 }
 fn default_control_port() -> u16 {
-    24900
+    45277
 }
 fn default_data_port() -> u16 {
-    24901
+    45278
+}
+fn default_discovery_port() -> u16 {
+    45433
 }
 
 impl Default for Config {
@@ -642,7 +742,7 @@ impl Default for Config {
             pointer: PointerConfig::default(),
             log: LogConfig::default(),
             network: NetworkExtras {
-                discovery_port: default_control_port(),
+                discovery_port: default_discovery_port(),
                 ..NetworkExtras::default()
             },
             limits: LimitsConfig::default(),
@@ -864,7 +964,8 @@ impl Config {
                 cfg.hotkeys.return_to_server, cfg.hotkeys.lock_screen
             );
         }
-        if upgraded || retired {
+        let fingerprints_trusted = cfg.ensure_fingerprints_trusted();
+        if upgraded || retired || fingerprints_trusted {
             if let Err(e) = cfg.save(path) {
                 warn!("Failed to persist upgraded config: {e}");
             }
@@ -1090,14 +1191,153 @@ impl Config {
         }
         if let Some(existing) = self.peer_fingerprint(host) {
             if existing.eq_ignore_ascii_case(&fp) {
+                // Already pinned — still ensure it appears in trusted_peers / topology.
+                self.trust_peer(host);
                 return Ok(());
             }
             return Err(format!(
                 "certificate for {host} changed; refusing the connection"
             ));
         }
-        self.peer_fingerprints.insert(host.to_string(), fp);
+        self.remember_peer(host, &fp);
         Ok(())
+    }
+
+    /// Older builds could pin a fingerprint without listing the name as trusted.
+    pub fn ensure_fingerprints_trusted(&mut self) -> bool {
+        let mut changed = false;
+        let names: Vec<String> = self.peer_fingerprints.keys().cloned().collect();
+        for name in names {
+            if self.trust_peer(&name) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Build the switch adjacency map from desk placements (host at 0,0).
+    pub fn layout_from_screens(&self) -> LayoutMap {
+        let host = if self.name.trim().is_empty() {
+            "本机".to_string()
+        } else {
+            self.name.trim().to_string()
+        };
+        let peers: Vec<&ScreenPlace> = self
+            .screens
+            .iter()
+            .filter(|s| !s.name.is_empty() && !s.name.eq_ignore_ascii_case(&host))
+            .filter(|s| !(s.x == 0 && s.y == 0))
+            .collect();
+        let mut groups: BTreeMap<&str, Vec<&ScreenPlace>> = BTreeMap::new();
+        for p in peers {
+            groups.entry(sector_of(p.x, p.y)).or_default().push(p);
+        }
+        let mut out = LayoutMap::new();
+        let mut link = |a: &str, edge: &str, b: &str| {
+            out.entry(a.to_string())
+                .or_default()
+                .insert(edge.to_string(), b.to_string());
+        };
+        for (side, mut list) in groups {
+            list.sort_by_key(|p| i64::from(p.x).pow(2) + i64::from(p.y).pow(2));
+            let back = opposite_edge(side);
+            if list.is_empty() {
+                continue;
+            }
+            link(&host, side, &list[0].name);
+            link(&list[0].name, back, &host);
+            for i in 0..list.len().saturating_sub(1) {
+                link(&list[i].name, side, &list[i + 1].name);
+                link(&list[i + 1].name, back, &list[i].name);
+            }
+        }
+        out
+    }
+
+    /// Replace `layout` from current `screens` placements.
+    pub fn sync_layout_from_screens(&mut self) {
+        self.layout = self.layout_from_screens();
+    }
+
+    /// Ensure every trusted peer (except self) has a desk slot; drop orphans
+    /// that are no longer trusted. Returns true if anything changed.
+    pub fn ensure_trusted_screen_places(&mut self) -> bool {
+        let host = self.name.trim().to_string();
+        let peers: Vec<String> = self
+            .trusted_peers
+            .iter()
+            .filter(|n| !n.eq_ignore_ascii_case(&host))
+            .cloned()
+            .collect();
+        let mut changed = false;
+
+        // Drop desk tiles for computers that are no longer trusted (forget /
+        // reset left screens behind, which showed up as ghost topology nodes).
+        let before = self.screens.len();
+        self.screens.retain(|s| {
+            s.name.eq_ignore_ascii_case(&host)
+                || peers.iter().any(|p| p.eq_ignore_ascii_case(&s.name))
+        });
+        if self.screens.len() != before {
+            changed = true;
+        }
+
+        for name in &peers {
+            if self
+                .screens
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let (x, y) = nearest_screen_slot(1, 0, name, &self.screens);
+            self.screens.push(ScreenPlace {
+                name: name.clone(),
+                x,
+                y,
+            });
+            changed = true;
+        }
+
+        // Keep host marker at center when any peer is placed; clear host-only
+        // leftover when the desk is empty.
+        let host_name = if host.is_empty() {
+            "本机".to_string()
+        } else {
+            host
+        };
+        let has_peer_tile = self
+            .screens
+            .iter()
+            .any(|s| !s.name.eq_ignore_ascii_case(&host_name));
+        if has_peer_tile {
+            if !self
+                .screens
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(&host_name) && s.x == 0 && s.y == 0)
+            {
+                self.screens
+                    .retain(|s| !s.name.eq_ignore_ascii_case(&host_name));
+                self.screens.insert(
+                    0,
+                    ScreenPlace {
+                        name: host_name,
+                        x: 0,
+                        y: 0,
+                    },
+                );
+                changed = true;
+            }
+        } else if !self.screens.is_empty() {
+            // No trusted peers — don't keep a lone host marker on the desk.
+            self.screens.clear();
+            changed = true;
+        }
+
+        if changed {
+            self.sync_layout_from_screens();
+        }
+        changed
     }
 
     /// Drop a remembered computer. The next connection has to pair again.
@@ -1108,10 +1348,18 @@ impl Config {
         }
         let peers = self.trusted_peers.len();
         let prints = self.peer_fingerprints.len();
+        let screens = self.screens.len();
         self.trusted_peers.retain(|h| !h.eq_ignore_ascii_case(host));
         self.peer_fingerprints
             .retain(|name, _| !name.eq_ignore_ascii_case(host));
-        peers != self.trusted_peers.len() || prints != self.peer_fingerprints.len()
+        self.screens.retain(|s| !s.name.eq_ignore_ascii_case(host));
+        let dropped = peers != self.trusted_peers.len()
+            || prints != self.peer_fingerprints.len()
+            || screens != self.screens.len();
+        if dropped {
+            self.sync_layout_from_screens();
+        }
+        dropped
     }
 }
 
@@ -1186,15 +1434,112 @@ mod tests {
 
     #[test]
     fn forget_peer_drops_name_and_fingerprint() {
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            name: "Host".into(),
+            ..Default::default()
+        };
         cfg.remember_peer("Desk", "aa");
         cfg.pin_peer("Other", "bb").unwrap();
+        cfg.screens = vec![
+            ScreenPlace {
+                name: "Host".into(),
+                x: 0,
+                y: 0,
+            },
+            ScreenPlace {
+                name: "Desk".into(),
+                x: 1,
+                y: 0,
+            },
+            ScreenPlace {
+                name: "Other".into(),
+                x: 0,
+                y: 1,
+            },
+        ];
         assert!(!cfg.forget_peer("  "));
         assert!(cfg.forget_peer("desk"));
         assert!(!cfg.is_trusted_peer("Desk"));
         assert!(cfg.peer_fingerprint("Desk").is_none());
         assert!(cfg.peer_fingerprint("Other").is_some());
+        assert!(!cfg
+            .screens
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case("Desk")));
+        assert!(cfg
+            .screens
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case("Other")));
         assert!(!cfg.forget_peer("desk"));
+    }
+
+    #[test]
+    fn ensure_trusted_screen_places_prunes_orphans() {
+        let mut cfg = Config {
+            name: "Host".into(),
+            screens: vec![
+                ScreenPlace {
+                    name: "Host".into(),
+                    x: 0,
+                    y: 0,
+                },
+                ScreenPlace {
+                    name: "Ghost".into(),
+                    x: 1,
+                    y: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(cfg.ensure_trusted_screen_places());
+        assert!(cfg.screens.is_empty());
+        assert!(cfg.layout.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_only_peers_are_listed_as_trusted() {
+        let mut cfg = Config::default();
+        cfg.peer_fingerprints
+            .insert("Legacy-PC".into(), "abcd".into());
+        assert!(!cfg.is_trusted_peer("Legacy-PC"));
+        assert!(cfg.ensure_fingerprints_trusted());
+        assert!(cfg.is_trusted_peer("Legacy-PC"));
+        assert!(!cfg.ensure_fingerprints_trusted());
+    }
+
+    #[test]
+    fn layout_from_screens_links_host_and_peer() {
+        let cfg = Config {
+            name: "Host".into(),
+            screens: vec![
+                ScreenPlace {
+                    name: "Host".into(),
+                    x: 0,
+                    y: 0,
+                },
+                ScreenPlace {
+                    name: "Peer".into(),
+                    x: 1,
+                    y: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let layout = cfg.layout_from_screens();
+        assert_eq!(
+            layout
+                .get("Host")
+                .and_then(|e| e.get("right"))
+                .map(|s| s.as_str()),
+            Some("Peer")
+        );
+        assert_eq!(
+            layout
+                .get("Peer")
+                .and_then(|e| e.get("left"))
+                .map(|s| s.as_str()),
+            Some("Host")
+        );
     }
 
     #[test]
@@ -1255,7 +1600,7 @@ mod tests {
         .unwrap();
         let cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
             .contains("toggle_enable"));
@@ -1269,7 +1614,7 @@ mod tests {
         let mut cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.config_version, 5);
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         assert!(cfg.peer_fingerprints.is_empty());
         assert!(!cfg.device_id.is_empty());
         assert_eq!(cfg.network.discovery_port, 25000);
@@ -1289,7 +1634,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
-        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Alt+Shift+L");
+        assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

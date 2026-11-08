@@ -277,6 +277,13 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                         cfg.data_port = before_data;
                         return IpcResponse::err(req.id, "端口已被占用");
                     }
+                    // Desk placements are the source of truth for edge switching.
+                    if before_screens != cfg.screens
+                        || (cfg.layout.is_empty()
+                            && cfg.screens.iter().any(|s| s.x != 0 || s.y != 0))
+                    {
+                        cfg.sync_layout_from_screens();
+                    }
                     match cfg.save(&state.config_path) {
                         Ok(()) => {
                             if before_log != cfg.log {
@@ -350,8 +357,17 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             }
             let mut cfg = state.config.write().await;
             let removed = cfg.forget_peer(&host);
+            // Orphans left after a partial forget / older builds.
+            let pruned = cfg.ensure_trusted_screen_places();
             match cfg.save(&state.config_path) {
-                Ok(()) => IpcResponse::ok(req.id, json!({"ok": true, "removed": removed})),
+                Ok(()) => {
+                    drop(cfg);
+                    if removed || pruned {
+                        state.layout_reload.send_modify(|n| *n = n.wrapping_add(1));
+                        state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+                    }
+                    IpcResponse::ok(req.id, json!({"ok": true, "removed": removed}))
+                }
                 Err(e) => IpcResponse::err(req.id, e.to_string()),
             }
         }
@@ -451,8 +467,10 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "roll_home_code" => {
+            let search = state.config.read().await.search_address.clone();
             let mut s = state.status.write().await;
-            crate::rotate_home(&mut s);
+            let ip = crate::home_code_ip(&search, &s.local_ipv4);
+            crate::rotate_home(&mut s, &ip);
             let until = s.home_code_until;
             drop(s);
             info!("home pairing code changed");
@@ -476,11 +494,13 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 .unwrap_or(0)
                 .saturating_add(120);
             let mut s = state.status.write().await;
-            s.offer_code = code;
+            s.offer_code = code.clone();
             s.offer_until = until;
             s.offer_gen = s.offer_gen.wrapping_add(1);
+            s.peer_note = "正在连接…".into();
             drop(s);
-            info!("pairing code entered; connecting");
+            info!(code = %code, "pairing code entered; connecting by encoded IP");
+            tracing::debug!(code = %code, "pair_offer: offer_gen bumped — net loop should dial");
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
         "open_pairing" => {
@@ -702,12 +722,21 @@ async fn refresh_status_from_config(state: &AppState, cfg: &Config) {
         csc_config::Role::Server => "server".into(),
         csc_config::Role::Client => "client".into(),
     };
-    s.discovery_port = cfg.control_port;
+    s.discovery_port = if cfg.network.discovery_port == 0 {
+        cfg.control_port
+    } else {
+        cfg.network.discovery_port
+    };
     s.link_state = match cfg.role {
         csc_config::Role::Server => "searching".into(),
         csc_config::Role::Client => "announcing".into(),
     };
     if !s.connected {
         s.active_screen = cfg.name.clone();
+    }
+    // Pairing code suffix tracks the selected NIC’s last IPv4 octet.
+    let ip = crate::home_code_ip(&cfg.search_address, &s.local_ipv4);
+    if !ip.is_empty() {
+        crate::sync_home_code_ip(&mut s, &ip);
     }
 }

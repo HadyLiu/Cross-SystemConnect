@@ -5,6 +5,7 @@ pub(crate) mod fullscreen;
 pub mod grab;
 pub(crate) mod leds;
 pub(crate) mod paste_hold;
+pub mod portal;
 pub(crate) mod power;
 pub(crate) mod uinput;
 mod xdo;
@@ -171,7 +172,12 @@ impl ScreenInfo for LinuxScreenInfo {
     }
 }
 
+/// On a Wayland host with the portal, XWayland's pointer is stale outside X11
+/// windows; edges come from barrier hits instead.
 pub(crate) fn pointer_pos() -> Option<(i32, i32)> {
+    if wayland_session() && portal::ready() {
+        return None;
+    }
     xdo::pointer()
 }
 
@@ -184,6 +190,9 @@ pub(crate) fn primary_button_down() -> bool {
 }
 
 pub(crate) fn warp_cursor(x: i32, y: i32) {
+    if wayland_session() && portal::ready() {
+        return;
+    }
     if wayland_session() {
         if let Some((cx, cy)) = xdo::pointer() {
             uinput::move_rel(x - cx, y - cy);

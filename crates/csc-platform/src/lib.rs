@@ -7,6 +7,7 @@ pub mod keymap;
 mod keyrepeat;
 mod lock;
 mod notify;
+mod rate;
 mod traits;
 pub mod vdrag;
 
@@ -14,6 +15,7 @@ pub use lock::{
     lock_hits, lock_screen, lock_watch, mods_held, pause_hits, pause_watch, stay_hits, stay_watch,
 };
 pub use notify::notify;
+pub use rate::RateStats;
 
 /// The machine is about to sleep, shutting down, or has woken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +370,53 @@ pub fn capture_set_grab(grab: bool, park: Option<(i32, i32)>) {
     linux::grab::set_grab(grab, park);
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     let _ = (grab, park);
+}
+
+/// Desktop sides of this keyboard host that lead to another computer. Where
+/// the compositor owns the pointer (Wayland), these become pointer barriers.
+pub fn capture_set_edges(left: bool, right: bool, top: bool, bottom: bool) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::grab::set_edges(linux::portal::Edges {
+        left,
+        right,
+        top,
+        bottom,
+    });
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = (left, right, top, bottom);
+}
+
+/// Where the pointer crossed a barrier, in desktop pixels, once per crossing.
+/// Only Wayland hosts report this; elsewhere the core reads the cursor itself.
+pub fn capture_edge_hit() -> Option<(i32, i32)> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::portal::take_hit()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        None
+    }
+}
+
+/// Hand a compositor-owned capture back, placing the cursor at `at`.
+pub fn capture_return_to(at: Option<(i32, i32)>) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::grab::return_to(at);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = at;
+}
+
+/// True when the desktop ended the capture by itself while it was forwarding.
+pub fn capture_released_by_desktop() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::grab::released_by_desktop()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        false
+    }
 }
 
 /// Input captured since the last call.

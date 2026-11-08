@@ -1,7 +1,8 @@
 use crate::app::App;
 use crate::theme::Palette;
 use crate::ui::widgets::{
-    self, field_width, form_row, mac_drag, mac_text_edit, mac_toggle, two_col,
+    self, field_width, mac_number, mac_number_with, mac_text_edit, mac_toggle, outline_button,
+    section_heading, settings_card, settings_card_body,
 };
 use eframe::egui::{self, RichText};
 
@@ -17,562 +18,627 @@ fn pal() -> Palette {
     Palette::app()
 }
 
-fn card_title(ui: &mut egui::Ui, p: &Palette, title: &str) {
-    ui.label(
-        RichText::new(title)
-            .size(widgets::FORM_FONT + 1.0)
-            .strong()
-            .color(p.text),
-    );
-    ui.add_space(12.0);
-}
-
-/// Doc/y.html tab-sharing: two-column clipboard + file transfer.
+/// 共享与文件 — Cursor 风格分区卡片。
 pub fn draw_sharing(app: &mut App, ui: &mut egui::Ui) {
     let p = pal();
-    two_col(ui, |left, right| {
-        draw_clipboard_card(app, left, &p);
-        draw_transfer_card(app, right, &p);
-    });
-}
 
-fn draw_clipboard_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("剪贴板无缝同步", "Clipboard sync"));
-        form_row(
-            ui,
-            p,
+    section_heading(ui, &p, tr("剪贴板", "Clipboard"));
+    settings_card(ui, &p, |list| {
+        list.row(
             tr("启用剪贴板共享", "Enable clipboard"),
-            |ui| {
-                if mac_toggle(ui, p, &mut app.cfg.clipboard.enabled).clicked() {
-                    app.queue_save();
-                }
-            },
-        );
-        form_row(ui, p, tr("同步内容格式", "Formats"), |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(&mut app.cfg.clipboard.text, tr("富文本", "Rich text"))
-                    .changed()
-                {
-                    app.queue_save();
-                }
-                if ui
-                    .checkbox(&mut app.cfg.clipboard.image, tr("图像/截图", "Images"))
-                    .changed()
-                {
-                    app.queue_save();
-                }
-            });
-        });
-        form_row(ui, p, tr("文字上限 (MB)", "Text limit (MB)"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.clipboard.max_inline_mb).range(1..=15),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("发送时机", "When to send"), |ui| {
-            egui::ComboBox::from_id_salt("push_mode")
-                .selected_text(if app.cfg.clipboard.push_mode == "on_switch" {
-                    tr("切到该电脑时", "On switch")
-                } else {
-                    tr("立即发送", "Immediate")
-                })
-                .width(field_width(ui))
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_value(
-                            &mut app.cfg.clipboard.push_mode,
-                            "immediate".into(),
-                            tr("立即发送", "Immediate"),
-                        )
-                        .changed()
-                    {
-                        app.queue_save();
-                    }
-                    if ui
-                        .selectable_value(
-                            &mut app.cfg.clipboard.push_mode,
-                            "on_switch".into(),
-                            tr("切到该电脑时", "On switch"),
-                        )
-                        .changed()
-                    {
-                        app.queue_save();
-                    }
-                });
-        });
-    });
-}
-
-fn draw_transfer_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("跨屏拖拽文件传输", "Cross-screen file transfer"));
-        form_row(ui, p, tr("启用跨屏传输", "Enable transfer"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.file_transfer.enabled).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(
-            ui,
-            p,
-            tr("单文件上限 (MB)", "Per-file limit (MB)"),
-            |ui| {
-                if mac_drag(
-                    ui,
-                    egui::DragValue::new(&mut app.cfg.file_transfer.max_size_mb).speed(10.0),
-                )
-                .changed()
-                {
-                    app.queue_save();
-                }
-            },
-        );
-        form_row(ui, p, tr("剪贴板文件", "Clipboard files"), |ui| {
-            if ui
-                .checkbox(
-                    &mut app.cfg.clipboard.files,
-                    tr("Ctrl+V 传输", "Transfer via Ctrl+V"),
-                )
-                .changed()
-            {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("限速", "Speed limit"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.file_transfer.limit_speed).clicked() {
-                app.queue_save();
-            }
-            if app.cfg.file_transfer.limit_speed {
-                ui.add_space(8.0);
-                if mac_drag(
-                    ui,
-                    egui::DragValue::new(&mut app.cfg.file_transfer.max_speed_mibs)
-                        .range(1..=10_000)
-                        .suffix(" MiB/s"),
-                )
-                .changed()
-                {
-                    app.queue_save();
-                }
-            }
-        });
-    });
-}
-
-/// 切换与热键：快捷键 | 边缘切换 左右分布。
-pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
-    let p = pal();
-    two_col(ui, |left, right| {
-        draw_hotkeys_card(app, left, &p);
-        draw_edge_card(app, right, &p);
-    });
-}
-
-fn draw_hotkeys_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("快捷键", "Shortcuts"));
-        widgets::hint(
-            ui,
-            p,
             tr(
-                "在输入框中直接编辑组合键文字，例如 Ctrl+Alt+L。",
-                "Edit the combo as text, e.g. Ctrl+Alt+L.",
+                "在已连接的电脑之间同步剪贴板内容。",
+                "Sync clipboard contents across connected computers.",
             ),
-        );
-        ui.add_space(10.0);
-        hotkey_row(app, ui, p, tr("锁定屏幕", "Lock screens"), |c| {
-            &mut c.hotkeys.lock_screen
-        });
-        if matches!(app.cfg.role, csc_config::Role::Server) {
-            hotkey_row(app, ui, p, tr("回到本机", "Return home"), |c| {
-                &mut c.hotkeys.return_to_server
-            });
-        }
-        hotkey_row(
-            app,
-            ui,
-            p,
-            tr("锁定在当前屏幕", "Lock to screen"),
-            |c| &mut c.hotkeys.lock_to_screen,
-        );
-        hotkey_row(app, ui, p, tr("紧急暂停", "Emergency pause"), |c| {
-            &mut c.hotkeys.emergency_pause
-        });
-    });
-}
-
-fn draw_edge_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("边缘切换", "Edge switching"));
-        if !matches!(app.cfg.role, csc_config::Role::Server) {
-            widgets::hint(
-                ui,
-                p,
-                tr(
-                    "切换规则由键鼠主机设置。",
-                    "Switching rules are set by the keyboard host.",
-                ),
-            );
-            return;
-        }
-
-        form_row(ui, p, tr("延迟 (ms)", "Delay (ms)"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.switch_cfg.edge_delay_ms).range(0..=2000),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-        form_row(
-            ui,
-            p,
-            tr("对角切换区 (px)", "Diagonal zone (px)"),
             |ui| {
-                if mac_drag(
-                    ui,
-                    egui::DragValue::new(&mut app.cfg.switch_cfg.diagonal_zone_px).range(1..=400),
-                )
-                .changed()
-                {
+                if mac_toggle(ui, &p, &mut app.cfg.clipboard.enabled).clicked() {
                     app.queue_save();
                 }
             },
         );
-        form_row(ui, p, tr("二次撞边切换", "Double-tap edge"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.switch_cfg.double_tap_edge).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(
-            ui,
-            p,
-            tr("二次窗口 (ms)", "Double-tap window (ms)"),
+        list.row(
+            tr("同步富文本", "Rich text"),
+            tr("包含格式化文字。", "Include formatted text."),
             |ui| {
-                if mac_drag(
-                    ui,
-                    egui::DragValue::new(&mut app.cfg.switch_cfg.double_tap_window_ms)
-                        .range(50..=2000),
-                )
-                .changed()
-                {
+                if mac_toggle(ui, &p, &mut app.cfg.clipboard.text).clicked() {
                     app.queue_save();
                 }
             },
         );
-        form_row(ui, p, tr("按住不切换", "Hold to block"), |ui| {
-            let label = match app.cfg.switch_cfg.block_modifier.as_str() {
-                "ctrl" => "Ctrl",
-                "shift" => "Shift",
-                "alt" => "Alt",
-                _ => tr("无", "None"),
-            };
-            egui::ComboBox::from_id_salt("block_mod")
-                .selected_text(label)
-                .width(field_width(ui))
-                .show_ui(ui, |ui| {
-                    for (v, lab) in [
-                        ("none", tr("无", "None")),
-                        ("ctrl", "Ctrl"),
-                        ("shift", "Shift"),
-                        ("alt", "Alt"),
-                    ] {
+        list.row(
+            tr("同步图像 / 截图", "Images / screenshots"),
+            tr("跨屏粘贴图片。", "Paste images across screens."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.clipboard.image).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("文字上限 (MB)", "Text limit (MB)"),
+            tr(
+                "超过此大小的文本不会同步。",
+                "Text larger than this is not synced.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.clipboard.max_inline_mb, 1..=15).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("发送时机", "When to send"),
+            tr(
+                "立即发送，或切到该电脑时再推送。",
+                "Send immediately, or when switching to that computer.",
+            ),
+            |ui| {
+                egui::ComboBox::from_id_salt("push_mode")
+                    .selected_text(if app.cfg.clipboard.push_mode == "on_switch" {
+                        tr("切到该电脑时", "On switch")
+                    } else {
+                        tr("立即发送", "Immediate")
+                    })
+                    .width(field_width(ui))
+                    .show_ui(ui, |ui| {
                         if ui
                             .selectable_value(
-                                &mut app.cfg.switch_cfg.block_modifier,
-                                v.to_string(),
-                                lab,
+                                &mut app.cfg.clipboard.push_mode,
+                                "immediate".into(),
+                                tr("立即发送", "Immediate"),
                             )
                             .changed()
                         {
                             app.queue_save();
                         }
-                    }
-                });
-        });
-        form_row(
-            ui,
-            p,
-            tr("全屏时不切换", "Block when fullscreen"),
+                        if ui
+                            .selectable_value(
+                                &mut app.cfg.clipboard.push_mode,
+                                "on_switch".into(),
+                                tr("切到该电脑时", "On switch"),
+                            )
+                            .changed()
+                        {
+                            app.queue_save();
+                        }
+                    });
+            },
+        );
+    });
+
+    section_heading(ui, &p, tr("文件传输", "File transfer"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("启用跨屏传输", "Enable transfer"),
+            tr(
+                "拖拽或粘贴文件到另一台电脑。",
+                "Drag or paste files to another computer.",
+            ),
             |ui| {
-                if mac_toggle(ui, p, &mut app.cfg.switch_cfg.block_when_fullscreen).clicked() {
+                if mac_toggle(ui, &p, &mut app.cfg.file_transfer.enabled).clicked() {
                     app.queue_save();
                 }
             },
         );
-        form_row(ui, p, tr("尽量不休眠", "Keep awake"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.power.keep_peers_awake).clicked() {
-                app.cfg.gui.prevent_sleep = app.cfg.power.keep_peers_awake;
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("指针速度", "Pointer speed"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.pointer.speed)
-                    .speed(0.05)
-                    .range(0.25..=4.0),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
+        list.row(
+            tr("单文件上限 (MB)", "Per-file limit (MB)"),
+            tr("单个文件的最大体积。", "Maximum size of a single file."),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.file_transfer.max_size_mb, 1..=1_000_000).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("剪贴板文件", "Clipboard files"),
+            tr(
+                "允许用 Ctrl+V 传输文件。",
+                "Allow transferring files with Ctrl+V.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.clipboard.files).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("限速", "Speed limit"),
+            tr(
+                "限制传输带宽，避免占满网络。",
+                "Cap bandwidth so the link stays usable.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.file_transfer.limit_speed).clicked() {
+                    app.queue_save();
+                }
+                if app.cfg.file_transfer.limit_speed {
+                    ui.add_space(8.0);
+                    if mac_number_with(
+                        ui,
+                        &mut app.cfg.file_transfer.max_speed_mibs,
+                        1..=10_000,
+                        " MiB/s",
+                    )
+                    .changed()
+                    {
+                        app.queue_save();
+                    }
+                }
+            },
+        );
     });
 }
 
-fn hotkey_row(
+/// 切换与热键。
+pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
+    let p = pal();
+
+    section_heading(ui, &p, tr("快捷键", "Shortcuts"));
+    settings_card(ui, &p, |list| {
+        hotkey_settings_row(
+            app,
+            list,
+            &p,
+            tr("锁定屏幕", "Lock screens"),
+            tr(
+                "在输入框中编辑组合键，例如 Ctrl+Shift+L。",
+                "Edit the combo as text, e.g. Ctrl+Shift+L.",
+            ),
+            |c| &mut c.hotkeys.lock_screen,
+        );
+        if matches!(app.cfg.role, csc_config::Role::Server) {
+            hotkey_settings_row(
+                app,
+                list,
+                &p,
+                tr("回到本机", "Return home"),
+                tr(
+                    "指针立刻回到键鼠主机。",
+                    "Return the pointer to the keyboard host.",
+                ),
+                |c| &mut c.hotkeys.return_to_server,
+            );
+        }
+        hotkey_settings_row(
+            app,
+            list,
+            &p,
+            tr("锁定在当前屏幕", "Lock to screen"),
+            tr("暂时禁止边缘穿越。", "Temporarily block edge crossing."),
+            |c| &mut c.hotkeys.lock_to_screen,
+        );
+        hotkey_settings_row(
+            app,
+            list,
+            &p,
+            tr("紧急暂停", "Emergency pause"),
+            tr("立刻停止远程控制。", "Stop remote control immediately."),
+            |c| &mut c.hotkeys.emergency_pause,
+        );
+    });
+
+    section_heading(ui, &p, tr("边缘切换", "Edge switching"));
+    if !matches!(app.cfg.role, csc_config::Role::Server) {
+        settings_card_body(ui, &p, |ui| {
+            widgets::hint(
+                ui,
+                &p,
+                tr(
+                    "切换规则由键鼠主机设置。",
+                    "Switching rules are set by the keyboard host.",
+                ),
+            );
+        });
+        return;
+    }
+
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("延迟 (ms)", "Delay (ms)"),
+            tr(
+                "指针贴边多久后切换。",
+                "How long the pointer stays on an edge before switching.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.switch_cfg.edge_delay_ms, 0..=2000).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("对角切换区 (px)", "Diagonal zone (px)"),
+            tr(
+                "角落斜向切换的感应宽度。",
+                "Corner zone width for diagonal switches.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.switch_cfg.diagonal_zone_px, 1..=400).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("二次撞边切换", "Double-tap edge"),
+            tr(
+                "需要连续两次顶到边缘才切换。",
+                "Require two edge hits before switching.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.switch_cfg.double_tap_edge).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("二次窗口 (ms)", "Double-tap window (ms)"),
+            tr(
+                "两次撞边的有效间隔。",
+                "Valid interval between the two edge hits.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.switch_cfg.double_tap_window_ms, 50..=2000).changed()
+                {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("按住不切换", "Hold to block"),
+            tr(
+                "按住修饰键时忽略边缘切换。",
+                "Ignore edge switches while holding a modifier.",
+            ),
+            |ui| {
+                let label = match app.cfg.switch_cfg.block_modifier.as_str() {
+                    "ctrl" => "Ctrl",
+                    "shift" => "Shift",
+                    "alt" => "Alt",
+                    _ => tr("无", "None"),
+                };
+                egui::ComboBox::from_id_salt("block_mod")
+                    .selected_text(label)
+                    .width(field_width(ui))
+                    .show_ui(ui, |ui| {
+                        for (v, lab) in [
+                            ("none", tr("无", "None")),
+                            ("ctrl", "Ctrl"),
+                            ("shift", "Shift"),
+                            ("alt", "Alt"),
+                        ] {
+                            if ui
+                                .selectable_value(
+                                    &mut app.cfg.switch_cfg.block_modifier,
+                                    v.to_string(),
+                                    lab,
+                                )
+                                .changed()
+                            {
+                                app.queue_save();
+                            }
+                        }
+                    });
+            },
+        );
+        list.row(
+            tr("全屏时不切换", "Block when fullscreen"),
+            tr(
+                "全屏应用时阻止穿屏。",
+                "Block crossing while an app is fullscreen.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.switch_cfg.block_when_fullscreen).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("尽量不休眠", "Keep awake"),
+            tr(
+                "有对端连接时尽量阻止休眠。",
+                "Try to prevent sleep while peers are linked.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.power.keep_peers_awake).clicked() {
+                    app.cfg.gui.prevent_sleep = app.cfg.power.keep_peers_awake;
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("指针速度", "Pointer speed"),
+            tr(
+                "远程指针的默认灵敏度。",
+                "Default sensitivity for the remote pointer.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.pointer.speed, 0.25..=4.0).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+    });
+}
+
+fn hotkey_settings_row(
     app: &mut App,
-    ui: &mut egui::Ui,
+    list: &mut widgets::SettingsList<'_, '_>,
     p: &Palette,
-    label: &str,
+    title: &str,
+    desc: &str,
     field: fn(&mut csc_config::Config) -> &mut String,
 ) {
-    form_row(ui, p, label, |ui| {
+    list.row(title, desc, |ui| {
         let v = field(&mut app.cfg);
         if mac_text_edit(ui, v).changed() {
             app.queue_save();
         }
+        let _ = p;
     });
 }
 
-/// 系统与网络：双栏分区。
+/// 系统与网络。
 pub fn draw_system(app: &mut App, ui: &mut egui::Ui) {
     let p = pal();
 
-    two_col(ui, |left, right| {
-        draw_net(app, left, &p);
-        draw_lang(app, right, &p);
-    });
-    ui.add_space(14.0);
-    two_col(ui, |left, right| {
-        draw_privacy(app, left, &p);
-        draw_window_tray(app, right, &p);
-    });
-    ui.add_space(14.0);
-    draw_log_and_commands(app, ui, &p);
-}
-
-fn draw_net(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("网络端口", "Network ports"));
-        form_row(ui, p, tr("发现端口", "Discovery port"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.network.discovery_port).range(1..=65535),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("控制端口", "Control port"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.control_port).range(1..=65535),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("传输端口", "Transfer port"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.data_port).range(1..=65535),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-        if app.cfg.control_port == app.cfg.data_port {
-            ui.colored_label(
-                p.danger,
-                tr(
-                    "控制端口和传输端口不能相同",
-                    "Control and transfer ports must differ",
-                ),
-            );
-            ui.add_space(8.0);
-        }
-        widgets::hint(
-            ui,
-            p,
+    section_heading(ui, &p, tr("网络端口", "Network ports"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("发现端口", "Discovery port"),
             tr(
-                "发现端口用于设备发现与心跳，各机须相同；控制 / 传输默认 24900 / 24901。",
-                "Discovery carries peer find + heartbeat (must match). Control / transfer default 24900 / 24901.",
+                "默认 45433；各机须相同。",
+                "Default 45433; must match on every computer.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.network.discovery_port, 1..=65535).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("控制端口", "Control port"),
+            tr("默认 45277。", "Default 45277."),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.control_port, 1..=65535).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("传输端口", "Transfer port"),
+            tr(
+                "默认 45278，不能与控制端口相同。",
+                "Default 45278; must differ from control.",
+            ),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.data_port, 1..=65535).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+    });
+    if app.cfg.control_port == app.cfg.data_port {
+        ui.colored_label(
+            p.danger,
+            tr(
+                "控制端口和传输端口不能相同",
+                "Control and transfer ports must differ",
             ),
         );
         ui.add_space(12.0);
-        card_title(ui, p, tr("心跳", "Heartbeat"));
-        form_row(ui, p, tr("启用心跳", "Enable heartbeat"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.network.heartbeat_enabled).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("间隔 (ms)", "Interval (ms)"), |ui| {
-            if mac_drag(
-                ui,
-                egui::DragValue::new(&mut app.cfg.network.heartbeat_ms).range(500..=60_000),
-            )
-            .changed()
-            {
-                app.queue_save();
-            }
-        });
-    });
-}
+    }
 
-fn draw_lang(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("通知", "Notifications"));
-        form_row(ui, p, tr("对端连接", "Peer connected"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.notify.connect).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("断开 / 失联", "Disconnect / lost"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.notify.disconnect).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("文件传输", "File transfer"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.notify.transfer).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("错误", "Errors"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.notify.errors).clicked() {
-                app.queue_save();
-            }
-        });
-        widgets::hint(
-            ui,
-            p,
+    section_heading(ui, &p, tr("心跳", "Heartbeat"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("启用心跳", "Enable heartbeat"),
+            tr(
+                "定期探测对端是否在线。",
+                "Periodically probe whether the peer is online.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.network.heartbeat_enabled).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("间隔 (ms)", "Interval (ms)"),
+            tr("心跳发送间隔。", "How often heartbeats are sent."),
+            |ui| {
+                if mac_number(ui, &mut app.cfg.network.heartbeat_ms, 500..=60_000).changed() {
+                    app.queue_save();
+                }
+            },
+        );
+    });
+
+    section_heading(ui, &p, tr("通知", "Notifications"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("对端连接", "Peer connected"),
             tr(
                 "配对请求总会弹出；连接提醒默认关闭。",
                 "Pairing always pops up; connect notices default off.",
             ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.notify.connect).clicked() {
+                    app.queue_save();
+                }
+            },
         );
-        ui.add_space(12.0);
-        card_title(ui, p, tr("界面语言", "Language"));
-        form_row(ui, p, tr("语言", "Language"), |ui| {
-            let current = match app.cfg.gui.language.as_str() {
-                "zh-CN" => "简体中文",
-                "en-US" => "English",
-                _ => tr("跟随系统", "Follow system"),
-            };
-            egui::ComboBox::from_id_salt("lang")
-                .selected_text(current)
-                .width(field_width(ui))
-                .show_ui(ui, |ui| {
-                    for (v, label) in [
-                        ("auto", tr("跟随系统", "Follow system")),
-                        ("zh-CN", "简体中文"),
-                        ("en-US", "English"),
-                    ] {
-                        if ui
-                            .selectable_value(&mut app.cfg.gui.language, v.to_string(), label)
-                            .changed()
-                        {
-                            crate::locale::apply(&app.cfg.gui.language);
-                            app.queue_save();
-                        }
-                    }
-                });
-        });
-    });
-}
-
-fn draw_privacy(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("隐私与诊断", "Privacy & diagnostics"));
-        widgets::hint(
-            ui,
-            p,
+        list.row(
+            tr("断开 / 失联", "Disconnect / lost"),
+            tr("连接中断时提醒。", "Notify when the link drops."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.notify.disconnect).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("文件传输", "File transfer"),
             tr(
-                "日志不记录按键、剪贴板和文件内容；诊断包指纹只保留前 8 位。",
-                "Logs omit keystrokes, clipboard and file contents; diagnostics keep 8-char fingerprints.",
+                "传输开始或完成时提醒。",
+                "Notify when transfers start or finish.",
             ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.notify.transfer).clicked() {
+                    app.queue_save();
+                }
+            },
         );
-        ui.add_space(10.0);
-        form_row(ui, p, tr("测量模式", "Bench mode"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.diagnostics.bench_enabled).clicked() {
-                app.queue_save();
-            }
-        });
-        ui.horizontal(|ui| {
-            if widgets::ghost_button(ui, p, tr("导出诊断", "Export diagnostics")).clicked() {
-                match crate::ipc_client::export_diagnostics() {
-                    Ok(v) => {
-                        let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                        app.set_ok(format!("{} {path}", tr("已导出", "Exported")));
-                    }
-                    Err(e) => app.set_err(e.to_string()),
+        list.row(
+            tr("错误", "Errors"),
+            tr("重要错误弹出通知。", "Show notices for important errors."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.notify.errors).clicked() {
+                    app.queue_save();
                 }
-            }
-            if widgets::ghost_button(ui, p, tr("重置（保留配对）", "Reset (keep pairing)"))
-                .clicked()
-            {
-                match crate::ipc_client::reset_data(true) {
-                    Ok(_) => {
-                        app.reload_config();
-                        app.set_ok(tr("已重置", "Reset done"));
-                    }
-                    Err(e) => app.set_err(e.to_string()),
-                }
-            }
-        });
-        ui.add_space(8.0);
-        if widgets::danger_text_button(ui, p, tr("重置并清除配对", "Reset and clear pairing"))
-            .clicked()
-        {
-            match crate::ipc_client::reset_data(false) {
-                Ok(_) => {
-                    app.reload_config();
-                    app.set_ok(tr("已清除", "Cleared"));
-                }
-                Err(e) => app.set_err(e.to_string()),
-            }
-        }
+            },
+        );
     });
-}
 
-fn draw_window_tray(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    crate::theme::section_frame(p).show(ui, |ui| {
-        card_title(ui, p, tr("窗口 / 托盘", "Window / tray"));
-        form_row(ui, p, tr("启动后驻留托盘", "Stay in tray"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.gui.auto_hide).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("关闭后继续驻留", "Close to tray"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.gui.close_to_tray).clicked() {
-                app.queue_save();
-            }
-        });
-        form_row(ui, p, tr("开机自启", "Launch at login"), |ui| {
-            if mac_toggle(ui, p, &mut app.cfg.gui.launch_at_login).clicked() {
-                let _ = crate::autostart::apply(app.cfg.gui.launch_at_login);
-                app.queue_save();
-            }
-        });
+    section_heading(ui, &p, tr("界面语言", "Language"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("语言", "Language"),
+            tr("更改后立即生效。", "Takes effect immediately."),
+            |ui| {
+                let current = match app.cfg.gui.language.as_str() {
+                    "zh-CN" => "简体中文",
+                    "en-US" => "English",
+                    _ => tr("跟随系统", "Follow system"),
+                };
+                egui::ComboBox::from_id_salt("lang")
+                    .selected_text(current)
+                    .width(field_width(ui))
+                    .show_ui(ui, |ui| {
+                        for (v, label) in [
+                            ("auto", tr("跟随系统", "Follow system")),
+                            ("zh-CN", "简体中文"),
+                            ("en-US", "English"),
+                        ] {
+                            if ui
+                                .selectable_value(&mut app.cfg.gui.language, v.to_string(), label)
+                                .changed()
+                            {
+                                crate::locale::apply(&app.cfg.gui.language);
+                                app.queue_save();
+                            }
+                        }
+                    });
+            },
+        );
     });
-}
 
-fn draw_log_and_commands(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    two_col(ui, |left, right| {
-        crate::theme::section_frame(p).show(left, |ui| {
-            card_title(ui, p, tr("日志设置", "Log settings"));
-            form_row(ui, p, tr("级别", "Level"), |ui| {
+    section_heading(ui, &p, tr("窗口 / 托盘", "Window / tray"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("启动后驻留托盘", "Stay in tray"),
+            tr("启动后隐藏主窗口。", "Hide the main window after launch."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.gui.auto_hide).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("关闭后继续驻留", "Close to tray"),
+            tr("点关闭时最小化到托盘。", "Closing minimizes to the tray."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.gui.close_to_tray).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("开机自启", "Launch at login"),
+            tr("登录系统后自动启动。", "Start automatically after sign-in."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.gui.launch_at_login).clicked() {
+                    let _ = crate::autostart::apply(app.cfg.gui.launch_at_login);
+                    app.queue_save();
+                }
+            },
+        );
+    });
+
+    section_heading(ui, &p, tr("隐私与诊断", "Privacy & diagnostics"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("测量模式", "Bench mode"),
+            tr(
+                "日志不记录按键、剪贴板和文件内容。",
+                "Logs omit keystrokes, clipboard and file contents.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.diagnostics.bench_enabled).clicked() {
+                    app.queue_save();
+                }
+            },
+        );
+        list.row(
+            tr("导出诊断", "Export diagnostics"),
+            tr(
+                "打包日志与状态以便排查。",
+                "Bundle logs and status for troubleshooting.",
+            ),
+            |ui| {
+                if outline_button(ui, &p, tr("导出", "Export")).clicked() {
+                    match crate::ipc_client::export_diagnostics() {
+                        Ok(v) => {
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                            app.set_ok(format!("{} {path}", tr("已导出", "Exported")));
+                        }
+                        Err(e) => app.set_err(e.to_string()),
+                    }
+                }
+            },
+        );
+        list.row(
+            tr("重置（保留配对）", "Reset (keep pairing)"),
+            tr(
+                "恢复默认设置，保留已信任设备。",
+                "Restore defaults but keep trusted devices.",
+            ),
+            |ui| {
+                if outline_button(ui, &p, tr("重置", "Reset")).clicked() {
+                    match crate::ipc_client::reset_data(true) {
+                        Ok(_) => {
+                            app.reload_config();
+                            app.set_ok(tr("已重置", "Reset done"));
+                        }
+                        Err(e) => app.set_err(e.to_string()),
+                    }
+                }
+            },
+        );
+        list.row(
+            tr("重置并清除配对", "Reset and clear pairing"),
+            tr(
+                "清除全部设置与信任关系。",
+                "Clear all settings and trusted peers.",
+            ),
+            |ui| {
+                if widgets::danger_text_button(ui, &p, tr("清除", "Clear")).clicked() {
+                    match crate::ipc_client::reset_data(false) {
+                        Ok(_) => {
+                            app.reload_config();
+                            app.set_ok(tr("已清除", "Cleared"));
+                        }
+                        Err(e) => app.set_err(e.to_string()),
+                    }
+                }
+            },
+        );
+    });
+
+    section_heading(ui, &p, tr("日志", "Logging"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("级别", "Level"),
+            tr("写入日志的详细程度。", "How verbose the log file is."),
+            |ui| {
                 egui::ComboBox::from_id_salt("log_level")
                     .selected_text(app.cfg.log.level.clone())
                     .width(field_width(ui))
@@ -587,29 +653,38 @@ fn draw_log_and_commands(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                             }
                         }
                     });
-            });
-            form_row(ui, p, tr("写入文件", "Write to file"), |ui| {
-                if mac_toggle(ui, p, &mut app.cfg.log.to_file).clicked() {
+            },
+        );
+        list.row(
+            tr("写入文件", "Write to file"),
+            tr("将日志保存到磁盘。", "Save the log to disk."),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.log.to_file).clicked() {
                     app.queue_save();
                 }
-            });
-            form_row(ui, p, tr("路径", "Path"), |ui| {
-                let path_w = (field_width(ui) - 100.0).max(64.0);
+            },
+        );
+        list.row(
+            tr("路径", "Path"),
+            tr(
+                "留空则使用默认位置。",
+                "Leave empty to use the default location.",
+            ),
+            |ui| {
+                let path_w = (field_width(ui) - 20.0).max(64.0);
                 if ui
                     .add_sized(
                         egui::vec2(path_w, widgets::FORM_ROW_H),
                         egui::TextEdit::singleline(&mut app.cfg.log.file)
                             .desired_width(path_w)
                             .margin(egui::Margin::symmetric(10, 4))
-                            .horizontal_align(egui::Align::LEFT)
-                            .vertical_align(egui::Align::Center)
                             .font(egui::FontId::proportional(widgets::FORM_FONT)),
                     )
                     .changed()
                 {
                     app.queue_save();
                 }
-                if widgets::ghost_button(ui, p, tr("浏览…", "Browse…")).clicked() {
+                if outline_button(ui, &p, tr("浏览", "Browse")).clicked() {
                     let start = if app.cfg.log.file.trim().is_empty() {
                         csc_config::default_log_path()
                     } else {
@@ -620,49 +695,58 @@ fn draw_log_and_commands(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                         app.queue_save();
                     }
                 }
-                if widgets::ghost_button(ui, p, tr("默认", "Default")).clicked() {
-                    app.cfg.log.file.clear();
-                    app.queue_save();
-                }
-            });
-        });
+            },
+        );
+    });
 
-        crate::theme::section_frame(p).show(right, |ui| {
-            card_title(ui, p, tr("进入 / 离开命令", "Enter / leave commands"));
-            form_row(ui, p, tr("进入本机时执行", "On enter"), |ui| {
-                if mac_toggle(ui, p, &mut app.cfg.enable_enter_command).clicked() {
+    section_heading(ui, &p, tr("进入 / 离开命令", "Enter / leave commands"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            tr("进入本机时执行", "On enter"),
+            tr(
+                "指针进入本机时运行命令。",
+                "Run a command when the pointer enters.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.enable_enter_command).clicked() {
                     app.queue_save();
                 }
-            });
-            form_row(ui, p, tr("进入命令", "Enter command"), |ui| {
-                if mac_text_edit(ui, &mut app.cfg.enter_command).changed() {
+            },
+        );
+        list.row(tr("进入命令", "Enter command"), "", |ui| {
+            if mac_text_edit(ui, &mut app.cfg.enter_command).changed() {
+                app.queue_save();
+            }
+        });
+        list.row(
+            tr("离开本机时执行", "On leave"),
+            tr(
+                "指针离开本机时运行命令。",
+                "Run a command when the pointer leaves.",
+            ),
+            |ui| {
+                if mac_toggle(ui, &p, &mut app.cfg.enable_exit_command).clicked() {
                     app.queue_save();
                 }
-            });
-            form_row(ui, p, tr("离开本机时执行", "On leave"), |ui| {
-                if mac_toggle(ui, p, &mut app.cfg.enable_exit_command).clicked() {
-                    app.queue_save();
-                }
-            });
-            form_row(ui, p, tr("离开命令", "Leave command"), |ui| {
-                if mac_text_edit(ui, &mut app.cfg.exit_command).changed() {
-                    app.queue_save();
-                }
-            });
+            },
+        );
+        list.row(tr("离开命令", "Leave command"), "", |ui| {
+            if mac_text_edit(ui, &mut app.cfg.exit_command).changed() {
+                app.queue_save();
+            }
         });
     });
 
-    ui.add_space(14.0);
-    crate::theme::section_frame(p).show(ui, |ui| {
+    section_heading(ui, &p, tr("实时日志", "Live log"));
+    settings_card_body(ui, &p, |ui| {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(tr("实时日志", "Live log"))
+                RichText::new(tr("最近输出", "Recent output"))
                     .size(13.0)
-                    .strong()
                     .color(p.text),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::ghost_button(ui, p, tr("刷新", "Refresh")).clicked() {
+                if outline_button(ui, &p, tr("刷新", "Refresh")).clicked() {
                     app.reload_logs();
                 }
             });
@@ -682,55 +766,45 @@ fn draw_log_and_commands(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     });
 }
 
-/// Doc/y.html tab-about.
+/// 关于软件。
 pub fn draw_about(app: &mut App, ui: &mut egui::Ui) {
     let p = pal();
-    crate::theme::section_frame(&p).show(ui, |ui| {
-        ui.label(
-            RichText::new(tr("关于 CrossConnect", "About CrossConnect"))
-                .size(12.0)
-                .strong()
-                .color(p.text),
-        );
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 14.0;
-            if let Some(tex) = app.logo.as_ref() {
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::from_handle(tex))
-                        .fit_to_exact_size(egui::vec2(56.0, 56.0)),
-                );
-            }
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("Cross-SystemConnect")
-                        .size(16.0)
-                        .strong()
-                        .color(p.text),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(13.0)
-                        .color(p.accent),
-                );
-            });
-        });
-        ui.add_space(12.0);
-        widgets::hint(
-            ui,
-            &p,
-            tr(
-                "基于 Rust 核心与 egui 轻量渲染构筑。协议版本 2：用一台电脑的键盘和鼠标控制局域网里的其他 Windows 或 Linux 电脑，并可以同步剪贴板和文件。",
-                "Built with a Rust core and egui. Protocol 2: control other Windows/Linux PCs on the LAN with one keyboard and mouse, and sync clipboard and files.",
+
+    section_heading(ui, &p, tr("关于", "About"));
+    settings_card(ui, &p, |list| {
+        list.row(
+            "Cross-SystemConnect",
+            &format!(
+                "{} v{}",
+                tr(
+                    "用一台电脑的键盘鼠标控制局域网中的其他电脑。",
+                    "Control other PCs on the LAN with one keyboard and mouse."
+                ),
+                env!("CARGO_PKG_VERSION")
             ),
+            |ui| {
+                if let Some(tex) = app.logo.as_ref() {
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                            .fit_to_exact_size(egui::vec2(36.0, 36.0)),
+                    );
+                }
+            },
         );
-        ui.add_space(12.0);
-        if widgets::ghost_button(ui, &p, tr("检查更新", "Check for updates")).clicked() {
-            app.set_ok(tr(
-                "更新地址还没有配置，所以这里不会联网。",
-                "No update address is configured, so this does not use the network.",
-            ));
-        }
+        list.row(
+            tr("检查更新", "Check for updates"),
+            tr(
+                "更新地址未配置时不会联网。",
+                "Does not use the network when no update address is set.",
+            ),
+            |ui| {
+                if outline_button(ui, &p, tr("检查", "Check")).clicked() {
+                    app.set_ok(tr(
+                        "更新地址还没有配置，所以这里不会联网。",
+                        "No update address is configured, so this does not use the network.",
+                    ));
+                }
+            },
+        );
     });
 }

@@ -222,6 +222,8 @@ fn release_pointer(grab: &mut bool, target: Option<(i32, i32)>) {
     }
     *grab = false;
     csc_platform::set_host_cursor_hidden(false);
+    let (ox, oy) = csc_platform::virtual_origin();
+    csc_platform::capture_return_to(target.map(|(x, y)| (ox + x, oy + y)));
     csc_platform::capture_set_grab(false, None);
     if let Some((x, y)) = target {
         let (ox, oy) = csc_platform::virtual_origin();
@@ -409,6 +411,9 @@ struct Core {
     stay_on: bool,
     last_lock: Instant,
     last_miss: Instant,
+    /// Wayland keyboard host still waiting for the input capture permission.
+    wayland_host_noted: bool,
+    sent_moves: csc_platform::RateStats,
     next_nic: Instant,
     supervisor: Supervisor,
     paste_gen: u64,
@@ -738,13 +743,19 @@ impl Core {
             self.poll_system().await;
         }
         {
+            // Prefer HELLO'd hostnames for the label; any live TCP session
+            // counts as connected (3010df5 used NetStatus on insert — same idea).
+            // Don't accumulate greeted keys across IP→hostname rekeys.
             let up = self.net.greeted_names().await;
-            for n in &up {
-                self.greeted.insert(n.to_lowercase());
-            }
+            let all = self.net.peer_names().await;
+            self.greeted = up.iter().map(|n| n.to_lowercase()).collect();
             let mut s = self.status.write().await;
-            s.connected = !up.is_empty();
-            s.peer_name = up.join(", ");
+            s.connected = !all.is_empty();
+            s.peer_name = if !up.is_empty() {
+                up.join(", ")
+            } else {
+                all.join(", ")
+            };
             self.switch.set_enabled(s.sharing_enabled);
             // Being controlled earlier (as a client) leaves the switch in Remote.
             // A keyboard host is only Remote while it holds the grab.
@@ -825,6 +836,24 @@ impl Core {
         if !host {
             reload = reload.or(self.supervisor.on_link(connected, Instant::now()));
         }
+        if host {
+            let (left, right, top, bottom) = self.switch.local_sides();
+            csc_platform::capture_set_edges(left, right, top, bottom);
+        }
+        if csc_platform::wayland_session() && !self.grab {
+            self.hooked = csc_platform::capture_start();
+        }
+        let waiting = host && csc_platform::wayland_session() && !self.hooked;
+        if waiting && !self.wayland_host_noted {
+            self.status.write().await.peer_note =
+                "请在系统弹窗中允许本应用「捕获输入」，否则指针无法穿过屏幕边缘。".into();
+        } else if !waiting && self.wayland_host_noted {
+            let mut s = self.status.write().await;
+            if s.peer_note.contains("捕获输入") {
+                s.peer_note.clear();
+            }
+        }
+        self.wayland_host_noted = waiting;
         if let Some(why) = reload {
             info!("restarting the network: {why}");
             self.net_reload.send_modify(|n| *n = n.wrapping_add(1));
@@ -833,6 +862,10 @@ impl Core {
 
     /// Local input while the pointer is on a remote screen.
     async fn grab_step(&mut self) {
+        if self.hooked && csc_platform::capture_released_by_desktop() {
+            self.return_home("the desktop ended input capture").await;
+            return;
+        }
         // With hooks, local input arrives already swallowed. Without them,
         // poll the cursor and pull it back to the park point each tick.
         let steps: Vec<Captured> = if self.hooked {
@@ -968,6 +1001,7 @@ impl Core {
             self.switch
                 .on_remote_relative(dx, dy, &mut self.remote_x, &mut self.remote_y, remote)
         else {
+            self.sent_moves.note();
             self.net.send_mouse_move(dx, dy).await;
             return false;
         };
@@ -1101,8 +1135,18 @@ impl Core {
 
     /// The local pointer, while it is on this computer.
     async fn local_step(&mut self) {
+        let hit = csc_platform::capture_edge_hit();
+        self.local_step_at(hit).await;
+        if hit.is_some() && !self.grab {
+            // A barrier fired but no computer took the pointer: hand it back at once.
+            csc_platform::capture_return_to(hit);
+        }
+    }
+
+    /// `hit` is where a compositor barrier stopped the pointer (Wayland hosts).
+    async fn local_step_at(&mut self, hit: Option<(i32, i32)>) {
         let raw = csc_platform::take_raw_motion();
-        let Some((ax, ay)) = csc_platform::cursor_pos() else {
+        let Some((ax, ay)) = hit.or_else(csc_platform::cursor_pos) else {
             return;
         };
         let (ox, oy) = csc_platform::virtual_origin();
@@ -1923,75 +1967,100 @@ impl Core {
         match ev {
             None => return false,
             Some(InboundEvent::Disconnected { peer }) => {
-                let was_up = self.greeted.remove(&peer.to_lowercase());
+                // Prefer live sessions over the historical set: a superseded IP
+                // key must not clear a hostname that is still connected.
+                let up = self.net.greeted_names().await;
+                let still = up.iter().any(|n| !n.eq_ignore_ascii_case(&peer));
+                let was_up = self.greeted.remove(&peer.to_lowercase()) && !still;
+                self.greeted = up.iter().map(|n| n.to_lowercase()).collect();
                 let mut s = self.status.write().await;
                 if was_up {
                     info!("session {peer} disconnected");
+                } else if still {
+                    debug!(
+                        "session {peer} closed; other link(s) still up: {}",
+                        up.join(", ")
+                    );
+                    s.connected = true;
+                    s.peer_name = up.join(", ");
                 } else {
                     debug!("connection to {peer} closed before the handshake finished");
                 }
-                let active = self.grab
-                    && (self.switch.active_remote().eq_ignore_ascii_case(&peer)
-                        || s.active_screen.eq_ignore_ascii_case(&peer));
-                if active {
-                    self.switch.unlock_to_local();
-                    self.held = HeldInput::default();
-                    release_pointer(&mut self.grab, Some(self.home_point));
-                    self.grab_armed = false;
-                    s.active_screen = s.local_name.clone();
-                }
-                if !self.grab {
-                    // The host that was driving this computer is gone.
-                    self.injected.release_injected(self.injector.as_mut());
-                    s.being_controlled = false;
-                    if self.switch.state() == SwitchState::Remote {
+                if still {
+                    // Keep grab/status; this was a superseded IP or duplicate dial.
+                    drop(s);
+                } else {
+                    let active = self.grab
+                        && (self.switch.active_remote().eq_ignore_ascii_case(&peer)
+                            || s.active_screen.eq_ignore_ascii_case(&peer));
+                    if active {
                         self.switch.unlock_to_local();
+                        self.held = HeldInput::default();
+                        release_pointer(&mut self.grab, Some(self.home_point));
+                        self.grab_armed = false;
                         s.active_screen = s.local_name.clone();
                     }
+                    if !self.grab {
+                        // The host that was driving this computer is gone.
+                        self.injected.release_injected(self.injector.as_mut());
+                        s.being_controlled = false;
+                        if self.switch.state() == SwitchState::Remote {
+                            self.switch.unlock_to_local();
+                            s.active_screen = s.local_name.clone();
+                        }
+                    }
+                    s.peer_name = up.join(", ");
+                    s.connected = !s.peer_name.is_empty();
+                    if !s.connected {
+                        s.being_controlled = false;
+                    }
+                    if s.role != "server" && s.host_state != "host_sleeping" {
+                        s.host_state = if s.connected {
+                            "connected".into()
+                        } else {
+                            "host_lost".into()
+                        };
+                    }
+                    let sleeping = s.host_state == "host_sleeping";
+                    drop(s);
+                    if was_up && !sleeping {
+                        notice::tell(
+                            notice::Kind::Disconnect,
+                            "Cross-SystemConnect",
+                            &format!("与 {peer} 断开"),
+                            false,
+                        );
+                    }
+                    self.shared.peer_gone(&peer);
+                    csc_platform::paste_watch(self.shared.remote_files());
+                    self.transfer.peer_gone(peer).await;
                 }
-                let left: Vec<&str> = s
-                    .peer_name
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&peer))
-                    .collect();
-                s.peer_name = left.join(", ");
-                s.connected = !s.peer_name.is_empty();
-                if !s.connected {
-                    s.being_controlled = false;
-                }
-                if s.role != "server" && s.host_state != "host_sleeping" {
-                    s.host_state = if s.connected {
-                        "connected".into()
-                    } else {
-                        "host_lost".into()
-                    };
-                }
-                let sleeping = s.host_state == "host_sleeping";
-                drop(s);
-                if was_up && !sleeping {
-                    notice::tell(
-                        notice::Kind::Disconnect,
-                        "Cross-SystemConnect",
-                        &format!("与 {peer} 断开"),
-                        false,
-                    );
-                }
-                self.shared.peer_gone(&peer);
-                csc_platform::paste_watch(self.shared.remote_files());
-                self.transfer.peer_gone(peer).await;
             }
             Some(InboundEvent::Hello(h)) => {
                 info!(
                     "HELLO from {} ({}x{}, capabilities {:#x})",
                     h.host_name, h.screen_width, h.screen_height, h.capabilities
                 );
+                // Refresh link status immediately so the UI shows 已连接 without
+                // waiting for the next 1ms tick (and without stale IP keys).
+                let up = self.net.greeted_names().await;
+                let all = self.net.peer_names().await;
+                self.greeted = up.iter().map(|n| n.to_lowercase()).collect();
                 {
                     let mut s = self.status.write().await;
+                    s.connected = !all.is_empty();
+                    s.peer_name = if !up.is_empty() {
+                        up.join(", ")
+                    } else {
+                        all.join(", ")
+                    };
                     if s.role != "server" {
                         s.host_state = "connected".into();
                     }
-                    if s.peer_note.contains("还没有信任本机") {
+                    if s.peer_note.contains("还没有信任本机")
+                        || s.peer_note.contains("正在切换为从机")
+                        || s.peer_note.contains("正在连接")
+                    {
                         s.peer_note.clear();
                     }
                 }
@@ -2005,7 +2074,7 @@ impl Core {
                 }
                 if h.screen_width > 1 && h.screen_height > 1 {
                     self.peer_screens.insert(
-                        h.host_name,
+                        h.host_name.clone(),
                         csc_platform::ScreenSize {
                             width: h.screen_width,
                             height: h.screen_height,
@@ -2310,12 +2379,12 @@ pub async fn run() -> anyhow::Result<()> {
         quit_tx,
         prompt: prompt.clone(),
         net_reload: net_reload.clone(),
-        layout_reload,
+        layout_reload: layout_reload.clone(),
         log,
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
-    // Bind IPC before discovery. A second core must exit so it does not also take port 24900.
+    // Bind IPC before discovery. A second core must exit so it does not also take the ports.
     let ipc_bound = match claim_ipc() {
         Ok(bound) => bound,
         Err(err) if err.downcast_ref::<IpcBusy>().is_some() => {
@@ -2388,6 +2457,8 @@ pub async fn run() -> anyhow::Result<()> {
         status.clone(),
         prompt,
         net_reload_rx,
+        net_reload.clone(),
+        layout_reload.clone(),
         inbound_tx,
         transfer.clone(),
     )
@@ -2398,9 +2469,12 @@ pub async fn run() -> anyhow::Result<()> {
     let clip = crate::clipboard::spawn(clip_tx);
     tokio::spawn(watch_memory(state.clone(), board.clone()));
     {
+        let search = config.read().await.search_address.clone();
         let mut s = state.status.write().await;
         // Stable until the user clicks「更换」; pairing stays open while the code exists.
-        s.home_code = fresh_home_code();
+        // Last three digits = this computer’s IPv4 host octet (e.g. .243 → …243).
+        let ip = home_code_ip(&search, &s.local_ipv4);
+        s.home_code = fresh_home_code(&ip);
         s.home_code_until = 0;
         s.pairing_open_until = 0;
     }
@@ -2458,6 +2532,8 @@ pub async fn run() -> anyhow::Result<()> {
         pending_clip: None,
         last_lock: Instant::now() - LOCK_REPEAT,
         last_miss: Instant::now() - Duration::from_secs(5),
+        wayland_host_noted: false,
+        sent_moves: csc_platform::RateStats::new("pointer moves sent"),
         next_nic: Instant::now(),
         supervisor,
         paste_gen: 0,
@@ -2504,20 +2580,83 @@ pub async fn run() -> anyhow::Result<()> {
     std::process::exit(0);
 }
 
-/// Home-page pairing code. Stable until the user clicks「更换」; the previous
-/// code stays valid once so a just-changed code can still be typed.
-fn fresh_home_code() -> String {
-    let mut buf = [0u8; 4];
+/// Home-page pairing code: `XXXYYY` where `XXX` is random and `YYY` is the last
+/// octet of this computer’s LAN IPv4 (e.g. `192.168.1.243` → `…243`). Stable
+/// until the user clicks「更换」; the previous code stays valid once.
+fn fresh_home_code(local_ip: &str) -> String {
+    let mut buf = [0u8; 2];
     let _ = getrandom::getrandom(&mut buf);
-    format!("{:06}", u32::from_le_bytes(buf) % 1_000_000)
+    let prefix = u16::from_le_bytes(buf) % 1000;
+    let suffix = crate::discover::ipv4_octets(local_ip)
+        .map(|o| u16::from(o[3]))
+        .unwrap_or(0);
+    format!("{prefix:03}{suffix:03}")
 }
 
-pub(crate) fn rotate_home(s: &mut csc_proto::AppStatus) {
+/// Keep the random prefix; refresh the IP suffix when the NIC changes.
+pub(crate) fn sync_home_code_ip(s: &mut csc_proto::AppStatus, local_ip: &str) {
+    let suffix = crate::discover::ipv4_octets(local_ip)
+        .map(|o| u16::from(o[3]))
+        .unwrap_or(0);
+    let prefix: String = s
+        .home_code
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(3)
+        .collect();
+    let prefix = if prefix.len() == 3 {
+        prefix
+    } else {
+        let mut buf = [0u8; 2];
+        let _ = getrandom::getrandom(&mut buf);
+        format!("{:03}", u16::from_le_bytes(buf) % 1000)
+    };
+    let next = format!("{prefix}{suffix:03}");
+    if next != s.home_code {
+        s.home_code_prev = std::mem::take(&mut s.home_code);
+        s.home_code = next;
+        s.home_code_until = 0;
+        s.pairing_open_until = 0;
+    }
+}
+
+pub(crate) fn rotate_home(s: &mut csc_proto::AppStatus, local_ip: &str) {
     s.home_code_prev = std::mem::take(&mut s.home_code);
-    s.home_code = fresh_home_code();
+    s.home_code = fresh_home_code(local_ip);
     // 0 = no auto-expiry; previous code still accepted once via home_code_prev.
     s.home_code_until = 0;
     s.pairing_open_until = 0;
+}
+
+/// A home code pairs once. Keep the IP suffix, draw a new prefix, and drop the
+/// grace slot so the used code stops matching immediately.
+pub(crate) fn burn_home_code(s: &mut csc_proto::AppStatus) {
+    if s.home_code.len() != 6 {
+        return;
+    }
+    let suffix: String = s.home_code.chars().skip(3).collect();
+    let mut next = s.home_code.clone();
+    while next == s.home_code {
+        let mut buf = [0u8; 2];
+        let _ = getrandom::getrandom(&mut buf);
+        next = format!("{:03}{suffix}", u16::from_le_bytes(buf) % 1000);
+    }
+    s.home_code = next;
+    s.home_code_prev.clear();
+    s.home_code_until = 0;
+    s.pairing_open_until = 0;
+}
+
+/// Prefer `search_address`, else the first local IPv4 on status.
+pub(crate) fn home_code_ip(search: &str, local_ipv4: &[String]) -> String {
+    if crate::discover::ipv4_octets(search).is_some() {
+        return search.to_string();
+    }
+    local_ipv4
+        .iter()
+        .find(|ip| crate::discover::ipv4_octets(ip).is_some())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Resident-memory self-check every minute (`limits.rss_*`). Over the restart
@@ -2553,6 +2692,20 @@ async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoar
 mod tests {
     use super::Hotkey;
     use std::collections::HashSet;
+
+    #[test]
+    fn used_home_code_is_replaced_and_keeps_ip_suffix() {
+        let mut s = csc_proto::AppStatus {
+            home_code: "582243".into(),
+            home_code_prev: "111243".into(),
+            ..Default::default()
+        };
+        super::burn_home_code(&mut s);
+        assert_ne!(s.home_code, "582243");
+        assert!(s.home_code.ends_with("243"));
+        assert_eq!(s.home_code.len(), 6);
+        assert!(s.home_code_prev.is_empty());
+    }
 
     #[test]
     fn reentry_stays_on_the_edge_that_was_crossed() {

@@ -21,7 +21,7 @@ use csc_proto::{
     SwitchPayload,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -94,8 +94,14 @@ pub struct Wires {
     transfer: crate::transfer::TransferHandle,
     /// Keyboard host: last TCP address of each controlled computer, for redialing.
     last_peers: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    /// Live control sessions (shared so HELLO can rekey IP → hostname).
+    peers: PeerTable,
     /// A session ended: search or announce right away.
     kick: Arc<tokio::sync::Notify>,
+    /// Bump to restart discovery after an automatic role change.
+    net_reload: watch::Sender<u64>,
+    /// Bump when desk/layout changes after trust so edge switch reloads neighbors.
+    layout_reload: watch::Sender<u64>,
 }
 
 impl Link {
@@ -163,16 +169,59 @@ impl PeerTable {
         true
     }
 
+    /// Move a live session from `from` to `to` (IP dial → hostname after HELLO).
+    /// Returns false when `to` already has a different live session: the newcomer
+    /// is dropped and the existing hostname session is kept.
+    async fn rekey(&self, from: &str, to: &str) -> bool {
+        if from.eq_ignore_ascii_case(to) || to.is_empty() {
+            return true;
+        }
+        let mut txs = self.txs.lock().await;
+        let Some(link) = txs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(from))
+            .map(|(k, l)| (k.clone(), l.clone()))
+        else {
+            return true;
+        };
+        if let Some(old) = txs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(to))
+            .map(|(k, l)| (k.clone(), l.clone()))
+        {
+            if !old.1.same(&link.1) {
+                // Keep the session already keyed by hostname; drop this dial.
+                txs.remove(&link.0);
+                drop(txs);
+                let mut active = self.active.lock().await;
+                if active.eq_ignore_ascii_case(from) {
+                    *active = to.to_string();
+                }
+                return false;
+            }
+            txs.remove(&old.0);
+        }
+        txs.remove(&link.0);
+        txs.insert(to.to_string(), link.1);
+        drop(txs);
+        let mut active = self.active.lock().await;
+        if active.eq_ignore_ascii_case(from) {
+            *active = to.to_string();
+        }
+        true
+    }
+
     /// Remove `name` only if it still points at this link, not a newer one.
     async fn remove_owned(&self, name: &str, link: &Link) {
-        let owned = self
-            .txs
-            .lock()
-            .await
-            .get(name)
-            .is_some_and(|cur| cur.same(link));
-        if owned {
-            self.remove(name).await;
+        let key = {
+            let txs = self.txs.lock().await;
+            txs.iter()
+                .find(|(k, cur)| k.eq_ignore_ascii_case(name) || cur.same(link))
+                .filter(|(_, cur)| cur.same(link))
+                .map(|(k, _)| k.clone())
+        };
+        if let Some(key) = key {
+            self.remove(&key).await;
         }
     }
 
@@ -201,6 +250,18 @@ impl PeerTable {
         if active.eq_ignore_ascii_case(name) {
             *active = next.unwrap_or_default();
         }
+    }
+
+    /// Kill the session task and drop it from the table (pairing-code takeover).
+    async fn kill_remove(&self, name: &str) {
+        let link = {
+            let txs = self.txs.lock().await;
+            Self::find(&txs, name)
+        };
+        if let Some(link) = link {
+            let _ = link.kill.send(true);
+        }
+        self.remove(name).await;
     }
 
     async fn contains(&self, name: &str) -> bool {
@@ -345,22 +406,28 @@ impl NetHub {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_network(
     cfg: Arc<RwLock<Config>>,
     config_path: PathBuf,
     app_status: Arc<RwLock<AppStatus>>,
     prompt: Arc<PeerPrompt>,
     mut config_watch: watch::Receiver<u64>,
+    net_reload: watch::Sender<u64>,
+    layout_reload: watch::Sender<u64>,
     events: mpsc::Sender<InboundEvent>,
     transfer: crate::transfer::TransferHandle,
 ) -> anyhow::Result<NetHub> {
+    let peers = PeerTable::new();
     let inbound = Wires {
         events,
         transfer,
         last_peers: Arc::new(Mutex::new(HashMap::new())),
+        peers: peers.clone(),
         kick: Arc::new(tokio::sync::Notify::new()),
+        net_reload,
+        layout_reload,
     };
-    let peers = PeerTable::new();
     let status = Arc::new(RwLock::new(NetStatus::default()));
     let status2 = status.clone();
     let cfg2 = cfg.clone();
@@ -557,6 +624,10 @@ async fn run_server(
         crate::discover::encode_search_unlinked(cfg.control_port, cfg.data_port, &cfg.name);
     let targets = scan_targets(cfg, discover, local_ips);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
+    // Typed pairing codes encode the peer host octet — poll often so we dial
+    // that IP right away instead of waiting for a full /24 UDP sweep.
+    let mut offer_poll = tokio::time::interval(Duration::from_millis(100));
+    let mut last_offer_gen = 0u64;
     let mut buf = [0u8; 2048];
     let (stop_tx, stop_rx) = watch::channel(false);
     let _stop = StopOnDrop(stop_tx);
@@ -568,11 +639,45 @@ async fn run_server(
 
     loop {
         tokio::select! {
+            _ = offer_poll.tick() => {
+                let gen = app_status.read().await.offer_gen;
+                if gen != last_offer_gen {
+                    last_offer_gen = gen;
+                    poke_offer_peer(&udp, &search_unlinked, cfg, app_status, discover).await;
+                    spawn_try_dial_offer_ip(
+                        cfg.clone(),
+                        live.clone(),
+                        config_path.to_path_buf(),
+                        identity.clone(),
+                        peers.clone(),
+                        inbound.clone(),
+                        status.clone(),
+                        app_status.clone(),
+                        prompt.clone(),
+                        inflight.clone(),
+                        stop_rx.clone(),
+                    );
+                }
+            }
             _ = tick.tick() => {
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &search, &targets).await)?;
                 let now = Instant::now();
                 seen.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(15));
                 publish_discovered(app_status, &seen).await;
+                poke_offer_peer(&udp, &search_unlinked, cfg, app_status, discover).await;
+                spawn_try_dial_offer_ip(
+                    cfg.clone(),
+                    live.clone(),
+                    config_path.to_path_buf(),
+                    identity.clone(),
+                    peers.clone(),
+                    inbound.clone(),
+                    status.clone(),
+                    app_status.clone(),
+                    prompt.clone(),
+                    inflight.clone(),
+                    stop_rx.clone(),
+                );
                 // Controlled computers that were linked before are dialed directly,
                 // without waiting for their announce.
                 let known: Vec<(String, SocketAddr)> = inbound
@@ -583,11 +688,26 @@ async fn run_server(
                     .map(|(k, a)| (k.clone(), *a))
                     .collect();
                 for (key, addr) in known {
-                    if peers.contains(&key).await {
+                    if peers.contains(&key).await
+                        || already_linked_to_ip(peers, &inbound, addr.ip()).await
+                    {
                         redial.reset(&key);
                         continue;
                     }
+                    // Typed pairing code owns initiation to this IP.
+                    if offer_ready(app_status).await {
+                        let offer = current_offer(app_status).await;
+                        if let Some(want) = peer_addr_from_offer(cfg, &offer, local_ips) {
+                            if want.ip() == addr.ip() {
+                                continue;
+                            }
+                        }
+                    }
                     if !redial.due(&key, now) || inflight.lock().await.contains(&key) {
+                        continue;
+                    }
+                    let ip_key = addr.ip().to_string();
+                    if inflight.lock().await.contains(&ip_key) {
                         continue;
                     }
                     debug!("redialing {key} at {addr}");
@@ -606,7 +726,7 @@ async fn run_server(
                         stop_rx.clone(),
                         key,
                         ServerLink::Dial(addr),
-                    );
+                    false);
                 }
                 let manuals = live.read().await.network.manual_peers.clone();
                 for peer in manuals {
@@ -643,7 +763,7 @@ async fn run_server(
                         stop_rx.clone(),
                         key,
                         ServerLink::Dial(addr),
-                    );
+                    false);
                 }
             }
             _ = kick.notified() => {
@@ -677,13 +797,26 @@ async fn run_server(
                 }, Instant::now()));
                 publish_discovered(app_status, &seen).await;
 
-                if peers.contains(&key).await {
+                if peers.contains(&key).await
+                    || already_linked_to_ip(peers, &inbound, src.ip()).await
+                {
+                    // Still poke so the client can dial back if our inbound is blocked.
+                    let _ = udp.send_to(&search_unlinked, src).await;
                     continue;
                 }
                 // A direct reply passes firewalls that drop unsolicited datagrams,
                 // so the client dials back now instead of after its own refresh.
                 let _ = udp.send_to(&search_unlinked, src).await;
                 let eager = offer_ready(app_status).await;
+                // Who typed the code dials out — discovery must not race that IP.
+                if eager {
+                    let offer = current_offer(app_status).await;
+                    if let Some(want) = peer_addr_from_offer(cfg, &offer, local_ips) {
+                        if want.ip() == src.ip() {
+                            continue;
+                        }
+                    }
+                }
                 let known = {
                     let saved = live.read().await;
                     saved.is_trusted_peer(&display) || saved.peer_fingerprint(&display).is_some()
@@ -712,7 +845,7 @@ async fn run_server(
                     stop_rx.clone(),
                     key,
                     ServerLink::Dial(peer_addr),
-                );
+                false);
             }
             acc = accept_opt(listener.as_ref()) => {
                 let (tcp, addr) = match acc {
@@ -756,7 +889,7 @@ async fn run_server(
                     stop_rx.clone(),
                     key,
                     ServerLink::Accepted(tcp, addr),
-                );
+                false);
             }
         }
     }
@@ -774,6 +907,364 @@ enum ServerLink {
     Accepted(TcpStream, SocketAddr),
 }
 
+/// Pairing code `XXXYYY`: `YYY` is the peer’s IPv4 last octet on the selected /24.
+/// When `search_address` was cleared (settings reset), fall back to a local IPv4.
+fn peer_addr_from_offer(cfg: &Config, offer: &str, local_ipv4: &[String]) -> Option<SocketAddr> {
+    let digits: String = offer.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 6 {
+        debug!(
+            offer = %offer,
+            digits = %digits,
+            "peer_addr_from_offer: need exactly 6 digits"
+        );
+        return None;
+    }
+    let octet: u8 = match digits[3..6].parse() {
+        Ok(o) => o,
+        Err(e) => {
+            debug!(suffix = &digits[3..6], error = %e, "peer_addr_from_offer: bad host octet");
+            return None;
+        }
+    };
+    if octet == 0 || octet == 255 {
+        debug!(octet, "peer_addr_from_offer: host octet cannot be 0/255");
+        return None;
+    }
+    let base = crate::discover::ipv4_octets(&cfg.search_address).or_else(|| {
+        let hit = local_ipv4
+            .iter()
+            .find_map(|ip| crate::discover::ipv4_octets(ip));
+        if let Some(b) = hit {
+            debug!(
+                search = %cfg.search_address,
+                fallback = %format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]),
+                "peer_addr_from_offer: search_address empty — using local IPv4"
+            );
+        }
+        hit
+    });
+    let Some(base) = base else {
+        debug!(
+            search = %cfg.search_address,
+            ?local_ipv4,
+            "peer_addr_from_offer: no IPv4 base (search_address and local_ipv4 empty)"
+        );
+        return None;
+    };
+    if base[3] == octet {
+        debug!(
+            base0 = base[0],
+            base1 = base[1],
+            base2 = base[2],
+            octet,
+            "peer_addr_from_offer: refusing to dial self"
+        );
+        return None;
+    }
+    let addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(base[0], base[1], base[2], octet)),
+        cfg.control_port,
+    );
+    debug!(%addr, offer = %digits, "peer_addr_from_offer: ok");
+    Some(addr)
+}
+
+/// Unicast a search probe to the IP encoded in the typed code so a firewalled
+/// client dials back without waiting for a full /24 sweep.
+async fn poke_offer_peer(
+    udp: &UdpSocket,
+    search: &[u8],
+    cfg: &Config,
+    app_status: &Arc<RwLock<AppStatus>>,
+    discover: u16,
+) {
+    if !offer_ready(app_status).await {
+        return;
+    }
+    let (offer, local_ips) = {
+        let s = app_status.read().await;
+        (s.offer_code.clone(), s.local_ipv4.clone())
+    };
+    if offer.len() != 6 {
+        return;
+    }
+    let Some(tcp) = peer_addr_from_offer(cfg, &offer, &local_ips) else {
+        return;
+    };
+    let dest = SocketAddr::new(tcp.ip(), discover);
+    if let Err(e) = udp.send_to(search, dest).await {
+        debug!("offer poke {dest}: {e}");
+    }
+}
+
+/// True when we already have a live session to this IP (under IP or hostname key).
+async fn already_linked_to_ip(peers: &PeerTable, inbound: &Wires, ip: std::net::IpAddr) -> bool {
+    if peers.contains(&ip.to_string()).await {
+        return true;
+    }
+    let keys: Vec<String> = inbound
+        .last_peers
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, a)| a.ip() == ip)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in keys {
+        if peers.contains(&k).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Keys currently holding a control session to `ip`.
+async fn session_keys_for_ip(peers: &PeerTable, inbound: &Wires, ip: IpAddr) -> Vec<String> {
+    let mut keys = Vec::new();
+    let ip_s = ip.to_string();
+    if peers.contains(&ip_s).await {
+        keys.push(ip_s.clone());
+    }
+    // Collect candidates then drop the mutex before any further .await.
+    let candidates: Vec<String> = inbound
+        .last_peers
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, a)| a.ip() == ip)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in candidates {
+        if keys.iter().any(|x| x.eq_ignore_ascii_case(&k)) {
+            continue;
+        }
+        if peers.contains(&k).await {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// True when a session to `ip` has finished HELLO (usable for switching / UI).
+async fn already_greeted_at_ip(peers: &PeerTable, inbound: &Wires, ip: IpAddr) -> bool {
+    let greeted = peers.greeted_names().await;
+    if greeted.iter().any(|n| n == &ip.to_string()) {
+        debug!(%ip, ?greeted, "already_greeted_at_ip: yes (ip key)");
+        return true;
+    }
+    let names: Vec<String> = inbound
+        .last_peers
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, a)| a.ip() == ip)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in &names {
+        if greeted.iter().any(|n| n.eq_ignore_ascii_case(k)) {
+            debug!(%ip, key = %k, ?greeted, "already_greeted_at_ip: yes (hostname)");
+            return true;
+        }
+    }
+    debug!(%ip, ?greeted, "already_greeted_at_ip: no");
+    false
+}
+
+/// Drop incomplete (or any) sessions to `ip` so a typed pairing-code dial can own the slot.
+async fn drop_sessions_to_ip(peers: &PeerTable, inbound: &Wires, ip: IpAddr) {
+    for key in session_keys_for_ip(peers, inbound, ip).await {
+        info!("replacing session {key} so pairing-code dial can initiate to {ip}");
+        peers.kill_remove(&key).await;
+    }
+}
+
+/// Fire-and-forget dial so the discovery select loop never blocks on locks/TLS.
+#[allow(clippy::too_many_arguments)]
+fn spawn_try_dial_offer_ip(
+    cfg: Config,
+    live: Arc<RwLock<Config>>,
+    config_path: PathBuf,
+    identity: Arc<crate::tls::Identity>,
+    peers: PeerTable,
+    inbound: Wires,
+    status: Arc<RwLock<NetStatus>>,
+    app_status: Arc<RwLock<AppStatus>>,
+    prompt: Arc<PeerPrompt>,
+    inflight: Arc<Mutex<HashSet<String>>>,
+    stop_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        try_dial_offer_ip(
+            &cfg,
+            &live,
+            &config_path,
+            &identity,
+            &peers,
+            &inbound,
+            &status,
+            &app_status,
+            &prompt,
+            &inflight,
+            &stop_rx,
+        )
+        .await;
+    });
+}
+
+/// Dial the IP encoded in the typed pairing code (skip subnet search wait).
+#[allow(clippy::too_many_arguments)]
+async fn try_dial_offer_ip(
+    cfg: &Config,
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    identity: &Arc<crate::tls::Identity>,
+    peers: &PeerTable,
+    inbound: &Wires,
+    status: &Arc<RwLock<NetStatus>>,
+    app_status: &Arc<RwLock<AppStatus>>,
+    prompt: &Arc<PeerPrompt>,
+    inflight: &Arc<Mutex<HashSet<String>>>,
+    stop_rx: &watch::Receiver<bool>,
+) {
+    if !offer_ready(app_status).await {
+        debug!("try_dial_offer_ip: skip — offer not ready");
+        return;
+    }
+    let offer = current_offer(app_status).await;
+    let local_ips = app_status.read().await.local_ipv4.clone();
+    debug!(
+        offer = %offer,
+        search = %cfg.search_address,
+        ?local_ips,
+        "try_dial_offer_ip: offer ready"
+    );
+    let Some(addr) = peer_addr_from_offer(cfg, &offer, &local_ips) else {
+        warn!(
+            offer = %offer,
+            search = %cfg.search_address,
+            ?local_ips,
+            "try_dial_offer_ip: cannot map pairing code to peer IP"
+        );
+        return;
+    };
+    debug!(%addr, "try_dial_offer_ip: resolving session key");
+    let key = session_key_for_ip(inbound, app_status, addr.ip()).await;
+    debug!(%addr, %key, "try_dial_offer_ip: session key ready");
+    let greeted = already_greeted_at_ip(peers, inbound, addr.ip()).await;
+    let keys = session_keys_for_ip(peers, inbound, addr.ip()).await;
+    let trusted = {
+        let saved = live.read().await;
+        let mut hit = saved.is_trusted_peer(&key) || saved.peer_fingerprint(&key).is_some();
+        for k in &keys {
+            if saved.is_trusted_peer(k) || saved.peer_fingerprint(k).is_some() {
+                hit = true;
+                break;
+            }
+        }
+        hit
+    };
+    debug!(%addr, %key, greeted, trusted, ?keys, "try_dial_offer_ip: link state");
+    // Who typed initiates. Only skip when HELLO finished AND peer is trusted.
+    if greeted && trusted {
+        info!(
+            %addr,
+            %key,
+            "try_dial_offer_ip: already greeted+trusted — clear offer, no redial"
+        );
+        clear_offer(app_status).await;
+        return;
+    }
+    // A typed code takes over the IP once. Later ticks must leave that session
+    // alone while the peer is clicking confirm, and only redial once it is gone.
+    static LAST_OFFER_DIAL: Mutex<u64> = Mutex::const_new(0);
+    let mut last_gen = LAST_OFFER_DIAL.lock().await;
+    let gen = app_status.read().await.offer_gen;
+    let first = *last_gen != gen;
+    let ip_key = addr.ip().to_string();
+    if !first {
+        let busy = {
+            let flight = inflight.lock().await;
+            flight.contains(&key) || flight.contains(&ip_key)
+        };
+        if busy || already_linked_to_ip(peers, inbound, addr.ip()).await {
+            debug!(%addr, %key, "try_dial_offer_ip: pairing session for this code still open");
+            return;
+        }
+    } else {
+        if greeted && !trusted {
+            debug!(%addr, %key, "try_dial_offer_ip: greeted but not trusted — replace");
+        } else if already_linked_to_ip(peers, inbound, addr.ip()).await {
+            debug!(%addr, %key, "try_dial_offer_ip: incomplete session — replace");
+        }
+        drop_sessions_to_ip(peers, inbound, addr.ip()).await;
+        debug!(%addr, %key, "try_dial_offer_ip: stale sessions dropped");
+    }
+    {
+        let mut flight = inflight.lock().await;
+        if first {
+            flight.remove(&ip_key);
+            flight.remove(&key);
+        }
+        if !flight.insert(key.clone()) {
+            debug!(%key, "try_dial_offer_ip: inflight race — skip duplicate spawn");
+            return;
+        }
+        debug!(%key, "try_dial_offer_ip: inflight marked");
+    }
+    *last_gen = gen;
+    drop(last_gen);
+    info!("pairing-code initiate: dialing {addr} as {key} (who typed, dials out)");
+    spawn_server_link(
+        cfg.clone(),
+        live.clone(),
+        config_path.to_path_buf(),
+        identity.clone(),
+        peers.clone(),
+        inbound.clone(),
+        status.clone(),
+        app_status.clone(),
+        prompt.clone(),
+        inflight.clone(),
+        stop_rx.clone(),
+        key,
+        ServerLink::Dial(addr),
+        first,
+    );
+}
+
+/// Prefer a hostname already known for `ip` (last_peers / discovered); else the IP.
+async fn session_key_for_ip(
+    inbound: &Wires,
+    app_status: &Arc<RwLock<AppStatus>>,
+    ip: IpAddr,
+) -> String {
+    let from_last = {
+        let guard = inbound.last_peers.lock().await;
+        guard
+            .iter()
+            .find(|(_, a)| a.ip() == ip)
+            .map(|(k, _)| k.clone())
+    }; // mutex dropped here
+    if let Some(name) = from_last {
+        if name.parse::<IpAddr>().is_err() {
+            return name;
+        }
+    }
+    let ip_s = ip.to_string();
+    let discovered = app_status.read().await.discovered.clone();
+    for peer in &discovered {
+        if peer.address == ip_s {
+            if !peer.name.is_empty() {
+                return peer.name.clone();
+            }
+            if !peer.host_name.is_empty() {
+                return peer.host_name.clone();
+            }
+        }
+    }
+    ip_s
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_server_link(
     cfg: Config,
@@ -789,6 +1280,8 @@ fn spawn_server_link(
     mut stop: watch::Receiver<bool>,
     key: String,
     link: ServerLink,
+    // Typed pairing-code dial: replace any incomplete session to this IP.
+    replace: bool,
 ) {
     tokio::spawn(async move {
         let dialed = matches!(link, ServerLink::Dial(_));
@@ -799,8 +1292,25 @@ fn spawn_server_link(
         match tls {
             Ok((stream, peer_cert)) => {
                 let (tx, rx) = new_link();
+                if replace {
+                    // Who typed the code initiates — own the slot.
+                    drop_sessions_to_ip(&peers, &inbound, peer_addr.ip()).await;
+                } else if already_linked_to_ip(&peers, &inbound, peer_addr.ip()).await {
+                    // Discovery/redial must not fight an existing (or offer) session.
+                    debug!(
+                        "already linked to {} via another name; dropping {key} at {peer_addr}",
+                        peer_addr.ip()
+                    );
+                    if dialed {
+                        inflight.lock().await.remove(&key);
+                    }
+                    return;
+                }
                 if dialed {
-                    if !peers.insert_new(&key, tx.clone()).await {
+                    if replace {
+                        // Force-take the key even if a racing insert landed.
+                        let _ = peers.adopt(&key, tx.clone(), Duration::ZERO).await;
+                    } else if !peers.insert_new(&key, tx.clone()).await {
                         debug!("already linked to {key}; dropping extra connection {peer_addr}");
                         inflight.lock().await.remove(&key);
                         return;
@@ -1141,10 +1651,28 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
 
 /// Tell the main loop `key` is gone, unless another session to it has taken over.
 /// Both sides dial at once when they reconnect; the extra link ending is not a disconnect.
+/// Also suppresses the IP-key hangup that follows an IP→hostname rekey while the
+/// hostname session is still live (otherwise the UI flashes 断开/已连接).
 async fn report_gone(peers: &PeerTable, wires: &Wires, key: &str) {
     if peers.contains(key).await {
         debug!("extra session to {key} closed; another one is still up");
         return;
+    }
+    if let Ok(ip) = key.parse::<IpAddr>() {
+        if already_linked_to_ip(peers, wires, ip).await {
+            debug!("session {key} closed; still linked under another name");
+            return;
+        }
+    } else {
+        let addr = wires.last_peers.lock().await.get(key).copied();
+        if let Some(addr) = addr {
+            if peers.contains(&addr.ip().to_string()).await
+                || already_linked_to_ip(peers, wires, addr.ip()).await
+            {
+                debug!("session {key} closed; still linked via {}", addr.ip());
+                return;
+            }
+        }
     }
     let _ = wires
         .events
@@ -1219,6 +1747,30 @@ async fn note_role_conflict(app_status: &Arc<RwLock<AppStatus>>, peer: &str) {
         ),
         true,
     );
+}
+
+/// Become the controlled computer and restart discovery so the host can dial in.
+async fn demote_to_client(
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    app_status: &Arc<RwLock<AppStatus>>,
+    net_reload: &watch::Sender<u64>,
+    peer: &str,
+) {
+    {
+        let mut saved = live.write().await;
+        if saved.role == Role::Client {
+            return;
+        }
+        info!("{peer} is the keyboard host; switching this computer to client");
+        saved.role = Role::Client;
+        if let Err(e) = saved.save(config_path) {
+            warn!("save client role: {e:#}");
+        }
+    }
+    app_status.write().await.role = "client".into();
+    app_status.write().await.peer_note = format!("已自动切换为从机，以便接受 {peer} 的控制");
+    net_reload.send_modify(|n| *n = n.wrapping_add(1));
 }
 
 fn effective_bind(cfg: &Config) -> String {
@@ -1531,7 +2083,20 @@ where
             } else {
                 remote.host_name.clone()
             };
-            note_role_conflict(app_status, &who).await;
+            if offer_ready(app_status).await {
+                // We typed a code — stay host; the other side should demote.
+                note_role_conflict(app_status, &who).await;
+                return Ok(());
+            }
+            // Peer is dialing as host (entered our code). Become client and retry.
+            demote_to_client(
+                &admit.live,
+                &admit.config_path,
+                app_status,
+                &inbound.net_reload,
+                &who,
+            )
+            .await;
             return Ok(());
         }
         let announced = remote.clone();
@@ -1577,8 +2142,14 @@ where
                 Ok(()) => {
                     let mut saved = admit.live.write().await;
                     saved.remember_peer(&name, &peer_fp);
+                    let desk = saved.ensure_trusted_screen_places();
                     if let Err(e) = saved.save(&admit.config_path) {
                         warn!("save trusted peer: {e:#}");
+                    }
+                    if desk {
+                        inbound
+                            .layout_reload
+                            .send_modify(|n| *n = n.wrapping_add(1));
                     }
                 }
                 Err(e) => {
@@ -1613,7 +2184,7 @@ where
             Ok(found) => found,
             Err(e) => {
                 let text = format!("{e:#}");
-                if text.contains("no_pair_code") {
+                if text.contains("no_pair_code") || text.contains("waiting_for_offer") {
                     let note = format!(
                         "{peer} 还没有信任本机。请在下方「添加对方配对码」输入 {peer} 首页上的六位配对码。"
                     );
@@ -1630,7 +2201,20 @@ where
         };
         peer_data_port = remote.ports.data;
         if both_hosts(cfg.role, &remote.role) {
-            note_role_conflict(app_status, &remote.host_name).await;
+            let who = if remote.host_name.is_empty() {
+                peer.clone()
+            } else {
+                remote.host_name.clone()
+            };
+            if offer_ready(app_status).await {
+                // We typed their code — keep hosting; they should auto-demote and
+                // accept on the next dial.
+                info!("{who} is still a host; waiting for it to switch to client");
+                app_status.write().await.peer_note = format!("{who} 正在切换为从机…");
+                return Ok(());
+            }
+            // Another host dialed us (or we crossed). Become client and retry.
+            demote_to_client(live, config_path, app_status, &inbound.net_reload, &who).await;
             return Ok(());
         }
         remember(&remote);
@@ -1645,12 +2229,43 @@ where
                 warn!("{msg}");
                 return Ok(());
             }
+            let desk = saved.ensure_trusted_screen_places();
             if let Err(e) = saved.save(config_path) {
                 warn!("save peer certificate: {e:#}");
             }
+            if desk {
+                inbound
+                    .layout_reload
+                    .send_modify(|n| *n = n.wrapping_add(1));
+            }
         }
+        // Offer dials may use the IP as the session key; layout and pointer
+        // switch need the hostname. Rekey once HELLO names the peer. If a
+        // hostname session is already live, drop this duplicate dial.
+        if !name.eq_ignore_ascii_case(&peer) {
+            if !inbound.peers.rekey(&peer, &name).await {
+                info!("session {name} already live; dropping duplicate dial via {peer}");
+                {
+                    let mut last = inbound.last_peers.lock().await;
+                    if let Some(addr) = last.remove(&peer) {
+                        last.entry(name.clone()).or_insert(addr);
+                    }
+                } // last_peers dropped before clear_offer .await
+                clear_offer(app_status).await;
+                return Ok(());
+            }
+            {
+                let mut last = inbound.last_peers.lock().await;
+                if let Some(addr) = last.remove(&peer) {
+                    last.insert(name.clone(), addr);
+                }
+            }
+            info!("session {peer} is now {name}");
+        }
+        // Connected — stop offer redials that would open a second link.
+        clear_offer(app_status).await;
         for frame in early {
-            dispatch_frame(frame, &peer, status, &mut inbound, is_host).await?;
+            dispatch_frame(frame, &name, status, &mut inbound, is_host).await?;
         }
         let _ = inbound.events.send(InboundEvent::Hello(remote)).await;
     }
@@ -1960,6 +2575,7 @@ async fn current_offer(status: &Arc<RwLock<AppStatus>>) -> String {
 }
 
 async fn clear_offer(status: &Arc<RwLock<AppStatus>>) {
+    debug!("clear_offer");
     let mut s = status.write().await;
     s.offer_code.clear();
     s.offer_until = 0;
@@ -2048,7 +2664,21 @@ where
         anyhow::bail!("bad_commit");
     }
     let _sas = csc_proto::pair_code(exporter, &na, &nb);
-    let confirm = if home_hit(app_status, &commit.code).await {
+    debug!(
+        commit_code_len = commit.code.len(),
+        local_offer_len = offer.len(),
+        host = %host_name,
+        "client_pair: got PairCommit"
+    );
+    // Host typed OUR home code → show confirm. Empty commit means host has not
+    // typed yet (should not happen once host waits for offer). Never sit 1.5s
+    // waiting for a local offer and then deny — that raced the initiator.
+    let typed_ours = home_hit(app_status, &commit.code).await;
+    let confirm = if typed_ours {
+        info!(
+            host = %host_name,
+            "client_pair: PairCommit matches this computer’s home code — confirm"
+        );
         let choice = wait_choice(
             reader,
             writer,
@@ -2065,34 +2695,36 @@ where
                 "cancel".into()
             },
         }
-    } else {
-        let code = if offer.len() == 6 {
-            offer
-        } else {
-            tokio::time::timeout(Duration::from_millis(1500), async {
-                loop {
-                    let ready = current_offer(app_status).await;
-                    if ready.len() == 6 {
-                        return ready;
-                    }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-            })
-            .await
-            .unwrap_or_default()
+    } else if commit.code.is_empty() {
+        warn!(
+            host = %host_name,
+            "client_pair: PairCommit has empty code — host must enter our pairing code"
+        );
+        let deny = csc_proto::PairConfirmPayload {
+            accepted: false,
+            code: String::new(),
         };
-        if code.len() != 6 {
-            let deny = csc_proto::PairConfirmPayload {
-                accepted: false,
-                code: String::new(),
-            };
-            write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
-            anyhow::bail!("no_pair_code");
-        }
+        write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
+        anyhow::bail!("no_pair_code");
+    } else if offer.len() == 6 {
+        // We also typed a code (rare both-sides case): accept with our offer.
+        debug!("client_pair: using local offer as PairConfirm code");
         csc_proto::PairConfirmPayload {
             accepted: true,
-            code,
+            code: offer,
         }
+    } else {
+        warn!(
+            commit = %commit.code,
+            host = %host_name,
+            "client_pair: PairCommit code is not this computer’s home code"
+        );
+        let deny = csc_proto::PairConfirmPayload {
+            accepted: false,
+            code: String::new(),
+        };
+        write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
+        anyhow::bail!("no_pair_code");
     };
     write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &confirm)?).await?;
     if !confirm.accepted {
@@ -2106,7 +2738,16 @@ where
         anyhow::bail!("pairing rejected");
     }
     clear_offer(app_status).await;
+    if typed_ours {
+        burn_home_code(app_status).await;
+    }
     Ok(())
+}
+
+/// The peer just paired with this computer's code: replace it so it works only once.
+async fn burn_home_code(status: &Arc<RwLock<AppStatus>>) {
+    crate::burn_home_code(&mut *status.write().await);
+    info!("pairing code used once; a new one is shown");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2136,6 +2777,7 @@ where
                 }
                 if frame.msg_type == MsgType::PairRequest {
                     if !pairing_window_open(app_status).await {
+                        warn!("host_wait_hello: pairing window closed — reject PairRequest");
                         let result = csc_proto::PairResultPayload {
                             status: "rejected".into(),
                         };
@@ -2151,7 +2793,34 @@ where
                             protocol_version: 2,
                             code: String::new(),
                         });
+                    debug!(
+                        peer = %peer_label,
+                        ask_code_len = ask.code.len(),
+                        "host_wait_hello: PairRequest"
+                    );
+                    // Whoever types the 6-digit code is the initiator and must
+                    // Dial a fresh control session. Discovery PairRequest must
+                    // not sit here waiting (that occupied the hostname slot,
+                    // dropped peer dial-backs, and sent PairCommit on a dying
+                    // discovery socket). Reject immediately when no offer is
+                    // ready; the offer dial path owns PairCommit.
                     let offer = current_offer(app_status).await;
+                    if offer.len() != 6 {
+                        debug!(
+                            peer = %peer_label,
+                            "host_wait_hello: no typed offer — reject discovery PairRequest (initiator must Dial)"
+                        );
+                        let result = csc_proto::PairResultPayload {
+                            status: "rejected".into(),
+                        };
+                        write_locked(writer, &encode_json_frame(MsgType::PairResult, &result)?)
+                            .await?;
+                        anyhow::bail!("waiting_for_offer");
+                    }
+                    info!(
+                        peer = %peer_label,
+                        "host_wait_hello: offer already present — PairCommit on this session"
+                    );
                     let na = random_nonce();
                     let commit = csc_proto::PairCommitPayload {
                         commit: hex_encode(&csc_proto::pair_commit(&na, device_id)),
@@ -2183,6 +2852,10 @@ where
                         anyhow::bail!("pairing cancelled");
                     }
                     if !ok.accepted {
+                        warn!(
+                            peer = %peer_label,
+                            "host_wait_hello: peer PairConfirm accepted=false (no_pair_code)"
+                        );
                         anyhow::bail!("no_pair_code");
                     }
                     let typed_ours = home_hit(app_status, &ok.code).await
@@ -2224,6 +2897,9 @@ where
                         anyhow::bail!("pairing rejected");
                     }
                     clear_offer(app_status).await;
+                    if typed_ours {
+                        burn_home_code(app_status).await;
+                    }
                     last = tokio::time::Instant::now();
                     continue;
                 }
@@ -2906,6 +3582,52 @@ mod tests {
         let n = count_udp_failure(n, false).unwrap();
         assert_eq!(count_udp_failure(n, true).unwrap(), 0);
         assert!(count_udp_failure(n, false).is_err());
+    }
+
+    #[test]
+    fn pairing_code_suffix_maps_to_peer_ip() {
+        let mut cfg = Config {
+            search_address: "192.168.1.90".into(),
+            control_port: 45433,
+            ..Default::default()
+        };
+        let addr = peer_addr_from_offer(&cfg, "582243", &[]).unwrap();
+        assert_eq!(addr, "192.168.1.243:45433".parse().unwrap());
+        // Own host octet must not dial self.
+        assert!(peer_addr_from_offer(&cfg, "111090", &[]).is_none());
+        assert!(peer_addr_from_offer(&cfg, "12", &[]).is_none());
+        // Settings reset clears search_address: fall back to the local IPv4.
+        cfg.search_address.clear();
+        assert!(peer_addr_from_offer(&cfg, "176026", &[]).is_none());
+        let local = ["192.168.1.90".to_string()];
+        let addr = peer_addr_from_offer(&cfg, "176026", &local).unwrap();
+        assert_eq!(addr, "192.168.1.26:45433".parse().unwrap());
+    }
+    #[tokio::test]
+    async fn rekey_keeps_existing_hostname_session() {
+        let peers = PeerTable::new();
+        let (host_link, host_rx) = new_link();
+        assert!(peers.insert_new("Desk", host_link).await);
+        let (ip_link, ip_rx) = new_link();
+        assert!(peers.insert_new("192.168.1.26", ip_link).await);
+        // Newcomer must not kill the hostname session.
+        assert!(!peers.rekey("192.168.1.26", "Desk").await);
+        assert!(peers.contains("Desk").await);
+        assert!(!peers.contains("192.168.1.26").await);
+        assert!(!*host_rx.kill.borrow());
+        // Dropped dial should not leave an orphan under the IP key.
+        assert!(!*ip_rx.kill.borrow() || !peers.contains("192.168.1.26").await);
+    }
+
+    #[tokio::test]
+    async fn rekey_moves_ip_session_to_hostname() {
+        let peers = PeerTable::new();
+        let (ip_link, rx) = new_link();
+        assert!(peers.insert_new("192.168.1.26", ip_link).await);
+        assert!(peers.rekey("192.168.1.26", "Desk").await);
+        assert!(peers.contains("Desk").await);
+        assert!(!peers.contains("192.168.1.26").await);
+        assert!(!*rx.kill.borrow());
     }
 
     #[test]

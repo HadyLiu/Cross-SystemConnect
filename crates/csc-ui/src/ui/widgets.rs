@@ -9,103 +9,246 @@ pub fn hint(ui: &mut egui::Ui, p: &Palette, text: &str) {
 
 /// Form metrics: label / control share one font size and one row height.
 pub const FORM_FONT: f32 = 14.0;
-pub const FORM_LABEL_W: f32 = 140.0;
-pub const FORM_FIELD_W: f32 = 180.0;
-pub const FORM_ROW_H: f32 = 32.0;
+pub const FORM_FIELD_W: f32 = 152.0;
+pub const FORM_ROW_H: f32 = 34.0;
+pub const FIELD_RADIUS: u8 = 10;
 
 /// Field width capped by remaining row space (avoids column overflow / overlap).
 pub fn field_width(ui: &egui::Ui) -> f32 {
     ui.available_width().clamp(64.0, FORM_FIELD_W)
 }
 
-/// Two equal columns; `add(left, right)` runs sequentially (safe for `&mut App`).
-///
-/// Uses unbounded column height so cards inside a `ScrollArea` are not clipped to
-/// the viewport (`ui.columns` max_rect bottoms at the parent max, which hides the
-/// next row of cards).
-pub fn two_col(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui, &mut egui::Ui)) {
-    let gap = 14.0;
-    ui.spacing_mut().item_spacing.x = gap;
-    let total_w = ui.available_width();
-    let col_w = ((total_w - gap) * 0.5).max(0.0);
-    let top_left = ui.cursor().min;
-    // Large finite height: enough for any settings page, without relying on
-    // parent max_rect (ScrollArea content max is only the viewport).
-    let tall = 100_000.0;
-
-    let left_rect = egui::Rect::from_min_size(top_left, egui::vec2(col_w, tall));
-    let right_rect = egui::Rect::from_min_size(
-        egui::pos2(top_left.x + col_w + gap, top_left.y),
-        egui::vec2(col_w, tall),
-    );
-
-    let mut left = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("two_col_l")
-            .max_rect(left_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    left.set_width(col_w);
-    // Horizontal-only clip so a wide control cannot paint into the sibling column.
-    left.shrink_clip_rect(egui::Rect::from_x_y_ranges(
-        left_rect.x_range(),
-        ui.clip_rect().y_range(),
-    ));
-
-    let mut right = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("two_col_r")
-            .max_rect(right_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    right.set_width(col_w);
-    right.shrink_clip_rect(egui::Rect::from_x_y_ranges(
-        right_rect.x_range(),
-        ui.clip_rect().y_range(),
-    ));
-
-    add(&mut left, &mut right);
-
-    let h = left.min_size().y.max(right.min_size().y);
-    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
-        top_left,
-        egui::vec2(total_w, h),
-    ));
+/// Cursor-style section title above a settings card.
+pub fn section_heading(ui: &mut egui::Ui, p: &Palette, title: &str) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(title).size(15.0).strong().color(p.text));
+    ui.add_space(10.0);
 }
 
-/// Form row: fixed label column, controls on the same baseline (no nested
-/// allocate_ui — that was expanding to the full card height and floating
-/// controls below their labels).
-pub fn form_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let row_w = ui.available_width();
-    let label_w = FORM_LABEL_W.min((row_w * 0.42).max(72.0));
-
-    // horizontal defaults to cross-align Center → label & control share one baseline.
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        ui.set_max_width(row_w);
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(label_w, FORM_ROW_H),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_max_width(label_w);
-                ui.add(
-                    egui::Label::new(RichText::new(label).size(FORM_FONT).color(p.text_2))
-                        .truncate(),
-                );
-            },
-        );
-
-        // Controls are direct children — height follows content, not available_height.
-        add(ui);
-    });
-    ui.add_space(12.0);
+/// Outlined action button (Open / Show / Import style).
+pub fn outline_button(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).size(12.5).color(p.text))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, p.border_strong))
+            .corner_radius(6.0)
+            .min_size(egui::vec2(64.0, 28.0)),
+    )
 }
 
-/// Number / DragValue sized like `.mac-input`, shrinks in narrow columns.
-pub fn mac_drag(ui: &mut egui::Ui, drag: egui::DragValue<'_>) -> egui::Response {
-    ui.add_sized(egui::vec2(field_width(ui), FORM_ROW_H), drag)
+/// Cursor-style settings card: rounded panel of title/desc rows + right controls.
+pub fn settings_card(ui: &mut egui::Ui, p: &Palette, add: impl FnOnce(&mut SettingsList<'_, '_>)) {
+    egui::Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(10))
+        .show(ui, |ui| {
+            let mut list = SettingsList { ui, p, rows: 0 };
+            add(&mut list);
+        });
+    ui.add_space(20.0);
+}
+
+/// Card with custom body (topology, logs) — same shell, padded content.
+pub fn settings_card_body(ui: &mut egui::Ui, p: &Palette, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| add(ui));
+    ui.add_space(20.0);
+}
+
+pub struct SettingsList<'ui, 'p> {
+    ui: &'ui mut egui::Ui,
+    p: &'p Palette,
+    rows: usize,
+}
+
+impl SettingsList<'_, '_> {
+    /// Title + muted description on the left; control(s) on the right.
+    pub fn row(&mut self, title: &str, desc: &str, add: impl FnOnce(&mut egui::Ui)) {
+        if self.rows > 0 {
+            let full = self.ui.max_rect();
+            let y = self.ui.cursor().top();
+            self.ui.painter().hline(
+                egui::Rangef::new(full.left() + 16.0, full.right() - 16.0),
+                y,
+                Stroke::new(1.0, self.p.border),
+            );
+        }
+        self.rows += 1;
+
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(16, 13))
+            .show(self.ui, |ui| {
+                let p = *self.p;
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // Leave room for a field + outline button (pairing code row).
+                        let text_w = (ui.available_width() - 250.0).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.label(RichText::new(title).size(13.5).color(p.text));
+                                if !desc.is_empty() {
+                                    ui.add_space(3.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(desc).size(12.0).color(p.text_2),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            },
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        add(ui);
+                    });
+                });
+            });
+    }
+}
+
+/// Centered inset number field. Type to edit — no left/right drag scrubbing.
+pub fn mac_number<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+) -> egui::Response {
+    mac_number_with(ui, value, range, "")
+}
+
+/// Like [`mac_number`], with a display suffix (e.g. `" MiB/s"`).
+pub fn mac_number_with<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    suffix: &str,
+) -> egui::Response {
+    number_field(ui, value, range, suffix, None)
+}
+
+/// Like [`mac_number`], always shown with `decimals` digits (e.g. `1.0`).
+pub fn mac_number_fixed<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    decimals: usize,
+) -> egui::Response {
+    number_field(ui, value, range, "", Some(decimals))
+}
+
+fn number_field<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    suffix: &str,
+    decimals: Option<usize>,
+) -> egui::Response {
+    let p = Palette::app();
+    let w = field_width(ui);
+    let id = ui.next_auto_id().with("mac_number");
+    let focused = ui.memory(|m| m.has_focus(id));
+
+    let display = match decimals {
+        Some(d) => format!("{:.*}", d, value.to_f64()),
+        None => format_number(value.to_f64(), suffix),
+    };
+    let mut text = if focused {
+        ui.data_mut(|d| {
+            d.get_temp::<String>(id)
+                .unwrap_or_else(|| strip_suffix(&display, suffix))
+        })
+    } else {
+        display
+    };
+
+    let stroke = if focused {
+        Stroke::new(1.5, p.accent)
+    } else {
+        Stroke::new(1.0, p.border)
+    };
+    let frame = egui::Frame::new()
+        .fill(p.input)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(FIELD_RADIUS))
+        .inner_margin(egui::Margin::symmetric(8, 6));
+
+    let mut response = ui.add_sized(
+        egui::vec2(w, FORM_ROW_H),
+        egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .desired_width(w)
+            .frame(frame)
+            .background_color(p.input)
+            .horizontal_align(egui::Align::Center)
+            .vertical_align(egui::Align::Center)
+            .font(FontId::proportional(FORM_FONT)),
+    );
+
+    if focused || response.gained_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text.clone()));
+    }
+    if response.lost_focus() {
+        ui.data_mut(|d| d.remove_temp::<String>(id));
+    }
+
+    // Commit on Enter / focus lost (not while every keystroke — avoids fighting the caret).
+    let commit =
+        response.lost_focus() || (focused && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+    if commit {
+        let raw = strip_suffix(text.trim(), suffix);
+        if let Ok(parsed) = raw.parse::<f64>() {
+            let lo = range.start().to_f64();
+            let hi = range.end().to_f64();
+            let clamped = parsed.clamp(lo.min(hi), lo.max(hi));
+            let next = Num::from_f64(clamped);
+            if next.to_f64() != value.to_f64() {
+                *value = next;
+                response.mark_changed();
+            }
+        }
+    }
+
+    response
+}
+
+fn format_number(v: f64, suffix: &str) -> String {
+    let body = if (v.fract().abs() * 1e9).round() < 1.0 {
+        format!("{v:.0}")
+    } else if (v * 100.0).fract().abs() < 1e-6 {
+        format!("{v:.2}")
+    } else {
+        format!("{v}")
+    };
+    if suffix.is_empty() {
+        body
+    } else {
+        format!("{body}{suffix}")
+    }
+}
+
+fn strip_suffix(s: &str, suffix: &str) -> String {
+    let t = s.trim();
+    if !suffix.is_empty() && t.ends_with(suffix) {
+        t[..t.len() - suffix.len()].trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn paint_inset_field(ui: &mut egui::Ui, p: &Palette, rect: egui::Rect) {
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(FIELD_RADIUS),
+        p.input,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Soft toggle (green when on); height matches form row.
@@ -161,7 +304,7 @@ pub fn nav_item(
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     let text_color = if selected {
         p.accent
     } else if hover {
@@ -303,13 +446,7 @@ pub fn status_pill(ui: &mut egui::Ui, p: &Palette, ok: bool, label: &str) {
 }
 
 pub fn ghost_button(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).size(FORM_FONT).color(p.text))
-            .fill(p.card)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(6.0)
-            .min_size(egui::vec2(0.0, FORM_ROW_H)),
-    )
+    outline_button(ui, p, label)
 }
 
 pub fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
@@ -317,7 +454,7 @@ pub fn primary_button(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Resp
         egui::Button::new(RichText::new(label).size(FORM_FONT).color(p.on_accent))
             .fill(p.accent)
             .stroke(Stroke::NONE)
-            .corner_radius(6.0)
+            .corner_radius(8.0)
             .min_size(egui::vec2(0.0, FORM_ROW_H)),
     )
 }
@@ -327,29 +464,25 @@ pub fn danger_text_button(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::
         egui::Button::new(RichText::new(label).size(FORM_FONT).color(p.danger))
             .fill(p.card)
             .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(6.0)
+            .corner_radius(8.0)
             .min_size(egui::vec2(0.0, FORM_ROW_H)),
     )
 }
 
 pub fn pairing_code(ui: &mut egui::Ui, p: &Palette, code: &str) {
     let display = format_code(code);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(118.0, FORM_ROW_H), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(6), p.input);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(6),
-        Stroke::new(1.0, p.border),
-        egui::StrokeKind::Outside,
-    );
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        display,
-        FontId::monospace(FORM_FONT),
-        p.accent,
-    );
+    // Same width as ComboBox / mac_number so the right column lines up.
+    let w = field_width(ui).max(FORM_FIELD_W);
+    let h = 46.0;
+    let size = Vec2::new(w, h);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    paint_inset_field(ui, p, rect);
+    // Layout then paint at geometric center (Align2 alone can look top-heavy).
+    let galley = ui
+        .painter()
+        .layout_no_wrap(display, FontId::monospace(28.0), p.accent);
+    let pos = rect.center() - galley.size() * 0.5;
+    ui.painter().galley(pos, galley, p.accent);
 }
 
 pub fn digit_boxes(ui: &mut egui::Ui, p: &Palette, digits: &mut [String; 6]) -> bool {
@@ -432,16 +565,15 @@ pub fn digit_boxes(ui: &mut egui::Ui, p: &Palette, digits: &mut [String; 6]) -> 
 
     for (i, rect) in rects.iter().enumerate() {
         let is_focus = active && focused == i;
-        ui.painter()
-            .rect_filled(*rect, CornerRadius::same(6), p.input);
-        ui.painter().rect_stroke(
+        ui.painter().rect(
             *rect,
-            CornerRadius::same(6),
+            CornerRadius::same(FIELD_RADIUS),
+            p.input,
             Stroke::new(
                 if is_focus { 1.5 } else { 1.0 },
                 if is_focus { p.accent } else { p.border },
             ),
-            egui::StrokeKind::Outside,
+            egui::StrokeKind::Inside,
         );
         if !digits[i].is_empty() {
             ui.painter().text(
@@ -474,13 +606,28 @@ pub fn format_code(code: &str) -> String {
 }
 
 pub fn mac_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
+    let p = Palette::app();
     let w = field_width(ui);
+    let id = ui.next_auto_id().with("mac_text");
+    let focused = ui.memory(|m| m.has_focus(id));
+    let stroke = if focused {
+        Stroke::new(1.5, p.accent)
+    } else {
+        Stroke::new(1.0, p.border)
+    };
+    let frame = egui::Frame::new()
+        .fill(p.input)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(FIELD_RADIUS))
+        .inner_margin(egui::Margin::symmetric(10, 6));
     ui.add_sized(
         egui::vec2(w, FORM_ROW_H),
         egui::TextEdit::singleline(text)
+            .id(id)
             .desired_width(w)
-            .margin(egui::Margin::symmetric(10, 4))
-            .horizontal_align(egui::Align::LEFT)
+            .frame(frame)
+            .background_color(p.input)
+            .horizontal_align(egui::Align::Center)
             .vertical_align(egui::Align::Center)
             .font(FontId::proportional(FORM_FONT)),
     )
