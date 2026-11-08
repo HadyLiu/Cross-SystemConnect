@@ -354,6 +354,9 @@ pub struct GuiConfig {
     /// False only on a config this program just created.
     #[serde(default = "default_true")]
     pub wizard_done: bool,
+    /// Ask GitHub Releases for a newer version when the settings window starts.
+    #[serde(default)]
+    pub check_updates: bool,
 }
 
 fn default_language() -> String {
@@ -409,6 +412,7 @@ impl Default for GuiConfig {
             close_to_tray: true,
             language: default_language(),
             wizard_done: false,
+            check_updates: false,
         }
     }
 }
@@ -1282,6 +1286,32 @@ impl Config {
             changed = true;
         }
 
+        // The desk only draws ring slots. A place saved farther out (an older
+        // build stored pixel offsets) would hide the peer; keep its direction.
+        for i in 0..self.screens.len() {
+            let s = &self.screens[i];
+            if s.name.eq_ignore_ascii_case(&host) || (s.x.abs() <= 1 && s.y.abs() <= 1) {
+                continue;
+            }
+            let want = (s.x.signum(), s.y.signum());
+            let name = s.name.clone();
+            let free = |slot: (i32, i32), places: &[ScreenPlace]| {
+                !places
+                    .iter()
+                    .any(|p| !p.name.eq_ignore_ascii_case(&name) && (p.x, p.y) == slot)
+            };
+            let slot = if free(want, &self.screens) {
+                want
+            } else {
+                nearest_screen_slot(want.0, want.1, &name, &self.screens)
+            };
+            if slot.0.abs() <= 1 && slot.1.abs() <= 1 {
+                self.screens[i].x = slot.0;
+                self.screens[i].y = slot.1;
+                changed = true;
+            }
+        }
+
         for name in &peers {
             if self
                 .screens
@@ -1494,6 +1524,36 @@ mod tests {
         assert!(cfg.ensure_trusted_screen_places());
         assert!(cfg.screens.is_empty());
         assert!(cfg.layout.is_empty());
+    }
+
+    #[test]
+    fn far_places_come_back_to_the_ring() {
+        let mut cfg = Config {
+            name: "hady-one".into(),
+            trusted_peers: vec!["hady-TM1703".into()],
+            screens: vec![
+                ScreenPlace {
+                    name: "hady-one".into(),
+                    x: 0,
+                    y: 0,
+                },
+                ScreenPlace {
+                    name: "hady-TM1703".into(),
+                    x: 137,
+                    y: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(cfg.ensure_trusted_screen_places());
+        let peer = cfg
+            .screens
+            .iter()
+            .find(|s| s.name == "hady-TM1703")
+            .unwrap();
+        assert_eq!((peer.x, peer.y), (1, 0));
+        assert_eq!(cfg.layout["hady-one"]["right"], "hady-TM1703");
+        assert!(!cfg.ensure_trusted_screen_places());
     }
 
     #[test]

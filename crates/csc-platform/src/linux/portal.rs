@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-const DEST: &str = "org.freedesktop.portal.Desktop";
-const PATH: &str = "/org/freedesktop/portal/desktop";
+pub(super) const DEST: &str = "org.freedesktop.portal.Desktop";
+pub(super) const PATH: &str = "/org/freedesktop/portal/desktop";
 const IFACE: &str = "org.freedesktop.portal.InputCapture";
 const CAP_KEYBOARD: u32 = 1;
 const CAP_POINTER: u32 = 2;
@@ -147,19 +147,30 @@ pub fn start(core_size: (i32, i32)) -> bool {
         .is_ok()
 }
 
-type BoxErr = Box<dyn std::error::Error>;
+pub(super) type BoxErr = Box<dyn std::error::Error>;
 
-fn next_token() -> String {
+pub(super) fn next_token() -> String {
     format!("csc{}", TOKEN.fetch_add(1, Ordering::AcqRel))
 }
 
-fn var<T: RefArg + 'static>(v: T) -> Variant<Box<dyn RefArg>> {
+pub(super) fn var<T: RefArg + 'static>(v: T) -> Variant<Box<dyn RefArg>> {
     Variant(Box::new(v))
 }
 
-/// Call a portal method that answers through a Request object, and wait for it.
 fn request<A: dbus::arg::AppendAll>(
     conn: &Connection,
+    method: &str,
+    token: &str,
+    args: A,
+    wait: Duration,
+) -> Result<PropMap, BoxErr> {
+    request_on(conn, IFACE, method, token, args, wait)
+}
+
+/// Call a portal method that answers through a Request object, and wait for it.
+pub(super) fn request_on<A: dbus::arg::AppendAll>(
+    conn: &Connection,
+    iface: &str,
     method: &str,
     token: &str,
     args: A,
@@ -178,7 +189,7 @@ fn request<A: dbus::arg::AppendAll>(
         false
     })?;
     let proxy = conn.with_proxy(DEST, PATH, Duration::from_secs(5));
-    let (_handle,): (dbus::Path,) = proxy.method_call(IFACE, method, args)?;
+    let (_handle,): (dbus::Path,) = proxy.method_call(iface, method, args)?;
     let until = Instant::now() + wait;
     loop {
         if let Some((code, results)) = answer.lock().ok().and_then(|mut s| s.take()) {

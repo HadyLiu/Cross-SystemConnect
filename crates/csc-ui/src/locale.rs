@@ -38,22 +38,6 @@ pub fn settings() -> &'static str {
     }
 }
 
-pub fn pause_sharing() -> &'static str {
-    if english() {
-        "Pause sharing"
-    } else {
-        "暂停共享"
-    }
-}
-
-pub fn resume_sharing() -> &'static str {
-    if english() {
-        "Resume sharing"
-    } else {
-        "继续共享"
-    }
-}
-
 pub fn quit() -> &'static str {
     if english() {
         "Quit"

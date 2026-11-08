@@ -172,6 +172,13 @@ pub mod win;
 pub use host::*;
 pub use traits::*;
 
+/// Hand the watched lock / stay / pause combinations to the desktop, where the
+/// local key watch cannot see keys (Wayland). Call after changing a watch.
+pub fn sync_global_shortcuts() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::shortcuts::sync();
+}
+
 pub fn create_input_capture() -> Box<dyn InputCapture> {
     #[cfg(windows)]
     {

@@ -4,6 +4,7 @@ use crate::ui::widgets::{
     self, field_width, mac_number, mac_number_with, mac_text_edit, mac_toggle, outline_button,
     section_heading, settings_card, settings_card_body,
 };
+use crate::update::UpdateState;
 use eframe::egui::{self, RichText};
 
 fn tr<'a>(zh: &'a str, en: &'a str) -> &'a str {
@@ -181,8 +182,8 @@ pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
             &p,
             tr("锁定屏幕", "Lock screens"),
             tr(
-                "在输入框中编辑组合键，例如 Ctrl+Shift+L。",
-                "Edit the combo as text, e.g. Ctrl+Shift+L.",
+                "点击右侧按钮后按下组合键；Esc 取消，Backspace 清除。",
+                "Click the field, then press the keys. Esc cancels, Backspace clears.",
             ),
             |c| &mut c.hotkeys.lock_screen,
         );
@@ -369,7 +370,7 @@ fn hotkey_settings_row(
 ) {
     list.row(title, desc, |ui| {
         let v = field(&mut app.cfg);
-        if mac_text_edit(ui, v).changed() {
+        if widgets::hotkey_field(ui, v).changed() {
             app.queue_save();
         }
         let _ = p;
@@ -791,20 +792,74 @@ pub fn draw_about(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
+        let state = app.updater.state();
+        let desc = match &state {
+            UpdateState::Idle => tr(
+                "从 GitHub Releases 查询最新版本，只打开下载页，不自动安装。",
+                "Looks up the latest version on GitHub Releases. Opens the download; never installs.",
+            )
+            .to_string(),
+            UpdateState::Checking => tr("正在检查…", "Checking…").to_string(),
+            UpdateState::UpToDate(v) => {
+                format!("{} v{v}", tr("已是最新版本", "Up to date:"))
+            }
+            UpdateState::Available(r) => format!(
+                "{} v{}（{}）",
+                tr("发现新版本", "New version"),
+                r.version,
+                r.published
+            ),
+            UpdateState::Failed(e) => format!("{}：{e}", tr("检查失败", "Check failed")),
+        };
+        list.row(tr("检查更新", "Check for updates"), &desc, |ui| {
+            let checking = matches!(state, UpdateState::Checking);
+            let label = tr("检查", "Check");
+            if ui
+                .add_enabled_ui(!checking, |ui| outline_button(ui, &p, label))
+                .inner
+                .clicked()
+            {
+                app.updater.check(ui.ctx());
+            }
+            if let UpdateState::Available(r) = &state {
+                if outline_button(ui, &p, tr("发布页", "Release page")).clicked() {
+                    let _ = open::that(&r.page);
+                }
+                if let Some(url) = &r.download {
+                    if outline_button(ui, &p, tr("下载", "Download")).clicked() {
+                        let _ = open::that(url);
+                    }
+                }
+            }
+        });
         list.row(
-            tr("检查更新", "Check for updates"),
+            tr("启动时检查更新", "Check on startup"),
             tr(
-                "更新地址未配置时不会联网。",
-                "Does not use the network when no update address is set.",
+                "打开本程序时向 GitHub 查询一次，只带版本号。",
+                "Asks GitHub once when this program starts. Sends only the version.",
             ),
             |ui| {
-                if outline_button(ui, &p, tr("检查", "Check")).clicked() {
-                    app.set_ok(tr(
-                        "更新地址还没有配置，所以这里不会联网。",
-                        "No update address is configured, so this does not use the network.",
-                    ));
+                if mac_toggle(ui, &p, &mut app.cfg.gui.check_updates).clicked() {
+                    app.queue_save();
                 }
             },
         );
     });
+
+    if let UpdateState::Available(r) = app.updater.state() {
+        if !r.notes.trim().is_empty() {
+            ui.add_space(12.0);
+            section_heading(
+                ui,
+                &p,
+                &format!("v{} {}", r.version, tr("更新内容", "notes")),
+            );
+            settings_card_body(ui, &p, |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(r.notes.trim()).size(12.5).color(p.text_2))
+                        .wrap(),
+                );
+            });
+        }
+    }
 }

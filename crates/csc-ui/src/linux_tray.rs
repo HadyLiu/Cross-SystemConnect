@@ -3,7 +3,7 @@
 //! Menu actions that must work while the settings window is minimized run here
 //! on the tray/dbus thread — the egui loop may be asleep and never drain events.
 
-use crate::events::{EventBus, UiEvent};
+use crate::events::EventBus;
 use crate::icon::{self, GreenDot};
 
 pub struct LinuxTray {
@@ -89,16 +89,7 @@ impl ksni::Tray for LinuxTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        let sharing = crate::ipc_client::get_status()
-            .ok()
-            .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
-            .unwrap_or(true);
-        let pause_label = if sharing {
-            crate::locale::pause_sharing()
-        } else {
-            crate::locale::resume_sharing()
-        };
-        vec![settings_item(), sharing_item(pause_label), quit_item()]
+        vec![settings_item(), quit_item()]
     }
 }
 
@@ -131,25 +122,6 @@ fn settings_item() -> ksni::MenuItem<LinuxTray> {
         label: crate::locale::settings().into(),
         activate: Box::new(|tray: &mut LinuxTray| {
             tray.bus.show_settings_now();
-        }),
-        ..Default::default()
-    }
-    .into()
-}
-
-fn sharing_item(label: &str) -> ksni::MenuItem<LinuxTray> {
-    ksni::menu::StandardItem {
-        label: label.into(),
-        activate: Box::new(|tray: &mut LinuxTray| {
-            // Run on the tray thread — does not need the egui loop.
-            let sharing_on = crate::ipc_client::get_status()
-                .ok()
-                .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
-                .unwrap_or(true);
-            match crate::ipc_client::set_sharing_enabled(!sharing_on) {
-                Ok(_) => tray.bus.send(UiEvent::SharingToggled),
-                Err(e) => tracing::warn!("tray toggle sharing: {e:#}"),
-            }
         }),
         ..Default::default()
     }

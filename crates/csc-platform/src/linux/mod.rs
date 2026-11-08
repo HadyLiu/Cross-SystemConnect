@@ -7,6 +7,7 @@ pub(crate) mod leds;
 pub(crate) mod paste_hold;
 pub mod portal;
 pub(crate) mod power;
+pub(crate) mod shortcuts;
 pub(crate) mod uinput;
 mod xdo;
 

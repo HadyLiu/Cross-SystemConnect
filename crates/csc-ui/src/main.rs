@@ -15,6 +15,7 @@ mod theme;
 mod ui;
 #[cfg(target_os = "linux")]
 mod unix_signals;
+mod update;
 
 use crate::events::EventBus;
 use eframe::egui;
@@ -114,6 +115,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport,
+        event_loop_builder: x11_event_loop(),
         ..Default::default()
     };
 
@@ -122,6 +124,31 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, bus, events, open_settings)))),
     )
+}
+
+/// On a Wayland desktop, run the window through XWayland. A Wayland client
+/// cannot unminimize itself, and winit cannot hide/show a Wayland window, so
+/// the tray could never bring settings back. X11 maps and unmaps it reliably.
+#[cfg(target_os = "linux")]
+fn x11_event_loop() -> Option<eframe::EventLoopBuilderHook> {
+    if !x11_window() {
+        return None;
+    }
+    Some(Box::new(|builder| {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn x11_event_loop() -> Option<eframe::EventLoopBuilderHook> {
+    None
+}
+
+/// The settings window is an X11 window (X11 session or XWayland).
+#[cfg(target_os = "linux")]
+pub fn x11_window() -> bool {
+    std::env::var_os("DISPLAY").is_some()
 }
 
 struct SingletonGuard;

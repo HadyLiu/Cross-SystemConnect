@@ -633,6 +633,164 @@ pub fn mac_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
     )
 }
 
+/// Shortcut field: click it, then press the combination. Esc cancels,
+/// Backspace / Delete clears. Written as `Ctrl+Alt+/`, the core's hotkey syntax.
+pub fn hotkey_field(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+    let p = Palette::app();
+    let en = crate::locale::is_english();
+    let size = Vec2::new(field_width(ui), FORM_ROW_H);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        resp.request_focus();
+    }
+    let recording = resp.has_focus();
+    if recording {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
+        let events = ui.input(|i| i.events.clone());
+        for ev in events {
+            let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            let key = physical_key.unwrap_or(key);
+            // A shortcut without Ctrl or Alt would swallow ordinary typing.
+            if !modifiers.ctrl && !modifiers.alt {
+                match key {
+                    egui::Key::Escape => {}
+                    egui::Key::Backspace | egui::Key::Delete => {
+                        value.clear();
+                        resp.mark_changed();
+                    }
+                    _ => continue,
+                }
+                resp.surrender_focus();
+                break;
+            }
+            if let Some(name) = hotkey_key_name(key) {
+                *value = format!("{}{name}", hotkey_mods(modifiers));
+                resp.mark_changed();
+                resp.surrender_focus();
+                break;
+            }
+        }
+    }
+    let recording = resp.has_focus();
+    let (text, color) = if recording {
+        let held = hotkey_mods(ui.input(|i| i.modifiers));
+        let text = if held.is_empty() {
+            if en {
+                "Press keys…"
+            } else {
+                "请按下组合键…"
+            }
+            .to_string()
+        } else {
+            format!("{held}…")
+        };
+        (text, p.accent)
+    } else if value.trim().is_empty() {
+        (if en { "Not set" } else { "未设置" }.to_string(), p.text_2)
+    } else {
+        (value.clone(), p.text)
+    };
+    let stroke = if recording {
+        Stroke::new(1.5, p.accent)
+    } else if resp.hovered() {
+        Stroke::new(1.0, p.border_strong)
+    } else {
+        Stroke::new(1.0, p.border)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(FIELD_RADIUS),
+        p.input,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(FORM_FONT),
+        color,
+    );
+    let tip = if en {
+        "Click, then press the shortcut (Esc cancels, Backspace clears)"
+    } else {
+        "点击后按下快捷键（Esc 取消，Backspace 清除）"
+    };
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip)
+}
+
+fn hotkey_mods(m: egui::Modifiers) -> String {
+    let mut out = String::new();
+    for (on, name) in [(m.ctrl, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift")] {
+        if on {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out
+}
+
+/// Key name as the core's hotkey parser reads it; `None` for keys it cannot bind.
+fn hotkey_key_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key as K;
+    Some(match key {
+        K::Enter => "Enter",
+        K::Escape => "Esc",
+        K::Backspace => "Backspace",
+        K::Tab => "Tab",
+        K::Space => "Space",
+        K::Insert => "Insert",
+        K::Delete => "Delete",
+        K::Home => "Home",
+        K::End => "End",
+        K::PageUp => "PageUp",
+        K::PageDown => "PageDown",
+        K::ArrowLeft => "Left",
+        K::ArrowRight => "Right",
+        K::ArrowUp => "Up",
+        K::ArrowDown => "Down",
+        K::Minus => "-",
+        K::Equals => "=",
+        K::OpenBracket => "[",
+        K::CloseBracket => "]",
+        K::Backslash => "\\",
+        K::Semicolon => ";",
+        K::Quote => "'",
+        K::Backtick => "`",
+        K::Comma => ",",
+        K::Period => ".",
+        K::Slash => "/",
+        _ => {
+            let name = key.name();
+            let ok = (name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric())
+                || (name.starts_with('F')
+                    && name[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)));
+            return ok.then_some(name);
+        }
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WindowAction {
     None,

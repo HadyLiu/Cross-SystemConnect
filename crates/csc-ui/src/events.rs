@@ -9,8 +9,6 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub enum UiEvent {
     ShowSettings,
-    /// Sharing already toggled on the tray thread; UI should refresh status/labels.
-    SharingToggled,
     Transfers(Vec<Value>),
     TrayLink {
         connected: bool,

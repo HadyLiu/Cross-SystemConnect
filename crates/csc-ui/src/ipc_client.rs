@@ -270,10 +270,6 @@ pub fn reset_data(keep_pairing: bool) -> anyhow::Result<Value> {
     call("reset_data", json!({"keepPairing": keep_pairing}))
 }
 
-pub fn set_sharing_enabled(enabled: bool) -> anyhow::Result<Value> {
-    call("set_sharing_enabled", json!({"enabled": enabled}))
-}
-
 pub fn export_diagnostics() -> anyhow::Result<Value> {
     call("export_diagnostics", json!({}))
 }

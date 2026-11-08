@@ -30,12 +30,20 @@ eframe = { version = "0.36.2", default-features = false, features = [
 rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
+# 检查更新：系统根证书校验（不用 webpki-roots，其 CDLA 许可不在 deny.toml 白名单）
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "platform-verifier",
+    "gzip",
+] }
+rustls.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = "0.19"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.2"
+winit = { version = "0.30", default-features = false, features = ["x11"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

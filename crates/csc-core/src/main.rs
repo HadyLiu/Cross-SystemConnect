@@ -409,6 +409,8 @@ struct Core {
     stay_hotkey: Option<Hotkey>,
     pause_hotkey: Option<Hotkey>,
     stay_on: bool,
+    /// A hotkey handled while grabbed; the desktop may report the same press.
+    last_grab_hotkey: Instant,
     last_lock: Instant,
     last_miss: Instant,
     /// Wayland keyboard host still waiting for the input capture permission.
@@ -510,6 +512,7 @@ fn watch_local(cfg: &Config) -> (Option<Hotkey>, Option<Hotkey>) {
         Some(k) => csc_platform::pause_watch(&k.mods, k.key),
         None => csc_platform::pause_watch(&[], 0),
     }
+    csc_platform::sync_global_shortcuts();
     (stay, pause)
 }
 
@@ -695,17 +698,22 @@ impl Core {
             (self.stay_hotkey, self.pause_hotkey) = watch_local(&cfg);
             self.load_input_prefs(&cfg);
         }
-        if csc_platform::lock_hits() > 0 && !self.grab {
+        // While grabbed, `grab_input` sees the keys itself; a desktop shortcut
+        // reported for the same press must not act a second time.
+        let local = !self.grab && self.last_grab_hotkey.elapsed() > Duration::from_millis(500);
+        let (lock, stay, pause) = (
+            csc_platform::lock_hits() > 0 && local,
+            csc_platform::stay_hits() > 0 && local,
+            csc_platform::pause_hits() > 0 && local,
+        );
+        if lock {
             self.lock_all(None).await;
         }
-        if csc_platform::stay_hits() > 0 {
+        if stay {
             self.stay_on = !self.stay_on;
             info!(stay = self.stay_on, "stay on this screen");
-            if self.stay_on && self.grab {
-                self.return_home("stay on this screen").await;
-            }
         }
-        if csc_platform::pause_hits() > 0 {
+        if pause {
             let on = {
                 let mut s = self.status.write().await;
                 s.sharing_enabled = !s.sharing_enabled;
@@ -715,9 +723,6 @@ impl Core {
                 s.sharing_enabled
             };
             info!(sharing = on, "emergency pause");
-            if !on && self.grab {
-                self.return_home("emergency pause").await;
-            }
         }
         let block = block_bit(&self.config.read().await.switch_cfg.block_modifier);
         let held = csc_platform::mods_held();
@@ -944,6 +949,9 @@ impl Core {
                     .is_some_and(|k| k.completes(hid, &self.held.keys))
             };
             let (lock, back) = (hit(&self.lock_hotkey), hit(&self.return_hotkey));
+            if lock || back || hit(&self.stay_hotkey) || hit(&self.pause_hotkey) {
+                self.last_grab_hotkey = Instant::now();
+            }
             if lock {
                 self.lock_all(None).await;
                 return true;
@@ -2516,6 +2524,7 @@ pub async fn run() -> anyhow::Result<()> {
         stay_hotkey,
         pause_hotkey,
         stay_on: false,
+        last_grab_hotkey: Instant::now(),
         paused_peers: HashSet::new(),
         greeted: HashSet::new(),
         sharing_announced: true,

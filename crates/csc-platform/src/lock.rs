@@ -90,6 +90,41 @@ pub(crate) fn lock_key_down(hid: u32, held: u32) {
     count_hit(hid, held, &PAUSE_KEY, &PAUSE_MODS, &PAUSE_HITS);
 }
 
+/// Shortcuts the desktop delivers itself (Wayland GlobalShortcuts portal).
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Watch {
+    Lock,
+    Stay,
+    Pause,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Watch {
+    pub(crate) const ALL: [Watch; 3] = [Watch::Lock, Watch::Stay, Watch::Pause];
+
+    fn slots(self) -> (&'static AtomicU32, &'static AtomicU32, &'static AtomicU32) {
+        match self {
+            Watch::Lock => (&LOCK_MODS, &LOCK_KEY, &LOCK_HITS),
+            Watch::Stay => (&STAY_MODS, &STAY_KEY, &STAY_HITS),
+            Watch::Pause => (&PAUSE_MODS, &PAUSE_KEY, &PAUSE_HITS),
+        }
+    }
+
+    /// Modifier bits and key (HID) being watched; `None` when nothing is set.
+    pub(crate) fn combo(self) -> Option<(u32, u32)> {
+        let (mods, key, _) = self.slots();
+        let key = key.load(Ordering::Acquire);
+        (key != 0).then(|| (mods.load(Ordering::Acquire), key))
+    }
+
+    pub(crate) fn hit(self) {
+        if self.combo().is_some() {
+            self.slots().2.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn note_mods(held: u32) {
     HELD_MODS.store(held, Ordering::Release);

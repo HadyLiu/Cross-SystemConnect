@@ -6,10 +6,28 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-09
+
+### 新增
+
+- **检查更新。** 「关于软件」页「检查」向 GitHub Releases 查询最新版本，有新版本时显示版本、日期和更新内容，「发布页」「下载」用浏览器打开（只接受本项目发布页下的链接，不自动下载安装）。可选「启动时检查更新」（`gui.check_updates`，默认关）。证书用系统信任库校验。
+- **快捷键改为按键录制。** 点击快捷键框后直接按下组合键（须含 Ctrl 或 Alt），Esc 取消，Backspace 清除。
+- **Wayland 下本机快捷键可用。** 锁定屏幕、锁定在当前屏幕、紧急暂停经 xdg-desktop-portal GlobalShortcuts 注册（首次由桌面弹窗确认）；此前 Wayland 下这三项只在控制对方时有效。为此在 `~/.local/share/applications` 写入 `io.github.HadyLiu.CrossSystemConnect.desktop` 并向门户登记应用 ID。
+
+### 变更
+
+- 托盘菜单去掉「暂停共享 / 继续共享」，只保留「设置」「退出」；暂停与恢复用「紧急暂停」快捷键。
+
+### 修复
+
+- 托盘「设置」在 GNOME Wayland 下打不开窗口：设置窗口改走 XWayland（X11 后端），关闭时隐藏、托盘可重新显示。
+- 屏幕拓扑里已信任的电脑不显示：旧版本存下的远处坐标（如 `x: 137`）落在 3×3 网格外，现在按原方向收回到相邻格。
+
 ## [0.2.4] - 2026-11-09
 
 ### 修复
 
+- CI：`cargo deny` 离线检查前先 `cargo fetch`，补齐其他平台才用到的依赖。
 - **穿屏与配对后连接状态抖动。** `3c923cd` 起配对码按 IP 直拨、发现按主机名拨号，同一台电脑会出现两条控制会话；IP→主机名 rekey 会误杀已有会话，界面不停「已连接/断开」，边缘切换因 `has_peer` 不稳而穿不过去。现在同一 IP 只保留一条会话，rekey 不再踢掉已有主机名会话，断开通知在仍有存活链路时抑制；`connected` 在 TCP 会话建立后立即为真（不再只等 HELLO 的 greeted 名）。
 - **日志等级过滤器按设置生效。** 默认仍是 `info`（`default_log_level` / `log.level` 不变）。用户在设置里选 `debug` 时，全局用该等级，所有模块的 DEBUG/INFO/WARN/ERROR 都会写出（兼容 `csc_core` / 旧名 `Cross_SystemConnect_core`）。配对拨号早退、PairCommit/Confirm、offer 映射失败等路径补齐 debug。
 - **谁输入配对码谁发起连接。** 输入六位码的这台机器必须主动拨出；发现侧未完成 HELLO 的 TCP 不得吞掉配对拨号。配对拨号会顶替未完成会话，发现/重拨在配对目标 IP 上让路。

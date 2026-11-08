@@ -39,6 +39,7 @@ pub struct App {
     pub transfer: TransferUi,
     /// Sidebar / about logo from `resources/app.png`.
     pub logo: Option<egui::TextureHandle>,
+    pub updater: crate::update::Updater,
 
     events: Receiver<UiEvent>,
     bus: EventBus,
@@ -57,7 +58,6 @@ pub struct App {
 struct TrayParts {
     icon: tray_icon::TrayIcon,
     settings: tray_icon::menu::MenuItem,
-    share: tray_icon::menu::CheckMenuItem,
     quit: tray_icon::menu::MenuItem,
 }
 
@@ -139,7 +139,11 @@ impl App {
             #[cfg(target_os = "linux")]
             _linux_tray: linux_tray,
             quitting: false,
+            updater: crate::update::Updater::default(),
         };
+        if app.cfg.gui.check_updates {
+            app.updater.check(&cc.egui_ctx);
+        }
         app.reload_status();
         app.reload_logs();
         app
@@ -274,11 +278,15 @@ impl App {
 
     pub fn hide_settings(&mut self, ctx: &egui::Context) {
         self.settings_visible = false;
-        // Linux Wayland: Visible(false) can unmap the surface so tray cannot remount it.
-        // Prefer minimize; keep Visible(true) so the egui loop and EventBus still wake.
+        // A native Wayland window cannot be hidden or unminimized by the app, so
+        // only minimize it there. The X11 window (also under XWayland) is unmapped.
         #[cfg(target_os = "linux")]
         {
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            if crate::x11_window() {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -303,10 +311,6 @@ impl App {
             match ev {
                 UiEvent::ShowSettings => {
                     self.show_settings(ctx);
-                }
-                UiEvent::SharingToggled => {
-                    self.reload_status();
-                    self.refresh_tray_labels();
                 }
                 UiEvent::Transfers(list) => {
                     self.transfer.set_transfers(list);
@@ -349,21 +353,10 @@ impl App {
         if let Some(tray) = self.tray.as_ref() {
             tray.settings.set_text(crate::locale::settings());
             tray.quit.set_text(crate::locale::quit());
-            let sharing_on = self
-                .status
-                .get("sharingEnabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            tray.share.set_text(if sharing_on {
-                crate::locale::pause_sharing()
-            } else {
-                crate::locale::resume_sharing()
-            });
-            tray.share.set_checked(!sharing_on);
         }
         #[cfg(target_os = "linux")]
         if let Some(handle) = self._linux_tray.as_ref() {
-            // Rebuild menu strings (locale / pause state) from Tray::menu().
+            // Rebuild menu strings (locale) from Tray::menu().
             handle.update(|_| {});
         }
     }
@@ -491,28 +484,13 @@ pub fn popup_key(status: &Value) -> String {
 
 #[cfg(not(target_os = "linux"))]
 fn build_tray(bus: EventBus) -> Option<TrayParts> {
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
     let tray_menu = Menu::new();
     let item_settings = MenuItem::new(crate::locale::settings(), true, None);
-    let sharing_on = crate::ipc_client::get_status()
-        .ok()
-        .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
-        .unwrap_or(true);
-    let item_share = CheckMenuItem::new(
-        if sharing_on {
-            crate::locale::pause_sharing()
-        } else {
-            crate::locale::resume_sharing()
-        },
-        true,
-        !sharing_on,
-        None,
-    );
     let item_quit = MenuItem::new(crate::locale::quit(), true, None);
     let _ = tray_menu.append(&item_settings);
-    let _ = tray_menu.append(&item_share);
     let _ = tray_menu.append(&item_quit);
 
     let tray_icon = TrayIconBuilder::new()
@@ -523,7 +501,6 @@ fn build_tray(bus: EventBus) -> Option<TrayParts> {
         .ok()?;
 
     let settings_id = item_settings.id().clone();
-    let share_id = item_share.id().clone();
     let quit_id = item_quit.id().clone();
 
     MenuEvent::set_event_handler(Some({
@@ -531,15 +508,6 @@ fn build_tray(bus: EventBus) -> Option<TrayParts> {
         move |event: MenuEvent| {
             if event.id == settings_id {
                 bus.show_settings_now();
-            } else if event.id == share_id {
-                let sharing_on = crate::ipc_client::get_status()
-                    .ok()
-                    .and_then(|s| s.get("sharingEnabled").and_then(|v| v.as_bool()))
-                    .unwrap_or(true);
-                match crate::ipc_client::set_sharing_enabled(!sharing_on) {
-                    Ok(_) => bus.send(UiEvent::SharingToggled),
-                    Err(e) => tracing::warn!("tray toggle sharing: {e:#}"),
-                }
             } else if event.id == quit_id {
                 crate::singleton::release();
                 crate::ipc_client::force_quit_now();
@@ -559,7 +527,6 @@ fn build_tray(bus: EventBus) -> Option<TrayParts> {
     Some(TrayParts {
         icon: tray_icon,
         settings: item_settings,
-        share: item_share,
         quit: item_quit,
     })
 }
