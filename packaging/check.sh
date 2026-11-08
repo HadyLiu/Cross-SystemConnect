@@ -91,4 +91,7 @@ mkdir -p "$(dirname "$deny_db")"
 if [[ ! -e "$deny_db" ]]; then
   ln -s "$advisory_db" "$deny_db"
 fi
+# --offline needs every crate in Cargo.lock, including ones for other targets
+# that the Linux build above never downloaded.
+cargo fetch --locked
 cargo deny --locked --offline check
