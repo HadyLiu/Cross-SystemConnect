@@ -205,6 +205,17 @@ fn local_lock_releases(state: &str) -> bool {
     matches!(state, "locked" | "secure_desktop")
 }
 
+/// Result of trying to leave this computer through a local edge / barrier.
+enum LocalEdge {
+    Idle,
+    Entered,
+    /// Barrier fired but the neighbor is offline or has no screen size yet.
+    Missed {
+        edge: csc_proto::Edge,
+        pct: f32,
+    },
+}
+
 /// A button, wheel, or key the hook swallowed in the same batch as a screen
 /// change. Play it on this computer once the pointer is back here.
 fn replay_swallowed(injector: &mut dyn csc_platform::InputInjector, step: Captured) {
@@ -477,6 +488,9 @@ struct Core {
     edge_enter_ready: Instant,
     /// Host: ignore remote EdgeHit leaves until then (right after entering a peer).
     edge_leave_ready: Instant,
+    /// Last Wayland barrier sides applied (skip portal work when unchanged).
+    /// `None` until the first apply, so all-false still starts the portal.
+    last_capture_edges: Option<(bool, bool, bool, bool)>,
     last_edge_sent: Instant,
     power_rx: std::sync::mpsc::Receiver<csc_platform::PowerEvent>,
     /// Computers that paused sharing, or are on a secure desktop.
@@ -783,7 +797,9 @@ impl Core {
             self.held = HeldInput::default();
             release_pointer(&mut self.grab, Some(self.home_point));
             self.grab_armed = false;
+            self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
             self.set_active_screen(None).await;
+            self.refresh_capture_edges().await;
         }
         if Instant::now() >= self.next_nic {
             self.next_nic = Instant::now() + Duration::from_secs(3);
@@ -813,6 +829,8 @@ impl Core {
                 s.active_screen = s.local_name.clone();
             }
         }
+        // Keep barriers in sync with live sessions (connect / disconnect / pause).
+        self.refresh_capture_edges().await;
         if !self.grab && csc_platform::paste_hits() > 0 {
             if self.is_host().await {
                 self.paste(String::new()).await;
@@ -917,8 +935,7 @@ impl Core {
             reload = reload.or(self.supervisor.on_link(connected, Instant::now()));
         }
         if host {
-            let (left, right, top, bottom) = self.switch.local_sides();
-            csc_platform::capture_set_edges(left, right, top, bottom);
+            self.refresh_capture_edges().await;
         }
         let waiting = host && csc_platform::wayland_session() && !self.hooked;
         if waiting && !self.wayland_host_noted {
@@ -1216,30 +1233,95 @@ impl Core {
         }
     }
 
+    /// Wayland barriers only on sides that currently have a live peer session.
+    /// Layout alone is not enough: an offline neighbor would trap the pointer.
+    async fn refresh_capture_edges(&mut self) {
+        if !self.is_host().await {
+            return;
+        }
+        let peers = self.net.peer_names().await;
+        let paused = &self.paused_peers;
+        let online = |name: &str| {
+            peers.iter().any(|p| p.eq_ignore_ascii_case(name))
+                && !paused.iter().any(|p| p.eq_ignore_ascii_case(name))
+        };
+        let next = self.switch.local_sides_reachable(online);
+        if self.last_capture_edges == Some(next) {
+            return;
+        }
+        self.last_capture_edges = Some(next);
+        let (left, right, top, bottom) = next;
+        csc_platform::capture_set_edges(left, right, top, bottom);
+    }
+
+    /// Hand compositor capture back inside the screen, never on the barrier pixel.
+    fn release_capture_inside(&mut self, local_edge: Option<(csc_proto::Edge, f32)>) {
+        let (ox, oy) = csc_platform::virtual_origin();
+        let (x, y) = if let Some((edge, pct)) = local_edge {
+            // local_reentry takes the remote edge; opposite of the local hit.
+            self.switch.local_reentry(edge.opposite(), pct)
+        } else {
+            self.home_point
+        };
+        csc_platform::capture_return_to(Some((ox + x, oy + y)));
+        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+    }
+
+    /// Release from a barrier hit when the edge decision is unknown: nudge inward.
+    fn release_capture_from_hit(&mut self, ax: i32, ay: i32) {
+        let (ox, oy) = csc_platform::virtual_origin();
+        let w = self.screen.width.max(1);
+        let h = self.screen.height.max(1);
+        const INSET: i32 = 32;
+        let mut x = (ax - ox).clamp(0, w - 1);
+        let mut y = (ay - oy).clamp(0, h - 1);
+        if y <= INSET {
+            y = INSET.min(h - 1);
+        } else if y >= h - 1 - INSET {
+            y = (h - 1 - INSET).max(0);
+        }
+        if x <= INSET {
+            x = INSET.min(w - 1);
+        } else if x >= w - 1 - INSET {
+            x = (w - 1 - INSET).max(0);
+        }
+        csc_platform::capture_return_to(Some((ox + x, oy + y)));
+        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+    }
+
     /// The local pointer, while it is on this computer.
     async fn local_step(&mut self) {
         let hit = csc_platform::capture_edge_hit();
-        if hit.is_some() && Instant::now() < self.edge_enter_ready {
-            // Just came back: release at the inset home so the barrier cannot
-            // re-capture and trap the pointer sliding along the outer edge.
-            csc_platform::capture_return_to(Some({
-                let (ox, oy) = csc_platform::virtual_origin();
-                (ox + self.home_point.0, oy + self.home_point.1)
-            }));
-            return;
-        }
-        self.local_step_at(hit).await;
-        if hit.is_some() && !self.grab {
-            // A barrier fired but no computer took the pointer: hand it back at once.
-            csc_platform::capture_return_to(hit);
+        if let Some(at) = hit {
+            if Instant::now() < self.edge_enter_ready {
+                // Just came back: release at the inset home so the barrier cannot
+                // re-capture and trap the pointer sliding along the outer edge.
+                self.release_capture_inside(None);
+                return;
+            }
+            match self.local_step_at(Some(at)).await {
+                LocalEdge::Entered => {}
+                LocalEdge::Missed { edge, pct } => {
+                    // Peer offline / no size: never release onto the barrier itself.
+                    self.release_capture_inside(Some((edge, pct)));
+                    self.refresh_capture_edges().await;
+                }
+                LocalEdge::Idle => {
+                    // Barrier fired but switching is blocked; free the pointer inward.
+                    self.release_capture_from_hit(at.0, at.1);
+                    self.refresh_capture_edges().await;
+                }
+            }
+        } else {
+            let _ = self.local_step_at(None).await;
         }
     }
 
     /// `hit` is where a compositor barrier stopped the pointer (Wayland hosts).
-    async fn local_step_at(&mut self, hit: Option<(i32, i32)>) {
+    async fn local_step_at(&mut self, hit: Option<(i32, i32)>) -> LocalEdge {
         let raw = csc_platform::take_raw_motion();
         let Some((ax, ay)) = hit.or_else(csc_platform::cursor_pos) else {
-            return;
+            return LocalEdge::Idle;
         };
         let (ox, oy) = csc_platform::virtual_origin();
         let x = ax - ox;
@@ -1247,10 +1329,10 @@ impl Core {
         csc_platform::vdrag::note_pointer(x, y);
         let dragging = csc_platform::primary_button_down();
         if self.block_fullscreen && !dragging && csc_platform::foreground_fullscreen() {
-            return;
+            return LocalEdge::Idle;
         }
         let Some(mut dec) = self.switch.on_local_cursor(x, y, raw, Instant::now()) else {
-            return;
+            return LocalEdge::Idle;
         };
         dec.neighbor = self.session_name(&dec.neighbor).await;
         if self
@@ -1258,7 +1340,13 @@ impl Core {
             .iter()
             .any(|n| n.eq_ignore_ascii_case(&dec.neighbor))
         {
-            return;
+            if hit.is_some() {
+                return LocalEdge::Missed {
+                    edge: dec.edge,
+                    pct: dec.position_pct,
+                };
+            }
+            return LocalEdge::Idle;
         }
         let known_screen = self.peer_screens.iter().any(|(k, size)| {
             k.eq_ignore_ascii_case(&dec.neighbor) && size.width > 1 && size.height > 1
@@ -1266,20 +1354,29 @@ impl Core {
         let has_peer = self.net.has_peer(&dec.neighbor).await;
         if has_peer && known_screen {
             self.enter_remote(dec, x, y).await;
-        } else if self.last_miss.elapsed() > Duration::from_secs(2) {
-            self.last_miss = Instant::now();
-            if !has_peer {
-                warn!(
-                    "pointer hit {:?} but {} has no session; place that computer on an edge in the layout",
-                    dec.edge, dec.neighbor
-                );
-            } else {
-                warn!(
-                    "pointer hit {:?} but {} has not reported its screen size; leaving the local pointer alone",
-                    dec.edge, dec.neighbor
-                );
-            }
+            return LocalEdge::Entered;
         }
+        if hit.is_some() {
+            if self.last_miss.elapsed() > Duration::from_secs(2) {
+                self.last_miss = Instant::now();
+                if !has_peer {
+                    warn!(
+                        "pointer hit {:?} but {} has no session; clearing that barrier",
+                        dec.edge, dec.neighbor
+                    );
+                } else {
+                    warn!(
+                        "pointer hit {:?} but {} has not reported its screen size; clearing that barrier",
+                        dec.edge, dec.neighbor
+                    );
+                }
+            }
+            return LocalEdge::Missed {
+                edge: dec.edge,
+                pct: dec.position_pct,
+            };
+        }
+        LocalEdge::Idle
     }
 
     /// Session for a layout name. A layout saved while a computer was known only
@@ -2076,6 +2173,9 @@ impl Core {
                 let was_up = self.greeted.remove(&peer.to_lowercase()) && !still;
                 self.greeted = up.iter().map(|n| n.to_lowercase()).collect();
                 let mut s = self.status.write().await;
+                // Drop RTT samples for peers that are no longer greeted.
+                s.peer_latency_ms
+                    .retain(|k, _| up.iter().any(|n| n.eq_ignore_ascii_case(k)));
                 if was_up {
                     info!("session {peer} disconnected");
                 } else if still {
@@ -2100,6 +2200,7 @@ impl Core {
                         self.held = HeldInput::default();
                         release_pointer(&mut self.grab, Some(self.home_point));
                         self.grab_armed = false;
+                        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
                         s.active_screen = s.local_name.clone();
                     }
                     if !self.grab {
@@ -2124,6 +2225,7 @@ impl Core {
                         };
                     }
                     let sleeping = s.host_state == "host_sleeping";
+                    let was_host = s.role == "server";
                     drop(s);
                     if was_up && !sleeping {
                         notice::tell(
@@ -2136,6 +2238,11 @@ impl Core {
                     self.shared.peer_gone(&peer);
                     csc_platform::paste_watch(self.shared.remote_files());
                     self.transfer.peer_gone(peer).await;
+                    // Drop barriers that pointed at this peer so the compositor
+                    // cannot keep swallowing the pointer on a dead edge.
+                    if was_host {
+                        self.refresh_capture_edges().await;
+                    }
                 }
             }
             Some(InboundEvent::Hello(h)) => {
@@ -2457,6 +2564,7 @@ pub async fn run() -> anyhow::Result<()> {
         discovered: Vec::new(),
         search_subnet: crate::discover::subnet_label(&cfg.search_address).unwrap_or_default(),
         transfers: Vec::new(),
+        peer_latency_ms: Default::default(),
     };
 
     let (return_hotkey, lock_hotkey) = hotkeys_of(&cfg);
@@ -2633,6 +2741,7 @@ pub async fn run() -> anyhow::Result<()> {
         control_ready: Instant::now(),
         edge_enter_ready: Instant::now(),
         edge_leave_ready: Instant::now(),
+        last_capture_edges: None,
         last_edge_sent: Instant::now() - Duration::from_secs(5),
         power_rx: csc_platform::spawn_power_watch(),
     };

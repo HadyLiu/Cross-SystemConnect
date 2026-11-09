@@ -353,11 +353,18 @@ impl SwitchController {
         })
     }
 
-    /// Neighbor of the active remote screen on `edge`, if the layout has one.
-    /// Sides of this screen (left, right, top, bottom) that lead to a neighbor.
-    /// A corner neighbor needs both sides that meet there.
-    pub fn local_sides(&self) -> (bool, bool, bool, bool) {
-        let leads = |e: Edge| self.layout.neighbor(&self.local_name, e).is_some();
+    /// Sides of this screen that lead to a neighbor. A corner neighbor needs
+    /// both sides that meet there. `reachable` filters layout neighbors (use
+    /// live sessions so barriers are not left up after a peer disconnects).
+    pub fn local_sides_reachable(
+        &self,
+        reachable: impl Fn(&str) -> bool,
+    ) -> (bool, bool, bool, bool) {
+        let leads = |e: Edge| {
+            self.layout
+                .neighbor(&self.local_name, e)
+                .is_some_and(&reachable)
+        };
         let tl = leads(Edge::TopLeft);
         let tr = leads(Edge::TopRight);
         let bl = leads(Edge::BottomLeft);
@@ -368,6 +375,12 @@ impl SwitchController {
             leads(Edge::Top) || tl || tr,
             leads(Edge::Bottom) || bl || br,
         )
+    }
+
+    /// Layout-only sides (any placed neighbor), ignoring whether a session is up.
+    #[cfg(test)]
+    pub fn local_sides(&self) -> (bool, bool, bool, bool) {
+        self.local_sides_reachable(|_| true)
     }
 
     pub fn neighbor_from_active(&self, edge: Edge) -> Option<String> {
@@ -1193,6 +1206,33 @@ mod tests {
         remote.insert("left".into(), "LOCAL".into());
         layout_map.insert("REMOTE".into(), remote);
         ScreenLayout::load(&layout_map)
+    }
+
+    #[test]
+    fn barriers_follow_live_sessions_not_layout_alone() {
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 100,
+                height: 100,
+            },
+            SwitchConfig::default(),
+            two_way_layout(),
+        );
+        assert_eq!(sw.local_sides(), (false, true, false, false));
+        assert_eq!(
+            sw.local_sides_reachable(|_| false),
+            (false, false, false, false)
+        );
+        assert_eq!(
+            sw.local_sides_reachable(|n| n.eq_ignore_ascii_case("REMOTE")),
+            (false, true, false, false)
+        );
+        assert_eq!(
+            sw.local_sides_reachable(|n| n.eq_ignore_ascii_case("OTHER")),
+            (false, false, false, false)
+        );
     }
 
     #[test]

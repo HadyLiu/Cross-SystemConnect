@@ -8,9 +8,9 @@
 //! with the client as the TLS server whichever side opened the TCP connection.
 
 use crate::discover::{
-    broadcast_targets, decode_datagram, encode_announce, encode_search, is_own_announce,
-    reject_mark, same_subnet24, subnet_label, subnet_scan_targets, suppress_repeat, Announce,
-    Datagram, RejectMark,
+    broadcast_targets, decode_datagram, encode_announce, encode_ping, encode_pong, encode_search,
+    is_own_announce, reject_mark, same_subnet24, subnet_label, subnet_scan_targets,
+    suppress_repeat, Announce, Datagram, RejectMark,
 };
 use crate::prompt::{Choice, PeerPrompt};
 use bytes::BytesMut;
@@ -635,6 +635,8 @@ async fn run_server(
     let mut seen: HashMap<String, (DiscoveredPeer, Instant)> = HashMap::new();
     let mut udp_fails = 0u32;
     let mut redial = Redial::default();
+    let mut latency = LatencyProbes::default();
+    let mut udp_peers: HashMap<IpAddr, SocketAddr> = HashMap::new();
     let kick = inbound.kick.clone();
 
     loop {
@@ -664,6 +666,17 @@ async fn run_server(
                 let now = Instant::now();
                 seen.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(15));
                 publish_discovered(app_status, &seen).await;
+                ping_linked_peers(
+                    &udp,
+                    cfg,
+                    discover,
+                    peers,
+                    &inbound,
+                    &mut latency,
+                    &udp_peers,
+                    &search_unlinked,
+                )
+                .await;
                 poke_offer_peer(&udp, &search_unlinked, cfg, app_status, discover).await;
                 spawn_try_dial_offer_ip(
                     cfg.clone(),
@@ -778,10 +791,29 @@ async fn run_server(
                 let Some((n, src)) = udp_datagram(res)? else {
                     continue;
                 };
-                let Some(Datagram::Announce(ann)) = decode_datagram(&buf[..n]) else {
-                    continue;
-                };
-                let src_ip = src.ip().to_string();
+                udp_peers.insert(src.ip(), src);
+                match decode_datagram(&buf[..n]) {
+                    Some(Datagram::Ping(echo)) => {
+                        let _ = udp.send_to(&discovery_pong(cfg, echo.nonce), src).await;
+                        continue;
+                    }
+                    Some(Datagram::Pong(echo)) => {
+                        if let Some((peer, ms)) = latency.finish_ping(echo.nonce) {
+                            set_peer_latency_for_ip(
+                                app_status,
+                                peers,
+                                &inbound,
+                                src.ip(),
+                                &peer,
+                                ms,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                    Some(Datagram::Announce(ann)) => {
+                        // fall through with ann
+                        let src_ip = src.ip().to_string();
                 if is_own_announce(&ann.host_name, local_host, &src_ip, local_ips)
                     || is_own_announce(&ann.name, &cfg.name, &src_ip, local_ips)
                     || is_own_announce(&ann.host_name, &cfg.name, &src_ip, local_ips)
@@ -794,6 +826,10 @@ async fn run_server(
                 let key = if ann.name.is_empty() { ann.host_name.clone() } else { ann.name.clone() };
                 let key = if key.is_empty() { src_ip.clone() } else { key };
                 let display = if ann.name.is_empty() { key.clone() } else { ann.name.clone() };
+                if let Some((peer, ms)) = latency.finish_search(src.ip()) {
+                    set_peer_latency_for_ip(app_status, peers, &inbound, src.ip(), &peer, ms)
+                        .await;
+                }
                 seen.insert(key.clone(), (DiscoveredPeer {
                     name: display.clone(),
                     host_name: if ann.host_name.is_empty() { key.clone() } else { ann.host_name.clone() },
@@ -851,6 +887,9 @@ async fn run_server(
                     key,
                     ServerLink::Dial(peer_addr),
                 false);
+                    }
+                    _ => {}
+                }
             }
             acc = accept_opt(listener.as_ref()) => {
                 let (tcp, addr) = match acc {
@@ -1451,6 +1490,8 @@ async fn run_client(
     let mut manual_tick = 0u8;
     let mut buf = [0u8; 2048];
     let mut udp_fails = 0u32;
+    let mut latency = LatencyProbes::default();
+    let mut udp_peers: HashMap<IpAddr, SocketAddr> = HashMap::new();
     let kick = inbound.kick.clone();
     loop {
         tokio::select! {
@@ -1460,6 +1501,20 @@ async fn run_client(
                     dial_client_manual(&ctx, &dialing).await;
                 }
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &announce, &targets).await)?;
+                // Probe about every 2s while linked (client tick is 1s).
+                if manual_tick.is_multiple_of(2) {
+                    ping_linked_peers(
+                        &udp,
+                        cfg,
+                        discover,
+                        peers,
+                        &inbound,
+                        &mut latency,
+                        &udp_peers,
+                        &announce,
+                    )
+                    .await;
+                }
                 let eager = offer_ready(&ctx.app_status).await;
                 let due: Vec<(String, SocketAddr)> = host_wait
                     .iter()
@@ -1486,6 +1541,7 @@ async fn run_client(
                 let Some((n, src)) = udp_datagram(res)? else {
                     continue;
                 };
+                udp_peers.insert(src.ip(), src);
                 let src_ip = src.ip().to_string();
                 if is_own_announce("", local_host, &src_ip, local_ips) {
                     continue;
@@ -1496,19 +1552,49 @@ async fn run_client(
                 {
                     continue;
                 }
-                let datagram = decode_datagram(&buf[..n]);
-                if let Some(Datagram::Search(probe)) = datagram {
-                    let _ = udp.send_to(&announce, src).await;
-                    let key = src.ip().to_string();
-                    let incoming_now = incoming.lock().await.contains_key(&key);
-                    if incoming_now || peers.contains(&key).await {
-                        host_wait.remove(&key);
-                    } else {
-                        host_wait.entry(key).or_insert((
-                            Instant::now(),
-                            SocketAddr::new(src.ip(), probe.control_port),
-                        ));
+                match decode_datagram(&buf[..n]) {
+                    Some(Datagram::Ping(echo)) => {
+                        let _ = udp.send_to(&discovery_pong(cfg, echo.nonce), src).await;
                     }
+                    Some(Datagram::Pong(echo)) => {
+                        if let Some((peer, ms)) = latency.finish_ping(echo.nonce) {
+                            set_peer_latency_for_ip(
+                                app_status,
+                                peers,
+                                &inbound,
+                                src.ip(),
+                                &peer,
+                                ms,
+                            )
+                            .await;
+                        }
+                    }
+                    Some(Datagram::Search(probe)) => {
+                        // Host Search after our announce/probe → discovery RTT.
+                        if let Some((peer, ms)) = latency.finish_search(src.ip()) {
+                            set_peer_latency_for_ip(
+                                app_status,
+                                peers,
+                                &inbound,
+                                src.ip(),
+                                &peer,
+                                ms,
+                            )
+                            .await;
+                        }
+                        let _ = udp.send_to(&announce, src).await;
+                        let key = src.ip().to_string();
+                        let incoming_now = incoming.lock().await.contains_key(&key);
+                        if incoming_now || peers.contains(&key).await {
+                            host_wait.remove(&key);
+                        } else {
+                            host_wait.entry(key).or_insert((
+                                Instant::now(),
+                                SocketAddr::new(src.ip(), probe.control_port),
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
             acc = listener.accept() => {
@@ -1636,6 +1722,12 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
             return;
         }
     };
+    // Discovery RTT probes look up linked peers via last_peers (same as the host).
+    ctx.inbound
+        .last_peers
+        .lock()
+        .await
+        .insert(key.clone(), peer);
     let mut stop = ctx.stop.clone();
     let data_token = export_server(&stream);
     tokio::select! {
@@ -2019,7 +2111,7 @@ async fn session<S>(
     status: &Arc<RwLock<NetStatus>>,
     app_status: &Arc<RwLock<AppStatus>>,
     prompt: &Arc<PeerPrompt>,
-    peer: String,
+    mut peer: String,
     mut outbound: LinkRx,
     mut inbound: Wires,
     link: Option<ClientLink>,
@@ -2188,6 +2280,18 @@ where
         }
         write_locked(&writer, &encode_hello_bin(&hello)).await?;
         remember(&announced);
+        // Point last_peers at the hostname so discovery RTT keys match the UI.
+        if !name.eq_ignore_ascii_case(&peer) {
+            let mut last = inbound.last_peers.lock().await;
+            if let Some(addr) = last.remove(&peer) {
+                last.insert(name.clone(), addr);
+            } else {
+                last.insert(
+                    name.clone(),
+                    SocketAddr::new(remote_ip, announced.ports.control),
+                );
+            }
+        }
         let _ = inbound.events.send(InboundEvent::Hello(announced)).await;
     } else {
         // The controlled computer sends heartbeats while its user decides, so
@@ -2284,6 +2388,7 @@ where
                 }
             }
             info!("session {peer} is now {name}");
+            peer = name.clone();
         }
         // Connected — stop offer redials that would open a second link.
         clear_offer(app_status).await;
@@ -3059,6 +3164,130 @@ fn bench_answer(frame: &csc_proto::Frame) -> Option<Vec<u8>> {
         t3: Some(now),
     };
     encode_json_frame(MsgType::BenchSync, &reply).ok()
+}
+
+/// Write the same RTT under every live session key for `ip` (hostname + IP).
+async fn set_peer_latency_for_ip(
+    app_status: &Arc<RwLock<AppStatus>>,
+    peers: &PeerTable,
+    inbound: &Wires,
+    ip: IpAddr,
+    fallback: &str,
+    ms: u32,
+) {
+    let mut keys = session_keys_for_ip(peers, inbound, ip).await;
+    if keys.is_empty() {
+        keys.push(fallback.to_string());
+    }
+    if !keys.iter().any(|k| k.eq_ignore_ascii_case(fallback)) {
+        keys.push(fallback.to_string());
+    }
+    let ip_s = ip.to_string();
+    if !keys.iter().any(|k| k == &ip_s) {
+        keys.push(ip_s);
+    }
+    let mut s = app_status.write().await;
+    for k in keys {
+        s.peer_latency_ms.insert(k, ms);
+    }
+}
+
+/// Outstanding discovery-channel RTT probes.
+#[derive(Default)]
+struct LatencyProbes {
+    next: u64,
+    /// Ping/Pong nonce → (sent, peer label).
+    pending_ping: HashMap<u64, (Instant, String)>,
+    /// Unicast Search → Announce RTT (works with older peers).
+    pending_search: HashMap<IpAddr, (Instant, String)>,
+}
+
+impl LatencyProbes {
+    fn begin_ping(&mut self, peer: String) -> u64 {
+        self.pending_ping
+            .retain(|_, (sent, _)| sent.elapsed() < Duration::from_secs(3));
+        let nonce = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.pending_ping.insert(nonce, (Instant::now(), peer));
+        nonce
+    }
+
+    fn finish_ping(&mut self, nonce: u64) -> Option<(String, u32)> {
+        let (sent, peer) = self.pending_ping.remove(&nonce)?;
+        let ms = sent.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        Some((peer, ms))
+    }
+
+    fn begin_search(&mut self, ip: IpAddr, peer: String) {
+        self.pending_search
+            .retain(|_, (sent, _)| sent.elapsed() < Duration::from_secs(3));
+        self.pending_search.insert(ip, (Instant::now(), peer));
+    }
+
+    fn finish_search(&mut self, ip: IpAddr) -> Option<(String, u32)> {
+        let (sent, peer) = self.pending_search.remove(&ip)?;
+        let ms = sent.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        Some((peer, ms))
+    }
+}
+
+fn discovery_pong(cfg: &Config, nonce: u64) -> Vec<u8> {
+    encode_pong(cfg.control_port, cfg.data_port, &cfg.name, nonce)
+}
+
+fn discovery_ping(cfg: &Config, nonce: u64) -> Vec<u8> {
+    encode_ping(cfg.control_port, cfg.data_port, &cfg.name, nonce)
+}
+
+async fn latency_label_for_ip(
+    peers: &PeerTable,
+    inbound: &Wires,
+    ip: IpAddr,
+    fallback: &str,
+) -> String {
+    session_keys_for_ip(peers, inbound, ip)
+        .await
+        .into_iter()
+        .find(|k| k.parse::<IpAddr>().is_err())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ping_linked_peers(
+    udp: &UdpSocket,
+    cfg: &Config,
+    discover: u16,
+    peers: &PeerTable,
+    inbound: &Wires,
+    probes: &mut LatencyProbes,
+    udp_peers: &HashMap<IpAddr, SocketAddr>,
+    search: &[u8],
+) {
+    let known: Vec<(String, SocketAddr)> = inbound
+        .last_peers
+        .lock()
+        .await
+        .iter()
+        .map(|(k, a)| (k.clone(), *a))
+        .collect();
+    let mut seen_ip = HashSet::new();
+    for (key, addr) in known {
+        let linked =
+            peers.contains(&key).await || already_linked_to_ip(peers, inbound, addr.ip()).await;
+        if !linked || !seen_ip.insert(addr.ip()) {
+            continue;
+        }
+        let label = latency_label_for_ip(peers, inbound, addr.ip(), &key).await;
+        let dest = udp_peers
+            .get(&addr.ip())
+            .copied()
+            .unwrap_or_else(|| SocketAddr::new(addr.ip(), discover));
+        // Search↔Announce works with older peers that ignore Ping.
+        probes.begin_search(addr.ip(), label.clone());
+        let _ = udp.send_to(search, dest).await;
+        let nonce = probes.begin_ping(label);
+        let _ = udp.send_to(&discovery_ping(cfg, nonce), dest).await;
+    }
 }
 
 fn mono_ns() -> u64 {

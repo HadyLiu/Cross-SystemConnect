@@ -102,23 +102,12 @@ pub fn draw_home(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    section_heading(ui, &p, tr("屏幕拓扑", "Screen topology"));
-    settings_card_body(ui, &p, |ui| {
-        if is_server {
+    if is_server {
+        section_heading(ui, &p, tr("屏幕拓扑", "Screen topology"));
+        settings_card_body(ui, &p, |ui| {
             draw_desk(app, ui, &p);
-        } else {
-            widgets::hint(
-                ui,
-                &p,
-                tr(
-                    "中间是键鼠主机；本机位置由主机摆放。",
-                    "Center is the keyboard host; this PC’s slot is set by the host.",
-                ),
-            );
-            ui.add_space(8.0);
-            draw_desk_readonly(app, ui, &p);
-        }
-    });
+        });
+    }
 
     section_heading(ui, &p, tr("已信任设备", "Trusted devices"));
     settings_card_body(ui, &p, |ui| {
@@ -251,6 +240,7 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         col_label(ui, c.name, tr("设备名", "Name"), p.text_2, false);
         col_label(ui, c.ip, tr("IP 地址", "IP"), p.text_2, false);
         col_label(ui, c.status, tr("状态", "Status"), p.text_2, false);
+        col_label(ui, c.latency, tr("延迟", "Latency"), p.text_2, false);
         col_label(ui, c.pointer, tr("指针灵敏度", "Pointer"), p.text_2, false);
         col_label(ui, c.action, tr("操作", "Action"), p.text_2, false);
     });
@@ -264,6 +254,7 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     for name in peers {
         let ip = peer_ip(app, &name);
         let online = peer_online(app, &name);
+        let latency = peer_latency_label(app, &name, online);
         let mut forget = false;
         device_row(ui, ROW_H, GAP, &cols, |ui, c| {
             col_label(ui, c.name, &name, Color32::WHITE, true);
@@ -274,6 +265,7 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                 (tr("离线", "Offline"), p.text_2)
             };
             col_label(ui, c.status, text, color, false);
+            col_label(ui, c.latency, &latency, p.text_2, false);
 
             ui.allocate_ui_with_layout(
                 egui::vec2(c.pointer, ROW_H),
@@ -301,7 +293,7 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                 |ui| {
                     ui.set_min_size(egui::vec2(c.action, ROW_H));
                     ui.set_max_width(c.action);
-                    if widgets::danger_text_button(ui, p, tr("断开", "Disconnect")).clicked() {
+                    if widgets::danger_text_button(ui, p, tr("移除", "Remove")).clicked() {
                         forget = true;
                     }
                 },
@@ -360,19 +352,21 @@ struct DeviceCols {
     name: f32,
     ip: f32,
     status: f32,
+    latency: f32,
     pointer: f32,
     action: f32,
 }
 
 fn device_col_widths(total: f32) -> DeviceCols {
     let action = 72.0;
-    let gaps = 12.0 * 4.0;
-    let rest = (total - action - gaps).max(280.0);
+    let gaps = 12.0 * 5.0;
+    let rest = (total - action - gaps).max(320.0);
     DeviceCols {
-        name: rest * 0.30,
-        ip: rest * 0.24,
-        status: rest * 0.14,
-        pointer: rest * 0.32,
+        name: rest * 0.26,
+        ip: rest * 0.20,
+        status: rest * 0.12,
+        latency: rest * 0.12,
+        pointer: rest * 0.30,
         action,
     }
 }
@@ -459,6 +453,25 @@ fn peer_online(app: &App, name: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+fn peer_latency_label(app: &App, name: &str, online: bool) -> String {
+    if !online {
+        return "—".into();
+    }
+    let Some(map) = app.status.get("peerLatencyMs").and_then(|v| v.as_object()) else {
+        return "…".into();
+    };
+    let ip = peer_ip(app, name);
+    for (k, v) in map {
+        let hit = k.eq_ignore_ascii_case(name) || (!ip.is_empty() && ip != "—" && k == &ip);
+        if hit {
+            if let Some(ms) = v.as_u64() {
+                return format!("{ms} ms");
+            }
+        }
+    }
+    "…".into()
 }
 
 fn try_send_pair_code(app: &mut App) {
@@ -577,78 +590,6 @@ pub fn draw_pair_confirm_modal(app: &mut App, ctx: &egui::Context) {
                 });
             });
         });
-}
-
-fn draw_desk_readonly(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    // Client view: keyboard host stays in the center; this computer is a peer tile.
-    let local = app.cfg.name.clone();
-    let kb_host = keyboard_host_name(app);
-    let avail = ui.available_width().max(180.0);
-    let h = 210.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(avail, h), Sense::hover());
-
-    let mut screens: Vec<(i32, i32, String)> = app
-        .cfg
-        .screens
-        .iter()
-        .filter(|s| !s.name.eq_ignore_ascii_case(&kb_host))
-        .filter(|s| !(s.x == 0 && s.y == 0))
-        .map(|s| (s.x, s.y, s.name.clone()))
-        .collect();
-
-    // Local machine not in host layout yet — still show it beside the host.
-    let local_shown = screens
-        .iter()
-        .any(|(_, _, n)| n.eq_ignore_ascii_case(&local));
-    if !local.is_empty()
-        && !local.eq_ignore_ascii_case(&kb_host)
-        && !local_shown
-        && app
-            .status
-            .get("connected")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    {
-        screens.push((1, 0, local.clone()));
-    }
-
-    paint_topology_grid(
-        ui,
-        p,
-        rect,
-        &screens,
-        &kb_host,
-        tr("(主机)", "(host)"),
-        Some(local.as_str()),
-        None,
-        None,
-    );
-}
-
-/// Name of the keyboard host for client topology (center cell).
-fn keyboard_host_name(app: &App) -> String {
-    if let Some(peer) = app
-        .status
-        .get("peerName")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return peer.split(',').next().unwrap_or(peer).trim().to_string();
-    }
-    for key in ["activeScreen", "hostName"] {
-        if let Some(n) = app.status.get(key).and_then(|v| v.as_str()).map(str::trim) {
-            if !n.is_empty() && !n.eq_ignore_ascii_case(&app.cfg.name) {
-                return n.to_string();
-            }
-        }
-    }
-    app.cfg
-        .trusted_peers
-        .iter()
-        .find(|n| !n.eq_ignore_ascii_case(&app.cfg.name))
-        .cloned()
-        .unwrap_or_else(|| tr("主机", "Host").to_string())
 }
 
 fn draw_desk(app: &mut App, ui: &mut egui::Ui, p: &Palette) {

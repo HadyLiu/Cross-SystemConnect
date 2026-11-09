@@ -6,6 +6,22 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-09
+
+### 新增
+
+- **已信任设备显示延迟。** 在线时经 UDP 发现通道探测 RTT，表格中显示当前毫秒数。
+
+### 变更
+
+- 信任设备操作由「断开」改为「移除」。
+- **从机首页不再显示屏幕拓扑**；拓扑仅主机可编辑。
+
+### 修复
+
+- **对端断开后指针仍吸在边缘。** 输入捕获屏障按存活会话刷新，离线邻边不再留障；会话结束后在屏内释放捕获。
+- clippy：`is_multiple_of`、冗余闭包、`local_sides` 仅测试保留。
+
 ## [0.2.6] - 2026-11-09
 
 ### 新增
@@ -284,6 +300,7 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
+[0.2.7]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.7
 [0.2.6]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.6
 [0.2.5]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.5
 [0.2.4]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.4

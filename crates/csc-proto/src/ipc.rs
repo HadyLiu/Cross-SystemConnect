@@ -109,6 +109,9 @@ pub struct AppStatus {
     /// Batches this computer is receiving or has just received.
     #[serde(default)]
     pub transfers: Vec<TransferProgress>,
+    /// Control-channel RTT in milliseconds, keyed by peer session name.
+    #[serde(default)]
+    pub peer_latency_ms: std::collections::BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

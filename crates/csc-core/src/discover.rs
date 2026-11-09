@@ -13,6 +13,8 @@ const VERSION: u8 = 2;
 const KIND_PROBE: u8 = 1;
 const KIND_REPLY: u8 = 2;
 const KIND_ANNOUNCE: u8 = 3;
+const KIND_PING: u8 = 4;
+const KIND_PONG: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Announce {
@@ -24,10 +26,21 @@ pub struct Announce {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Echo {
+    pub name: String,
+    pub control_port: u16,
+    pub data_port: u16,
+    pub nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Datagram {
     Announce(Announce),
     /// Host scan. Carries the host's control and data ports.
     Search(Announce),
+    /// Unicast RTT probe on the discovery socket.
+    Ping(Echo),
+    Pong(Echo),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +101,21 @@ fn encode_packet(kind: u8, control_port: u16, data_port: u16, name: &str) -> Vec
     out
 }
 
+/// Discovery-channel RTT probe. `nonce` is echoed by the peer in a pong.
+pub fn encode_ping(control_port: u16, data_port: u16, name: &str, nonce: u64) -> Vec<u8> {
+    encode_echo(KIND_PING, control_port, data_port, name, nonce)
+}
+
+pub fn encode_pong(control_port: u16, data_port: u16, name: &str, nonce: u64) -> Vec<u8> {
+    encode_echo(KIND_PONG, control_port, data_port, name, nonce)
+}
+
+fn encode_echo(kind: u8, control_port: u16, data_port: u16, name: &str, nonce: u64) -> Vec<u8> {
+    let mut out = encode_packet(kind, control_port, data_port, name);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out
+}
+
 pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
     if buf.len() < 11 || &buf[0..4] != MAGIC || buf[4] != VERSION {
         return None;
@@ -104,15 +132,34 @@ pub fn decode_datagram(buf: &[u8]) -> Option<Datagram> {
     let name = std::str::from_utf8(&buf[11..11 + name_len])
         .ok()?
         .to_string();
-    let ann = Announce {
-        host_name: name.clone(),
-        name,
-        control_port,
-        data_port,
-    };
+    let rest = &buf[11 + name_len..];
     match buf[5] {
-        KIND_PROBE => Some(Datagram::Search(ann)),
-        KIND_REPLY | KIND_ANNOUNCE => Some(Datagram::Announce(ann)),
+        KIND_PROBE => Some(Datagram::Search(Announce {
+            host_name: name.clone(),
+            name,
+            control_port,
+            data_port,
+        })),
+        KIND_REPLY | KIND_ANNOUNCE => Some(Datagram::Announce(Announce {
+            host_name: name.clone(),
+            name,
+            control_port,
+            data_port,
+        })),
+        KIND_PING | KIND_PONG if rest.len() >= 8 => {
+            let nonce = u64::from_le_bytes(rest[..8].try_into().ok()?);
+            let echo = Echo {
+                name,
+                control_port,
+                data_port,
+                nonce,
+            };
+            if buf[5] == KIND_PING {
+                Some(Datagram::Ping(echo))
+            } else {
+                Some(Datagram::Pong(echo))
+            }
+        }
         _ => None,
     }
 }
@@ -264,6 +311,23 @@ mod tests {
         };
         match decode_datagram(&encode_port_announce(&a)) {
             Some(Datagram::Announce(got)) => assert_eq!(got.control_port, 25000),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        let raw = encode_ping(24900, 24901, "host", 0xAABB_CCDD_1122_3344);
+        match decode_datagram(&raw) {
+            Some(Datagram::Ping(e)) => {
+                assert_eq!(e.nonce, 0xAABB_CCDD_1122_3344);
+                assert_eq!(e.name, "host");
+                let pong = encode_pong(e.control_port, e.data_port, &e.name, e.nonce);
+                match decode_datagram(&pong) {
+                    Some(Datagram::Pong(p)) => assert_eq!(p.nonce, e.nonce),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
