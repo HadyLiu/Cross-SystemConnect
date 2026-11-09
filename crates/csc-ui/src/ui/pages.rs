@@ -187,19 +187,19 @@ pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
             ),
             |c| &mut c.hotkeys.lock_screen,
         );
-        if matches!(app.cfg.role, csc_config::Role::Server) {
-            hotkey_settings_row(
-                app,
-                list,
-                &p,
-                tr("回到本机", "Return home"),
-                tr(
-                    "指针立刻回到键鼠主机。",
-                    "Return the pointer to the keyboard host.",
-                ),
-                |c| &mut c.hotkeys.return_to_server,
-            );
-        }
+        // Always listed: reset/demote to client used to hide this row and look like
+        // the shortcut was deleted. It only acts while this computer is the host.
+        hotkey_settings_row(
+            app,
+            list,
+            &p,
+            tr("回到本机", "Return home"),
+            tr(
+                "指针立刻回到键鼠主机。",
+                "Return the pointer to the keyboard host.",
+            ),
+            |c| &mut c.hotkeys.return_to_server,
+        );
         hotkey_settings_row(
             app,
             list,
@@ -819,7 +819,8 @@ pub fn draw_about(app: &mut App, ui: &mut egui::Ui) {
                 .inner
                 .clicked()
             {
-                app.updater.check(ui.ctx());
+                // Manual check: tip in the title bar only; no desktop toast.
+                app.updater.check(ui.ctx(), false);
             }
             if let UpdateState::Available(r) = &state {
                 if outline_button(ui, &p, tr("发布页", "Release page")).clicked() {
@@ -835,8 +836,8 @@ pub fn draw_about(app: &mut App, ui: &mut egui::Ui) {
         list.row(
             tr("启动时检查更新", "Check on startup"),
             tr(
-                "打开本程序时向 GitHub 查询一次，只带版本号。",
-                "Asks GitHub once when this program starts. Sends only the version.",
+                "启动时查询一次；有新版本发系统通知，并在窗口左上角提示。",
+                "Checks once at launch. A new version shows a system notice and a tip at the top left.",
             ),
             |ui| {
                 if mac_toggle(ui, &p, &mut app.cfg.gui.check_updates).clicked() {

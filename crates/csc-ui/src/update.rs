@@ -41,6 +41,8 @@ pub enum UpdateState {
 #[derive(Clone, Default)]
 pub struct Updater {
     state: Arc<Mutex<UpdateState>>,
+    /// Version string already announced with a desktop notification this run.
+    notified: Arc<Mutex<Option<String>>>,
 }
 
 impl Updater {
@@ -49,7 +51,9 @@ impl Updater {
     }
 
     /// Start a check unless one is already running.
-    pub fn check(&self, ctx: &egui::Context) {
+    /// When `announce` is true and a newer release is found, a desktop
+    /// notification is shown once per version (startup auto-check).
+    pub fn check(&self, ctx: &egui::Context, announce: bool) {
         {
             let Ok(mut s) = self.state.lock() else { return };
             if matches!(*s, UpdateState::Checking) {
@@ -58,6 +62,7 @@ impl Updater {
             *s = UpdateState::Checking;
         }
         let state = self.state.clone();
+        let notified = self.notified.clone();
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("update-check".into())
@@ -72,6 +77,11 @@ impl Updater {
                         UpdateState::Failed(format!("{e:#}"))
                     }
                 };
+                if announce {
+                    if let UpdateState::Available(ref release) = next {
+                        maybe_notify(release, &notified);
+                    }
+                }
                 if let Ok(mut s) = state.lock() {
                     *s = next;
                 }
@@ -83,6 +93,38 @@ impl Updater {
             }
         }
     }
+}
+
+fn maybe_notify(release: &Release, notified: &Arc<Mutex<Option<String>>>) {
+    {
+        let Ok(mut slot) = notified.lock() else {
+            return;
+        };
+        if slot.as_deref() == Some(release.version.as_str()) {
+            return;
+        }
+        *slot = Some(release.version.clone());
+    }
+    let en = crate::locale::is_english();
+    let title = if en {
+        "Update available"
+    } else {
+        "发现新版本"
+    };
+    let body = if en {
+        format!(
+            "Cross-SystemConnect v{} is available (you have v{}). Open Settings → About.",
+            release.version,
+            env!("CARGO_PKG_VERSION")
+        )
+    } else {
+        format!(
+            "Cross-SystemConnect v{} 可用（当前 v{}）。打开设置 → 关于软件查看。",
+            release.version,
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+    csc_platform::notify(title, &body, false);
 }
 
 fn agent() -> ureq::Agent {

@@ -168,7 +168,9 @@ fn x11_pointer() -> Option<(i32, i32)> {
 
 /// Land on the edge that was just crossed.
 fn inset_from_edge(edge: csc_proto::Edge, x: &mut i32, y: &mut i32, m: &csc_platform::Rect) {
-    const N: i32 = 0;
+    // Land inside the shared edge pixel so the controlled side does not
+    // immediately EdgeHit the seam and bounce the host back.
+    const N: i32 = 16;
     match edge {
         csc_proto::Edge::Left | csc_proto::Edge::TopLeft | csc_proto::Edge::BottomLeft => {
             *x = (*x + N).min(m.right - 1);
@@ -304,7 +306,7 @@ impl HeldInput {
     }
 }
 
-/// A key combination such as `Ctrl+Alt+/`, as HID usages.
+/// A key combination such as `Ctrl+Shift+/`, as HID usages.
 /// Modifiers are stored left-handed; either hand matches.
 #[derive(Debug, Clone, PartialEq)]
 struct Hotkey {
@@ -351,7 +353,7 @@ fn single_instance_lock() -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-fn nics_of(host: csc_platform::HostNetInfo) -> (String, Vec<String>, Vec<LocalNic>) {
+pub(crate) fn nics_of(host: csc_platform::HostNetInfo) -> (String, Vec<String>, Vec<LocalNic>) {
     let nics = host
         .nics
         .into_iter()
@@ -362,6 +364,43 @@ fn nics_of(host: csc_platform::HostNetInfo) -> (String, Vec<String>, Vec<LocalNi
         })
         .collect();
     (host.host_name, host.ipv4_addresses, nics)
+}
+
+/// Ethernet first, then whatever else `HostNetInfo` ordered. Used whenever a
+/// search address must be chosen automatically.
+pub(crate) fn preferred_search(nics: &[LocalNic]) -> Option<String> {
+    nics.iter()
+        .find(|n| n.kind == "ethernet")
+        .or(nics.first())
+        .map(|n| n.address.clone())
+}
+
+/// True when `search` was empty or no longer on a local adapter and was replaced.
+pub(crate) fn ensure_search_address(cfg: &mut Config, nics: &[LocalNic]) -> bool {
+    if nics.is_empty() {
+        return false;
+    }
+    let known = nics.iter().any(|n| n.address == cfg.search_address);
+    if !cfg.search_address.is_empty() && known {
+        return false;
+    }
+    let Some(next) = preferred_search(nics) else {
+        return false;
+    };
+    if cfg.search_address == next {
+        return false;
+    }
+    info!(
+        "using {} for the keyboard link (was {})",
+        next,
+        if cfg.search_address.is_empty() {
+            "unset"
+        } else {
+            cfg.search_address.as_str()
+        }
+    );
+    cfg.search_address = next;
+    true
 }
 
 fn popup(body: &str, error: bool) {
@@ -434,6 +473,10 @@ struct Core {
     commanded: Option<(i32, i32)>,
     /// Ignore edge-leave until this moment, so the crossing itself does not bounce back.
     control_ready: Instant,
+    /// Host: ignore local barrier enters until then (after returning to this screen).
+    edge_enter_ready: Instant,
+    /// Host: ignore remote EdgeHit leaves until then (right after entering a peer).
+    edge_leave_ready: Instant,
     last_edge_sent: Instant,
     power_rx: std::sync::mpsc::Receiver<csc_platform::PowerEvent>,
     /// Computers that paused sharing, or are on a secure desktop.
@@ -782,6 +825,11 @@ impl Core {
         if self.screen.width <= 1 || self.screen.height <= 1 {
             return;
         }
+        // Wayland InputCapture becomes ready after the portal prompt; barriers
+        // can fire in the same tick. Refresh every loop, not only the 3s NIC poll.
+        if csc_platform::wayland_session() && !self.grab {
+            self.hooked = csc_platform::capture_start();
+        }
         let local =
             !self.grab && self.switch.enabled() && self.switch.state() == SwitchState::Local;
         if !local {
@@ -790,6 +838,9 @@ impl Core {
             let _ = csc_platform::take_raw_motion();
         }
         if self.grab && self.switch.state() == SwitchState::Remote {
+            // Enter may have raced ahead of `hooked`. Without set_grab, libei
+            // events are dropped and the compositor keeps the pointer trapped.
+            self.ensure_capture_grab();
             self.grab_step().await;
         } else if self.grab {
             release_pointer(&mut self.grab, None);
@@ -797,6 +848,20 @@ impl Core {
         } else if local {
             self.local_step().await;
         }
+    }
+
+    /// Arm portal capture if enter raced ahead of `hooked`. Do not call
+    /// `set_grab` every tick: it drops queued motion.
+    fn ensure_capture_grab(&mut self) {
+        if !csc_platform::wayland_session() || self.hooked {
+            return;
+        }
+        if !csc_platform::capture_start() {
+            return;
+        }
+        self.hooked = true;
+        let (ox, oy) = csc_platform::virtual_origin();
+        csc_platform::capture_set_grab(true, Some((ox + self.park_x, oy + self.park_y)));
     }
 
     fn publish_screen(&mut self) {
@@ -829,13 +894,23 @@ impl Core {
             return;
         };
         let (host_name, ips, nics) = nics_of(host);
-        let search = self.config.read().await.search_address.clone();
+        let search = {
+            let mut cfg = self.config.write().await;
+            if ensure_search_address(&mut cfg, &nics) {
+                if let Err(e) = cfg.save(&default_config_path()) {
+                    warn!("save search address after adapter change: {e:#}");
+                }
+                self.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            }
+            cfg.search_address.clone()
+        };
         let mut reload = self.supervisor.on_adapters(&search, &ips);
         let (connected, host) = {
             let mut s = self.status.write().await;
             s.host_name = host_name;
             s.local_ipv4 = ips;
             s.local_nics = nics;
+            s.search_subnet = crate::discover::subnet_label(&search).unwrap_or_default();
             (s.connected, s.role == "server")
         };
         if !host {
@@ -844,9 +919,6 @@ impl Core {
         if host {
             let (left, right, top, bottom) = self.switch.local_sides();
             csc_platform::capture_set_edges(left, right, top, bottom);
-        }
-        if csc_platform::wayland_session() && !self.grab {
-            self.hooked = csc_platform::capture_start();
         }
         let waiting = host && csc_platform::wayland_session() && !self.hooked;
         if waiting && !self.wayland_host_noted {
@@ -1044,6 +1116,8 @@ impl Core {
         self.switch.unlock_to_local();
         release_pointer(&mut self.grab, Some(self.home_point));
         self.grab_armed = false;
+        // Barrier still covers the seam; ignore hits until the pointer settles inside.
+        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
         self.set_active_screen(None).await;
         info!("{why}: input back from {current}");
     }
@@ -1132,6 +1206,7 @@ impl Core {
             let back = self.switch.local_reentry(leave.edge, leave.position_pct);
             release_pointer(&mut self.grab, Some(back));
             self.grab_armed = false;
+            self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
             self.set_active_screen(None).await;
             info!(
                 "switch return from {current} at {:?} {:.2}, cursor to {back:?}",
@@ -1144,6 +1219,15 @@ impl Core {
     /// The local pointer, while it is on this computer.
     async fn local_step(&mut self) {
         let hit = csc_platform::capture_edge_hit();
+        if hit.is_some() && Instant::now() < self.edge_enter_ready {
+            // Just came back: release at the inset home so the barrier cannot
+            // re-capture and trap the pointer sliding along the outer edge.
+            csc_platform::capture_return_to(Some({
+                let (ox, oy) = csc_platform::virtual_origin();
+                (ox + self.home_point.0, oy + self.home_point.1)
+            }));
+            return;
+        }
         self.local_step_at(hit).await;
         if hit.is_some() && !self.grab {
             // A barrier fired but no computer took the pointer: hand it back at once.
@@ -1246,6 +1330,11 @@ impl Core {
         // Later motion is relative (raw input), not a reposition.
         self.park_x = x;
         self.park_y = y;
+        // Barriers can activate the instant the portal enables, before the
+        // periodic poll sets `hooked`. Always re-check and arm grab here.
+        if csc_platform::wayland_session() {
+            self.hooked = csc_platform::capture_start() || self.hooked;
+        }
         if self.hooked {
             csc_platform::capture_set_grab(true, Some((ox + x, oy + y)));
         } else {
@@ -1257,6 +1346,8 @@ impl Core {
             csc_platform::set_host_cursor_hidden(true);
         }
         self.grab_armed = false;
+        // Peer lands on the shared seam; ignore its EdgeHit until it moves in.
+        self.edge_leave_ready = Instant::now() + Duration::from_millis(400);
         self.set_active_screen(Some(&dec.neighbor)).await;
         self.flush_pending_clip(&dec.neighbor).await;
         self.last_local_activity = Instant::now();
@@ -1742,6 +1833,9 @@ impl Core {
         if !self.grab || !self.switch.active_remote().eq_ignore_ascii_case(peer) {
             return;
         }
+        if Instant::now() < self.edge_leave_ready {
+            return;
+        }
         let report = EdgeReport {
             edge: hit.edge,
             corner: hit.corner,
@@ -2108,9 +2202,9 @@ impl Core {
                 self.remote_y = self.remote_y.clamp(m.top, m.bottom - 1);
                 inset_from_edge(p.edge, &mut self.remote_x, &mut self.remote_y, &m);
                 self.probe.reset();
-                // Ignore the tail of the crossing move. Long enough to not bounce
-                // straight back, short enough that a deliberate return is immediate.
-                self.control_ready = Instant::now() + Duration::from_millis(16);
+                // Ignore the tail of the crossing move so the shared-edge land
+                // does not EdgeHit straight back to the host.
+                self.control_ready = Instant::now() + Duration::from_millis(300);
                 // Seed with the pointer before the jump. If the jump is ignored,
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
@@ -2418,39 +2512,20 @@ pub async fn run() -> anyhow::Result<()> {
             warn!("host net info: {e}");
             csc_platform::HostNetInfo::default()
         });
+    let (host_name, ips, nics) = nics_of(host);
     {
         let mut cfg = config.write().await;
-        let known = host.nics.iter().any(|n| n.address == cfg.search_address);
-        // A saved Clash fake-ip is not a real NIC. Opening Clash must not
-        // leave the keyboard link bound to that adapter.
-        if !host.nics.is_empty() && (cfg.search_address.is_empty() || !known) {
-            if let Some(nic) = host
-                .nics
-                .iter()
-                .find(|n| n.kind == "ethernet")
-                .or(host.nics.first())
-            {
-                info!(
-                    "using {} for the keyboard link (was {})",
-                    nic.address,
-                    if cfg.search_address.is_empty() {
-                        "unset"
-                    } else {
-                        cfg.search_address.as_str()
-                    }
-                );
-                cfg.search_address = nic.address.clone();
-                if let Err(e) = cfg.save(&config_path) {
-                    warn!("save default search address: {e:#}");
-                }
+        // Prefer ethernet. A saved Clash fake-ip is not a real NIC.
+        if ensure_search_address(&mut cfg, &nics) {
+            if let Err(e) = cfg.save(&config_path) {
+                warn!("save default search address: {e:#}");
             }
         }
-        info!("host={} ips={:?}", host.host_name, host.ipv4_addresses);
+        info!("host={} ips={:?}", host_name, ips);
     }
     let search = config.read().await.search_address.clone();
     let mut supervisor = Supervisor::default();
     {
-        let (host_name, ips, nics) = nics_of(host);
         supervisor.on_adapters(&search, &ips);
         let mut s = status.write().await;
         s.host_name = host_name;
@@ -2556,6 +2631,8 @@ pub async fn run() -> anyhow::Result<()> {
         last_real: None,
         commanded: None,
         control_ready: Instant::now(),
+        edge_enter_ready: Instant::now(),
+        edge_leave_ready: Instant::now(),
         last_edge_sent: Instant::now() - Duration::from_secs(5),
         power_rx: csc_platform::spawn_power_watch(),
     };
@@ -2700,6 +2777,8 @@ async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoar
 #[cfg(test)]
 mod tests {
     use super::Hotkey;
+    use csc_config::Config;
+    use csc_proto::LocalNic;
     use std::collections::HashSet;
 
     #[test]
@@ -2742,6 +2821,39 @@ mod tests {
     }
 
     #[test]
+    fn search_address_prefers_ethernet_when_unset() {
+        let nics = vec![
+            LocalNic {
+                address: "40.40.105.188".into(),
+                kind: "wifi".into(),
+                name: "wlp".into(),
+            },
+            LocalNic {
+                address: "10.10.10.9".into(),
+                kind: "ethernet".into(),
+                name: "enp".into(),
+            },
+        ];
+        assert_eq!(
+            super::preferred_search(&nics).as_deref(),
+            Some("10.10.10.9")
+        );
+        let mut cfg = Config {
+            search_address: String::new(),
+            ..Default::default()
+        };
+        assert!(super::ensure_search_address(&mut cfg, &nics));
+        assert_eq!(cfg.search_address, "10.10.10.9");
+        assert!(!super::ensure_search_address(&mut cfg, &nics));
+        cfg.search_address = "40.40.105.188".into();
+        // A valid wifi selection is kept — only empty / unknown are replaced.
+        assert!(!super::ensure_search_address(&mut cfg, &nics));
+        cfg.search_address = "1.2.3.4".into();
+        assert!(super::ensure_search_address(&mut cfg, &nics));
+        assert_eq!(cfg.search_address, "10.10.10.9");
+    }
+
+    #[test]
     fn return_hotkey_matches_either_hand() {
         let hk = Hotkey::parse("Ctrl+Alt+End").expect("parse");
         let end = 0x4D;
@@ -2755,13 +2867,13 @@ mod tests {
 
     #[test]
     fn default_hotkeys_parse() {
-        let back = Hotkey::parse("Ctrl+Alt+/").expect("parse");
-        let ctrl_alt: HashSet<u32> = [0xE0, 0xE6].into_iter().collect();
-        assert!(back.completes(0x38, &ctrl_alt));
+        let back = Hotkey::parse("Ctrl+Shift+/").expect("parse");
+        let ctrl_shift: HashSet<u32> = [0xE0, 0xE1].into_iter().collect();
+        assert!(back.completes(0x38, &ctrl_shift));
         let lock = Hotkey::parse("Win+L").expect("parse");
         let right_win: HashSet<u32> = [0xE7].into_iter().collect();
         assert!(lock.completes(0x0F, &right_win));
-        assert!(!lock.completes(0x0F, &ctrl_alt));
+        assert!(!lock.completes(0x0F, &ctrl_shift));
     }
 
     #[cfg(target_os = "linux")]

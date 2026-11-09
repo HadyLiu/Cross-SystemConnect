@@ -103,7 +103,7 @@ fn draw_titlebar(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Re
                         );
                         ui.add_space(6.0);
                     }
-                    ui.label(
+                    let title = ui.label(
                         RichText::new(format!(
                             "Cross-SystemConnect  v{}",
                             env!("CARGO_PKG_VERSION")
@@ -111,21 +111,41 @@ fn draw_titlebar(app: &mut App, ctx: &egui::Context, p: &Palette, full: egui::Re
                         .size(11.0)
                         .color(p.text_2),
                     );
+                    // Double-click the title (not the update chip) to toggle maximize.
+                    if title.double_clicked() {
+                        let maximized = ui.ctx().input(|i| i.viewport().maximized).unwrap_or(false);
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+                    if let crate::update::UpdateState::Available(release) = app.updater.state() {
+                        ui.add_space(10.0);
+                        let tip = if crate::locale::is_english() {
+                            format!("New v{}", release.version)
+                        } else {
+                            format!("新版本 v{}", release.version)
+                        };
+                        let chip =
+                            egui::Button::new(RichText::new(tip).size(11.0).color(p.on_accent))
+                                .fill(p.accent)
+                                .corner_radius(6.0)
+                                .min_size(egui::vec2(0.0, 22.0));
+                        let resp = ui.add(chip).on_hover_text(if crate::locale::is_english() {
+                            "Open About to download"
+                        } else {
+                            "打开「关于软件」查看下载"
+                        });
+                        if resp.clicked() {
+                            app.page = Page::About;
+                            app.show_settings(ui.ctx());
+                        }
+                    }
                 },
             );
 
-            let drag = ui.interact(
-                drag_rect,
-                ui.id().with("title_drag"),
-                egui::Sense::click_and_drag(),
-            );
+            // Drag only — leave clicks for the update chip and title double-click.
+            let drag = ui.interact(drag_rect, ui.id().with("title_drag"), egui::Sense::drag());
             if drag.drag_started() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-            if drag.double_clicked() {
-                let maximized = ui.ctx().input(|i| i.viewport().maximized).unwrap_or(false);
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
 
             ui.scope_builder(

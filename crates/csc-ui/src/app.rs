@@ -142,9 +142,13 @@ impl App {
             updater: crate::update::Updater::default(),
         };
         if app.cfg.gui.check_updates {
-            app.updater.check(&cc.egui_ctx);
+            // Startup check: desktop notification when a newer release exists.
+            app.updater.check(&cc.egui_ctx, true);
         }
         app.reload_status();
+        // Core may already have trusted peers from a previous session; do not
+        // wait for a link-state edge to pull them into the UI cache.
+        app.sync_trusted_from_core();
         app.reload_logs();
         app
     }
@@ -195,14 +199,30 @@ impl App {
         }
         self.last_status_at = Instant::now();
         // Core writes trusted_peers on pin/remember; refresh so the device list
-        // and topology unplaced names update without a manual save.
+        // and topology update without a manual save.
         let after = trust_sync_key(&self.status);
-        if before != after {
+        if before != after || trust_ui_stale(&self.status, &self.cfg) {
             self.sync_trusted_from_core();
+        }
+        if self
+            .status
+            .get("connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && (self.message.contains("正在连接") || self.message.contains("Connecting"))
+        {
+            if let Some(peer) = self
+                .status
+                .get("peerName")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                self.set_ok(format!("{} {peer}", self.t("已连接", "Connected")));
+            }
         }
     }
 
-    /// Pull trusted peers (and screens when idle) from core after a link change.
+    /// Pull trusted peers (and screens) from core after a link / trust change.
     fn sync_trusted_from_core(&mut self) {
         let Ok(v) = crate::ipc_client::get_config() else {
             return;
@@ -215,9 +235,25 @@ impl App {
         if !self.save_pending {
             self.cfg.screens = remote.screens;
             self.cfg.layout = remote.layout;
-            if self.cfg.ensure_trusted_screen_places() {
-                self.queue_save();
+        } else {
+            // Keep an in-progress desk edit, but still pick up new peer tiles
+            // so pairing does not leave the topology blank.
+            for place in remote.screens {
+                if !self
+                    .cfg
+                    .screens
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(&place.name))
+                {
+                    self.cfg.screens.push(place);
+                }
             }
+            for (name, edges) in remote.layout {
+                self.cfg.layout.entry(name).or_insert(edges);
+            }
+        }
+        if self.cfg.ensure_trusted_screen_places() {
+            self.queue_save();
         }
     }
 
@@ -462,6 +498,25 @@ fn trust_sync_key(status: &Value) -> String {
         .map(|a| a.len())
         .unwrap_or(0);
     format!("{connected}|{peer}|{host_state}|{pending}|{discovered}")
+}
+
+/// True when a live peer is missing from the UI's trusted list or desk tiles.
+fn trust_ui_stale(status: &Value, cfg: &Config) -> bool {
+    let Some(peer) = status.get("peerName").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    peer.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|name| {
+            !cfg.trusted_peers
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(name))
+                || !cfg
+                    .screens
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(name))
+        })
 }
 
 /// What should pop the settings window: a client asking to connect, or a

@@ -6,6 +6,25 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-09
+
+### 新增
+
+- **启动检查更新用系统通知 + 左上角提示。** 开启「启动时检查更新」后，发现新版本会发桌面通知；设置窗口标题栏左上角显示可点的「新版本 v…」芯片，点开「关于软件」。手动点「检查」只更新界面，不再弹通知。
+- **网卡列表「刷新」。** 设置里可立即重枚举本机网卡，不必重启。
+
+### 变更
+
+- **「回到本机」默认快捷键改为 `Ctrl+Shift+/`**（旧默认 `Ctrl+Alt+/` / `Ctrl+Alt+Home` 会自动迁移）。快捷键页始终显示该项，不再因角色变成从机而消失。
+
+### 修复
+
+- **搜索 IP 范围下拉看不到以太网。** 状态里字段是 `address`，界面误读 `ipv4`，网卡列表被清空。
+- **默认搜索地址优先以太网**；未设置或已失效时自动选有线网卡。发现与 TCP 接入均限制在选定地址的同一 /24，跨网段不连。
+- **配对成功后信任设备 / 屏幕拓扑不显示。** 界面缓存与内核不同步时补拉信任列表与桌面位；连上后清掉卡住的「正在连接…」。
+- **Wayland 穿屏指针吸在边缘、对端收不到移动。** InputCapture 刚启用时屏障已触发，但 `hooked` 未置位、`set_grab` 未调用，libei 位移被丢掉；进入时立即武装捕获。
+- **从对端回来后只能在最上沿左右滑、不能上下移。** 回落仅内缩 1 像素，马上又被顶边屏障吸走并与对端 EdgeHit 弹跳；加大回落内缩，进出后短暂忽略边缘切换。
+
 ## [0.2.5] - 2026-11-09
 
 ### 新增
@@ -265,6 +284,8 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
+[0.2.6]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.6
+[0.2.5]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.5
 [0.2.4]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.4
 [0.2.3]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.3
 [0.2.2]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.2

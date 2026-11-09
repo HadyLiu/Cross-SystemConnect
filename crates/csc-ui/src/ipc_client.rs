@@ -262,6 +262,11 @@ pub fn roll_home_code() -> anyhow::Result<Value> {
     call("roll_home_code", json!({}))
 }
 
+/// Re-enumerate local adapters and return them (also written into status).
+pub fn refresh_nics() -> anyhow::Result<Value> {
+    call("refresh_nics", json!({}))
+}
+
 pub fn pair_offer(code: &str) -> anyhow::Result<Value> {
     call("pair_offer", json!({"code": code}))
 }

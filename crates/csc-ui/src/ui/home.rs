@@ -34,11 +34,11 @@ pub fn draw_home(app: &mut App, ui: &mut egui::Ui) {
         list.row(
             tr("搜索 IP 范围", "Search IP range"),
             tr(
-                "在选定网卡所在网段搜索设备。",
-                "Search the subnet of the selected NIC.",
+                "默认优先以太网；仅同一 /24 网段内的电脑可连接。",
+                "Ethernet is preferred by default; only peers on the same /24 may connect.",
             ),
             |ui| {
-                draw_nic_combo(app, ui);
+                draw_nic_combo(app, ui, &p);
             },
         );
         list.row(
@@ -126,7 +126,48 @@ pub fn draw_home(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn draw_nic_combo(app: &mut App, ui: &mut egui::Ui) {
+fn draw_nic_combo(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
+    // right_to_left: refresh sits on the far right, same as the pairing-code row.
+    let refresh = ui.add(
+        egui::Button::new(
+            RichText::new(tr("刷新", "Refresh"))
+                .size(12.5)
+                .color(p.text),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0, p.border_strong))
+        .corner_radius(6.0)
+        .min_size(egui::vec2(64.0, 46.0)),
+    );
+    if refresh.clicked() {
+        match crate::ipc_client::refresh_nics() {
+            Ok(v) => {
+                if let Some(ip) = v.get("searchAddress").and_then(|s| s.as_str()) {
+                    if !ip.is_empty() && app.cfg.search_address != ip {
+                        app.cfg.search_address = ip.to_string();
+                    }
+                }
+                app.reload_config();
+                app.reload_status();
+                let count = app
+                    .status
+                    .get("localNics")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                app.set_ok(format!(
+                    "{} ({count})",
+                    tr("已刷新网卡", "Adapters refreshed")
+                ));
+            }
+            Err(e) => {
+                app.reload_status();
+                app.set_err(e.to_string());
+            }
+        }
+    }
+    ui.add_space(8.0);
+
     let nics = app
         .status
         .get("localNics")
@@ -145,11 +186,26 @@ fn draw_nic_combo(app: &mut App, ui: &mut egui::Ui) {
     } else {
         for nic in &nics {
             let name = nic.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let ip = nic.get("ipv4").and_then(|v| v.as_str()).unwrap_or("");
+            // Core / LocalNic use `address`; older drafts used `ipv4`.
+            let ip = nic
+                .get("address")
+                .or_else(|| nic.get("ipv4"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if ip.is_empty() {
                 continue;
             }
-            options.push((ip.to_string(), format!("{name}: {ip}")));
+            let kind = match nic.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+                "ethernet" => tr("以太网", "Ethernet"),
+                "wifi" => tr("无线", "Wi-Fi"),
+                _ => "",
+            };
+            let label = if kind.is_empty() {
+                format!("{name}: {ip}")
+            } else {
+                format!("{name} ({kind}): {ip}")
+            };
+            options.push((ip.to_string(), label));
         }
     }
     let current = if app.cfg.search_address.is_empty() {

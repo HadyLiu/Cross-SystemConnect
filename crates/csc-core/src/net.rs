@@ -740,6 +740,11 @@ async fn run_server(
                     };
                     let Some(addr) = addrs.next() else { continue };
                     let key = addr.ip().to_string();
+                    if !cfg.search_address.is_empty()
+                        && !same_subnet24(&key, &cfg.search_address)
+                    {
+                        continue;
+                    }
                     if peers.contains(&key).await {
                         redial.reset(&key);
                         continue;
@@ -857,6 +862,13 @@ async fn run_server(
                 };
                 let _ = tcp.set_nodelay(true);
                 let ip = addr.ip().to_string();
+                if !cfg.search_address.is_empty() && !same_subnet24(&ip, &cfg.search_address) {
+                    info!(
+                        "ignoring TCP from {addr}: outside selected subnet {}",
+                        subnet_label(&cfg.search_address).unwrap_or_default()
+                    );
+                    continue;
+                }
                 // Only computers that announced on the selected LAN, or were linked
                 // before, may dial in.
                 let known = inbound
@@ -1502,8 +1514,16 @@ async fn run_client(
             acc = listener.accept() => {
                 let (tcp, peer) = acc?;
                 let _ = tcp.set_nodelay(true);
+                let ip = peer.ip().to_string();
+                if !cfg.search_address.is_empty() && !same_subnet24(&ip, &cfg.search_address) {
+                    info!(
+                        "ignoring keyboard host from {peer}: outside selected subnet {}",
+                        subnet_label(&cfg.search_address).unwrap_or_default()
+                    );
+                    continue;
+                }
                 info!("keyboard host connected from {peer}");
-                let key = peer.ip().to_string();
+                let key = ip;
                 *incoming
                     .lock()
                     .await
@@ -1558,6 +1578,9 @@ async fn dial_client_manual(ctx: &ClientCtx, dialing: &Arc<Mutex<HashSet<String>
         };
         let Some(addr) = addrs.next() else { continue };
         let key = addr.ip().to_string();
+        if !ctx.cfg.search_address.is_empty() && !same_subnet24(&key, &ctx.cfg.search_address) {
+            continue;
+        }
         if ctx.peers.contains(&key).await || dialing.lock().await.contains(&key) {
             continue;
         }

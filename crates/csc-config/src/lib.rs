@@ -296,13 +296,13 @@ fn default_lock_to_screen() -> String {
     "Ctrl+Shift+K".into()
 }
 fn default_return() -> String {
-    "Ctrl+Alt+/".into()
+    "Ctrl+Shift+/".into()
 }
 fn default_emergency_pause() -> String {
     "Ctrl+Shift+P".into()
 }
 /// Keys of earlier versions, replaced wherever they are still found.
-const RETIRED_RETURN_KEY: &str = "Ctrl+Alt+Home";
+const RETIRED_RETURN_KEYS: &[&str] = &["Ctrl+Alt+Home", "Ctrl+Alt+/"];
 
 /// `Win+L`, `Ctrl+Alt+L`, `ScrollLock`, or empty — replaced once when moving to v5.
 fn retired_lock_key(key: &str) -> bool {
@@ -1024,9 +1024,9 @@ impl Config {
     /// The old keys are gone for good, not just as defaults, and an empty key
     /// would leave the action without one. True when a key was replaced.
     fn retire_old_hotkeys(&mut self) -> bool {
-        let retire = |key: &mut String, old: &str, new: fn() -> String| {
+        let retire = |key: &mut String, old: &[&str], new: fn() -> String| {
             let k = key.replace(' ', "");
-            let stale = k.is_empty() || k.eq_ignore_ascii_case(old);
+            let stale = k.is_empty() || old.iter().any(|o| k.eq_ignore_ascii_case(o));
             if stale {
                 *key = new();
             }
@@ -1034,7 +1034,7 @@ impl Config {
         };
         let back = retire(
             &mut self.hotkeys.return_to_server,
-            RETIRED_RETURN_KEY,
+            RETIRED_RETURN_KEYS,
             default_return,
         );
         let lock_empty = self.hotkeys.lock_screen.trim().is_empty();
@@ -1659,7 +1659,7 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::load_or_create(&path).unwrap();
-        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Shift+/");
         assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
@@ -1673,7 +1673,7 @@ mod tests {
         .unwrap();
         let mut cfg = Config::load_or_create(&path).unwrap();
         assert_eq!(cfg.config_version, 5);
-        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Shift+/");
         assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         assert!(cfg.peer_fingerprints.is_empty());
         assert!(!cfg.device_id.is_empty());
@@ -1681,19 +1681,19 @@ mod tests {
         assert_eq!(cfg.log.max_kb, 1024);
         assert!(std::fs::read_to_string(&path)
             .unwrap()
-            .contains("Ctrl+Alt+/"));
+            .contains("Ctrl+Shift+/"));
 
         cfg.merge_from_value(serde_json::json!({
             "hotkeys": {"lock_screen": "scroll lock", "return_to_server": "Ctrl+Alt+Home"}
         }))
         .unwrap();
-        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Shift+/");
         assert_eq!(cfg.hotkeys.lock_screen, "scroll lock");
         cfg.merge_from_value(serde_json::json!({
             "hotkeys": {"lock_screen": "", "return_to_server": ""}
         }))
         .unwrap();
-        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Alt+/");
+        assert_eq!(cfg.hotkeys.return_to_server, "Ctrl+Shift+/");
         assert_eq!(cfg.hotkeys.lock_screen, "Ctrl+Shift+L");
         let _ = std::fs::remove_dir_all(&dir);
     }

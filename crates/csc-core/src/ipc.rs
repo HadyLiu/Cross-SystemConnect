@@ -466,6 +466,43 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
             info!("rescan requested from UI");
             IpcResponse::ok(req.id, json!({"ok": true}))
         }
+        "refresh_nics" | "refreshNics" => {
+            let host = match tokio::task::spawn_blocking(csc_platform::query_host_net_info).await {
+                Ok(h) => h,
+                Err(e) => return IpcResponse::err(req.id, e.to_string()),
+            };
+            let (host_name, ips, nics) = crate::nics_of(host);
+            let list = nics.clone();
+            let mut search_changed = false;
+            {
+                let mut cfg = state.config.write().await;
+                if crate::ensure_search_address(&mut cfg, &nics) {
+                    search_changed = true;
+                    if let Err(e) = cfg.save(&state.config_path) {
+                        warn!("save search address after refresh: {e:#}");
+                    }
+                }
+            }
+            let search = state.config.read().await.search_address.clone();
+            {
+                let mut s = state.status.write().await;
+                s.host_name = host_name;
+                s.local_ipv4 = ips;
+                s.local_nics = nics;
+                s.search_subnet = crate::discover::subnet_label(&search).unwrap_or_default();
+            }
+            if search_changed {
+                state.net_reload.send_modify(|n| *n = n.wrapping_add(1));
+            }
+            info!(count = list.len(), %search, "adapters refreshed from UI");
+            match serde_json::to_value(list) {
+                Ok(v) => IpcResponse::ok(
+                    req.id,
+                    json!({"ok": true, "nics": v, "searchAddress": search}),
+                ),
+                Err(e) => IpcResponse::err(req.id, e.to_string()),
+            }
+        }
         "roll_home_code" => {
             let search = state.config.read().await.search_address.clone();
             let mut s = state.status.write().await;

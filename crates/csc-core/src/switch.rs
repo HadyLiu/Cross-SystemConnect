@@ -468,13 +468,15 @@ impl SwitchController {
         self.box_point(edge, pct)
     }
 
-    /// Pointer back on the local side opposite `remote_edge`, one pixel in
-    /// so the crossing itself does not immediately switch again.
+    /// Pointer back on the local side opposite `remote_edge`, inset so the
+    /// crossing itself does not immediately switch again. On Wayland HiDPI the
+    /// portal maps core pixels to logical ones; one pixel is still on the barrier.
     pub fn local_reentry(&self, remote_edge: Edge, pct: f32) -> (i32, i32) {
         let local = remote_edge.opposite();
         let (mut x, mut y) = self.place_on_edge(local, pct);
         let m = self.monitor_at(x, y);
-        const INSET: i32 = 1;
+        // ~16 logical px at 200% scale; clearly inside the InputCapture barrier.
+        const INSET: i32 = 32;
         match local {
             Edge::Left | Edge::TopLeft | Edge::BottomLeft => {
                 x = (x + INSET).min(m.right - 1);
