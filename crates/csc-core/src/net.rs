@@ -94,6 +94,8 @@ pub struct Wires {
     transfer: crate::transfer::TransferHandle,
     /// Keyboard host: last TCP address of each controlled computer, for redialing.
     last_peers: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    /// Names/IPs the user disconnected; do not auto-redial until they pair again.
+    held_off: Arc<Mutex<HashSet<String>>>,
     /// Live control sessions (shared so HELLO can rekey IP → hostname).
     peers: PeerTable,
     /// A session ended: search or announce right away.
@@ -281,7 +283,12 @@ impl PeerTable {
     pub async fn send_to(&self, name: &str, frame: Vec<u8>) {
         let link = Self::find(&*self.txs.lock().await, name);
         if let Some(link) = link {
-            let _ = link.tx.send(frame).await;
+            // Never wait: a stalled writer would freeze the grab loop and
+            // hold the pointer. A full or closed queue means the session is
+            // already stuck, so end it and let Disconnected hand input back.
+            if link.tx.try_send(frame).is_err() {
+                let _ = link.kill.send(true);
+            }
         }
     }
 
@@ -322,6 +329,8 @@ impl PeerTable {
 #[derive(Clone)]
 pub struct NetHub {
     peers: PeerTable,
+    last_peers: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    held_off: Arc<Mutex<HashSet<String>>>,
 }
 
 impl NetHub {
@@ -374,6 +383,58 @@ impl NetHub {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Drop a live session without forgetting trust, and do not auto-redial
+    /// that computer until the user types a pairing code again.
+    pub async fn disconnect_peer(&self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let had = self.peers.contains(name).await;
+        let info = self.peers.info(name).await;
+        self.peers.kill_remove(name).await;
+
+        let mut aliases = Vec::new();
+        if let Some(info) = &info {
+            if !info.host_name.is_empty() && !info.host_name.eq_ignore_ascii_case(name) {
+                aliases.push(info.host_name.clone());
+            }
+        }
+        for alias in &aliases {
+            self.peers.kill_remove(alias).await;
+        }
+
+        let mut ips = Vec::new();
+        {
+            let mut last = self.last_peers.lock().await;
+            last.retain(|k, addr| {
+                let hit = k.eq_ignore_ascii_case(name)
+                    || aliases.iter().any(|a| k.eq_ignore_ascii_case(a));
+                if hit {
+                    ips.push(addr.ip());
+                }
+                !hit
+            });
+            last.retain(|k, addr| {
+                !ips.iter()
+                    .any(|ip| addr.ip() == *ip || k == &ip.to_string())
+            });
+        }
+        for ip in &ips {
+            self.peers.kill_remove(&ip.to_string()).await;
+        }
+
+        let mut held = self.held_off.lock().await;
+        held.insert(name.to_ascii_lowercase());
+        for alias in &aliases {
+            held.insert(alias.to_ascii_lowercase());
+        }
+        for ip in ips {
+            held.insert(ip.to_string().to_ascii_lowercase());
+        }
+        had
+    }
+
     pub async fn send_mouse_move(&self, dx: i32, dy: i32) {
         self.send_raw(encode_mouse_move_bin(&MouseMovePayload { dx, dy }))
             .await;
@@ -419,10 +480,13 @@ pub async fn spawn_network(
     transfer: crate::transfer::TransferHandle,
 ) -> anyhow::Result<NetHub> {
     let peers = PeerTable::new();
+    let last_peers = Arc::new(Mutex::new(HashMap::new()));
+    let held_off = Arc::new(Mutex::new(HashSet::new()));
     let inbound = Wires {
         events,
         transfer,
-        last_peers: Arc::new(Mutex::new(HashMap::new())),
+        last_peers: last_peers.clone(),
+        held_off: held_off.clone(),
         peers: peers.clone(),
         kick: Arc::new(tokio::sync::Notify::new()),
         net_reload,
@@ -500,7 +564,11 @@ pub async fn spawn_network(
         }
     });
 
-    Ok(NetHub { peers })
+    Ok(NetHub {
+        peers,
+        last_peers,
+        held_off,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,6 +710,7 @@ async fn run_server(
     loop {
         tokio::select! {
             _ = offer_poll.tick() => {
+                expire_stale_offer(app_status).await;
                 let gen = app_status.read().await.offer_gen;
                 if gen != last_offer_gen {
                     last_offer_gen = gen;
@@ -662,6 +731,7 @@ async fn run_server(
                 }
             }
             _ = tick.tick() => {
+                expire_stale_offer(app_status).await;
                 udp_fails = count_udp_failure(udp_fails, send_to_targets(&udp, &search, &targets).await)?;
                 let now = Instant::now();
                 seen.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(15));
@@ -701,6 +771,9 @@ async fn run_server(
                     .map(|(k, a)| (k.clone(), *a))
                     .collect();
                 for (key, addr) in known {
+                    if is_held_off(&inbound, &[&key, &addr.ip().to_string()]).await {
+                        continue;
+                    }
                     if peers.contains(&key).await
                         || already_linked_to_ip(peers, &inbound, addr.ip()).await
                     {
@@ -848,6 +921,9 @@ async fn run_server(
                 // A direct reply passes firewalls that drop unsolicited datagrams,
                 // so the client dials back now instead of after its own refresh.
                 let _ = udp.send_to(&search_unlinked, src).await;
+                if is_held_off(&inbound, &[&key, &display, &ann.host_name, &src_ip]).await {
+                    continue;
+                }
                 let eager = offer_ready(app_status).await;
                 // Who typed the code dials out — discovery must not race that IP.
                 if eager {
@@ -899,7 +975,7 @@ async fn run_server(
                         continue;
                     }
                 };
-                let _ = tcp.set_nodelay(true);
+                prepare_tcp(&tcp);
                 let ip = addr.ip().to_string();
                 if !cfg.search_address.is_empty() && !same_subnet24(&ip, &cfg.search_address) {
                     info!(
@@ -926,6 +1002,10 @@ async fn run_server(
                     info!("ignoring TCP from {addr}: no announce seen yet");
                     continue;
                 };
+                if is_held_off(&inbound, &[&key, &ip]).await {
+                    info!("ignoring TCP from {addr}: user disconnected this computer");
+                    continue;
+                }
                 spawn_server_link(
                     cfg.clone(),
                     live.clone(),
@@ -956,6 +1036,99 @@ async fn accept_opt(listener: Option<&TcpListener>) -> std::io::Result<(TcpStrea
 enum ServerLink {
     Dial(SocketAddr),
     Accepted(TcpStream, SocketAddr),
+}
+
+/// Address used to redial a peer's *listening* control port.
+/// Never store an inbound connection's ephemeral source port — that produced
+/// redials to ports such as 7672 after a client dialed back.
+fn peer_control_addr(ip: IpAddr, advertised: u16, fallback: u16) -> SocketAddr {
+    let port = if advertised != 0 {
+        advertised
+    } else {
+        fallback
+    };
+    SocketAddr::new(ip, port)
+}
+
+fn remember_control_addr(
+    last: &mut HashMap<String, SocketAddr>,
+    key: &str,
+    ip: IpAddr,
+    advertised: u16,
+    fallback: u16,
+) {
+    last.insert(key.to_string(), peer_control_addr(ip, advertised, fallback));
+}
+
+fn known_control_port(last: &HashMap<String, SocketAddr>, ip: IpAddr, fallback: u16) -> u16 {
+    last.iter()
+        .find(|(_, a)| a.ip() == ip && a.port() != 0)
+        .map(|(_, a)| a.port())
+        .unwrap_or(fallback)
+}
+
+async fn set_peer_note(app_status: &Arc<RwLock<AppStatus>>, note: impl Into<String>) {
+    let note = note.into();
+    let mut s = app_status.write().await;
+    if s.peer_note != note {
+        s.peer_note = note;
+    }
+}
+
+async fn expire_stale_offer(app_status: &Arc<RwLock<AppStatus>>) {
+    let mut s = app_status.write().await;
+    if s.offer_code.len() != 6 || s.offer_until == 0 || s.offer_until > unix_now() {
+        return;
+    }
+    s.offer_code.clear();
+    s.offer_until = 0;
+    if s.peer_note.contains("正在连接") || s.peer_note.is_empty() {
+        s.peer_note = "连接超时，请重新输入配对码".into();
+    }
+}
+
+async fn fail_offer(app_status: &Arc<RwLock<AppStatus>>, note: &str) {
+    let mut s = app_status.write().await;
+    s.offer_code.clear();
+    s.offer_until = 0;
+    let keep_existing = !s.peer_note.is_empty()
+        && !s.peer_note.contains("正在连接")
+        && (s.peer_note.contains("配对")
+            || s.peer_note.contains("取消")
+            || s.peer_note.contains("超时")
+            || s.peer_note.contains("失败"));
+    if !keep_existing {
+        s.peer_note = note.to_string();
+    }
+}
+
+async fn note_waiting_dialback(app_status: &Arc<RwLock<AppStatus>>) {
+    if offer_ready(app_status).await {
+        set_peer_note(app_status, "正在连接，等待对方回拨…").await;
+    }
+}
+
+async fn note_handshake_failed(app_status: &Arc<RwLock<AppStatus>>, err: &str) {
+    if offer_ready(app_status).await {
+        warn!("pairing handshake failed during offer: {err}");
+        fail_offer(app_status, "连接握手失败，请重新输入配对码").await;
+    }
+}
+
+async fn ip_looks_trusted(live: &Arc<RwLock<Config>>, inbound: &Wires, ip: IpAddr) -> bool {
+    let mut names: Vec<String> = vec![ip.to_string()];
+    {
+        let last = inbound.last_peers.lock().await;
+        for (k, a) in last.iter() {
+            if a.ip() == ip {
+                names.push(k.clone());
+            }
+        }
+    }
+    let saved = live.read().await;
+    names
+        .iter()
+        .any(|n| saved.is_trusted_peer(n) || saved.peer_fingerprint(n).is_some())
 }
 
 /// Pairing code `XXXYYY`: `YYY` is the peer’s IPv4 last octet on the selected /24.
@@ -1203,6 +1376,10 @@ async fn try_dial_offer_ip(
     debug!(%addr, %key, "try_dial_offer_ip: session key ready");
     let greeted = already_greeted_at_ip(peers, inbound, addr.ip()).await;
     let keys = session_keys_for_ip(peers, inbound, addr.ip()).await;
+    let ip = addr.ip().to_string();
+    let mut hold_names: Vec<&str> = vec![&key, &ip];
+    hold_names.extend(keys.iter().map(|s| s.as_str()));
+    release_hold(inbound, &hold_names).await;
     let trusted = {
         let saved = live.read().await;
         let mut hit = saved.is_trusted_peer(&key) || saved.peer_fingerprint(&key).is_some();
@@ -1336,91 +1513,189 @@ fn spawn_server_link(
 ) {
     tokio::spawn(async move {
         let dialed = matches!(link, ServerLink::Dial(_));
-        let (tls, peer_addr) = match link {
-            ServerLink::Dial(addr) => (connect_tls(&identity, addr).await, addr),
-            ServerLink::Accepted(tcp, addr) => (tls_client(&identity, tcp, addr).await, addr),
-        };
-        match tls {
-            Ok((stream, peer_cert)) => {
-                let (tx, rx) = new_link();
-                if replace {
-                    // Who typed the code initiates — own the slot.
-                    drop_sessions_to_ip(&peers, &inbound, peer_addr.ip()).await;
-                } else if already_linked_to_ip(&peers, &inbound, peer_addr.ip()).await {
-                    // Discovery/redial must not fight an existing (or offer) session.
-                    debug!(
-                        "already linked to {} via another name; dropping {key} at {peer_addr}",
-                        peer_addr.ip()
-                    );
-                    if dialed {
-                        inflight.lock().await.remove(&key);
-                    }
-                    return;
-                }
-                if dialed {
-                    if replace {
-                        // Force-take the key even if a racing insert landed.
-                        let _ = peers.adopt(&key, tx.clone(), Duration::ZERO).await;
-                    } else if !peers.insert_new(&key, tx.clone()).await {
-                        debug!("already linked to {key}; dropping extra connection {peer_addr}");
-                        inflight.lock().await.remove(&key);
-                        return;
-                    }
-                } else if !peers.adopt(&key, tx.clone(), DUPLICATE_LINK).await {
-                    debug!("already linked to {key}; dropping extra connection {peer_addr}");
-                    return;
-                }
-                let how = if dialed { "dialed" } else { "dialed back by client" };
-                info!("connected to client {key} at {peer_addr} ({how})");
-                let tcp_addr = if dialed {
-                    peer_addr
-                } else {
-                    SocketAddr::new(peer_addr.ip(), cfg.control_port)
-                };
-                inbound.last_peers.lock().await.insert(key.clone(), tcp_addr);
-                refresh_link_status(&status, &peers).await;
-                let kick = inbound.kick.clone();
-                let events = inbound.clone();
-                let data_token = export_client(&stream);
-                tokio::select! {
-                    result = session(
+        match link {
+            ServerLink::Dial(addr) => match connect_tls(&identity, addr).await {
+                Ok((stream, cert)) => {
+                    let token = export_client(&stream);
+                    host_link_session(
                         &cfg,
                         &live,
                         &config_path,
-                        stream,
-                        peer_cert,
+                        &identity,
+                        &peers,
+                        inbound,
                         &status,
                         &app_status,
                         &prompt,
-                        key.clone(),
-                        rx,
-                        inbound,
-                        None,
-                        None,
-                        peer_addr.ip(),
-                        &identity,
-                        data_token,
-                    ) => {
-                        if let Err(e) = result {
-                            warn!("session {key} ended: {e:#}");
-                        }
-                    }
-                    _ = stop.changed() => {}
+                        &inflight,
+                        &mut stop,
+                        &key,
+                        stream,
+                        cert,
+                        token,
+                        addr,
+                        true,
+                        replace,
+                    )
+                    .await;
                 }
-                peers.remove_owned(&key, &tx).await;
-                report_gone(&peers, &events, &key).await;
-                refresh_link_status(&status, &peers).await;
-                kick.notify_one();
-            }
-            Err(e) if dialed => warn!(
-                "connect {peer_addr}: {e:#} (the client's firewall may block inbound TCP; waiting for it to dial back)"
-            ),
-            Err(e) => warn!("client {key} dialed back from {peer_addr}: {e:#}"),
+                Err(e) => {
+                    warn!(
+                        "connect {addr}: {e:#} (the client's firewall may block inbound TCP; waiting for it to dial back)"
+                    );
+                    let text = format!("{e:#}");
+                    if text.contains("timed out")
+                        || text.contains("Connection refused")
+                        || text.contains("Network is unreachable")
+                        || text.contains("No route to host")
+                    {
+                        note_waiting_dialback(&app_status).await;
+                    } else {
+                        note_handshake_failed(&app_status, &text).await;
+                    }
+                }
+            },
+            ServerLink::Accepted(tcp, addr) => match accept_tls(&identity, tcp).await {
+                Ok((stream, cert)) => {
+                    let token = export_server(&stream);
+                    host_link_session(
+                        &cfg,
+                        &live,
+                        &config_path,
+                        &identity,
+                        &peers,
+                        inbound,
+                        &status,
+                        &app_status,
+                        &prompt,
+                        &inflight,
+                        &mut stop,
+                        &key,
+                        stream,
+                        cert,
+                        token,
+                        addr,
+                        false,
+                        replace,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!("client {key} dialed back from {addr}: {e:#}");
+                    note_handshake_failed(&app_status, &format!("{e:#}")).await;
+                }
+            },
         }
         if dialed {
             inflight.lock().await.remove(&key);
         }
     });
+}
+
+/// One host-side control session after TLS (outbound = TLS client, inbound = TLS server).
+#[allow(clippy::too_many_arguments)]
+async fn host_link_session<S>(
+    cfg: &Config,
+    live: &Arc<RwLock<Config>>,
+    config_path: &Path,
+    identity: &Arc<crate::tls::Identity>,
+    peers: &PeerTable,
+    inbound: Wires,
+    status: &Arc<RwLock<NetStatus>>,
+    app_status: &Arc<RwLock<AppStatus>>,
+    prompt: &Arc<PeerPrompt>,
+    inflight: &Arc<Mutex<HashSet<String>>>,
+    stop: &mut watch::Receiver<bool>,
+    key: &str,
+    stream: S,
+    peer_cert: Vec<u8>,
+    data_token: [u8; 32],
+    peer_addr: SocketAddr,
+    dialed: bool,
+    replace: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, rx) = new_link();
+    if replace {
+        // Who typed the code initiates — own the slot.
+        drop_sessions_to_ip(peers, &inbound, peer_addr.ip()).await;
+    } else if already_linked_to_ip(peers, &inbound, peer_addr.ip()).await {
+        // Discovery/redial must not fight an existing (or offer) session.
+        debug!(
+            "already linked to {} via another name; dropping {key} at {peer_addr}",
+            peer_addr.ip()
+        );
+        if dialed {
+            inflight.lock().await.remove(key);
+        }
+        return;
+    }
+    if dialed {
+        if replace {
+            // Force-take the key even if a racing insert landed.
+            let _ = peers.adopt(key, tx.clone(), Duration::ZERO).await;
+        } else if !peers.insert_new(key, tx.clone()).await {
+            debug!("already linked to {key}; dropping extra connection {peer_addr}");
+            inflight.lock().await.remove(key);
+            return;
+        }
+    } else if !peers.adopt(key, tx.clone(), DUPLICATE_LINK).await {
+        debug!("already linked to {key}; dropping extra connection {peer_addr}");
+        return;
+    }
+    let how = if dialed {
+        "dialed"
+    } else {
+        "dialed back by client"
+    };
+    info!("connected to client {key} at {peer_addr} ({how})");
+    let tcp_addr = if dialed {
+        peer_addr
+    } else {
+        let known = {
+            let last = inbound.last_peers.lock().await;
+            known_control_port(&last, peer_addr.ip(), cfg.control_port)
+        };
+        peer_control_addr(peer_addr.ip(), known, cfg.control_port)
+    };
+    inbound
+        .last_peers
+        .lock()
+        .await
+        .insert(key.to_string(), tcp_addr);
+    refresh_link_status(status, peers).await;
+    let kick = inbound.kick.clone();
+    let events = inbound.clone();
+    tokio::select! {
+        result = session(
+            cfg,
+            live,
+            config_path,
+            stream,
+            peer_cert,
+            status,
+            app_status,
+            prompt,
+            key.to_string(),
+            rx,
+            inbound,
+            None,
+            None,
+            peer_addr.ip(),
+            identity,
+            data_token,
+        ) => {
+            if let Err(e) = result {
+                warn!("session {key} ended: {e:#}");
+            }
+        }
+        _ = stop.changed() => {}
+    }
+    peers.remove_owned(key, &tx).await;
+    report_gone(peers, &events, key).await;
+    refresh_link_status(status, peers).await;
+    kick.notify_one();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1496,6 +1771,7 @@ async fn run_client(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                expire_stale_offer(app_status).await;
                 manual_tick = manual_tick.wrapping_add(1);
                 if manual_tick % 15 == 1 {
                     dial_client_manual(&ctx, &dialing).await;
@@ -1599,7 +1875,7 @@ async fn run_client(
             }
             acc = listener.accept() => {
                 let (tcp, peer) = acc?;
-                let _ = tcp.set_nodelay(true);
+                prepare_tcp(&tcp);
                 let ip = peer.ip().to_string();
                 if !cfg.search_address.is_empty() && !same_subnet24(&ip, &cfg.search_address) {
                     info!(
@@ -1618,7 +1894,7 @@ async fn run_client(
                 let ctx = ctx.clone();
                 let incoming = incoming.clone();
                 tokio::spawn(async move {
-                    client_link(ctx, tcp, peer).await;
+                    client_link(ctx, tcp, peer, false).await;
                     let mut n = incoming.lock().await;
                     if let Some(left) = n.get_mut(&key) {
                         *left = left.saturating_sub(1);
@@ -1687,7 +1963,7 @@ fn spawn_client_dial(
         match connect_peer(addr).await {
             Ok(tcp) => {
                 info!("dialed keyboard host at {addr}");
-                client_link(ctx, tcp, addr).await;
+                client_link(ctx, tcp, addr, true).await;
             }
             Err(e) => debug!("dial keyboard host {addr}: {e:#}"),
         }
@@ -1696,7 +1972,8 @@ fn spawn_client_dial(
 }
 
 /// Run one control session with the keyboard host, whichever side opened the TCP.
-async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
+/// Outbound dials are the TLS client; inbound accepts are the TLS server.
+async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr, dialed: bool) {
     let key = peer.ip().to_string();
     let (tx, rx) = new_link();
     let registered = Arc::new(AtomicBool::new(false));
@@ -1715,21 +1992,72 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
         rejected: ctx.rejected.clone(),
         address: peer.to_string(),
     };
-    let (stream, peer_cert) = match accept_tls(&ctx.identity, tcp).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!("tls from {peer}: {e:#}");
-            return;
+    if dialed {
+        match tls_client(&ctx.identity, tcp, peer).await {
+            Ok((stream, cert)) => {
+                let token = export_client(&stream);
+                client_link_session(
+                    ctx, stream, cert, token, peer, key, link, admit, tx, rx, registered, true,
+                )
+                .await;
+            }
+            Err(e) => warn!("tls to {peer}: {e:#}"),
         }
-    };
-    // Discovery RTT probes look up linked peers via last_peers (same as the host).
-    ctx.inbound
-        .last_peers
-        .lock()
-        .await
-        .insert(key.clone(), peer);
+    } else {
+        match accept_tls(&ctx.identity, tcp).await {
+            Ok((stream, cert)) => {
+                let token = export_server(&stream);
+                client_link_session(
+                    ctx, stream, cert, token, peer, key, link, admit, tx, rx, registered, false,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!("tls from {peer}: {e:#}");
+                if !ip_looks_trusted(&ctx.live, &ctx.inbound, peer.ip()).await {
+                    begin_pair_attempt(&ctx.app_status).await;
+                    set_peer_note(&ctx.app_status, format!("{peer} 正在尝试连接，但握手失败"))
+                        .await;
+                    finish_pair_attempt(&ctx.app_status).await;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn client_link_session<S>(
+    ctx: ClientCtx,
+    stream: S,
+    peer_cert: Vec<u8>,
+    data_token: [u8; 32],
+    peer: SocketAddr,
+    key: String,
+    link: ClientLink,
+    admit: Admit,
+    tx: Link,
+    rx: LinkRx,
+    registered: Arc<AtomicBool>,
+    dialed: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Remember the peer's listening control port, never the ephemeral source port.
+    {
+        let mut last = ctx.inbound.last_peers.lock().await;
+        if dialed {
+            last.insert(key.clone(), peer);
+        } else {
+            let port = known_control_port(&last, peer.ip(), ctx.cfg.control_port);
+            remember_control_addr(&mut last, &key, peer.ip(), port, ctx.cfg.control_port);
+        }
+    }
+    let targeted = !dialed && !ip_looks_trusted(&ctx.live, &ctx.inbound, peer.ip()).await;
+    if targeted {
+        begin_pair_attempt(&ctx.app_status).await;
+        set_peer_note(&ctx.app_status, format!("{} 正在尝试连接…", peer.ip())).await;
+    }
     let mut stop = ctx.stop.clone();
-    let data_token = export_server(&stream);
     tokio::select! {
         result = session(
             &ctx.cfg,
@@ -1754,6 +2082,9 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr) {
             }
         }
         _ = stop.changed() => {}
+    }
+    if targeted {
+        finish_pair_attempt(&ctx.app_status).await;
     }
     ctx.peers.remove_owned(&key, &tx).await;
     // A second connection that never got past HELLO or trust was never this peer's session.
@@ -1810,6 +2141,28 @@ fn count_udp_failure(fails: u32, sent_any: bool) -> anyhow::Result<u32> {
     Ok(fails)
 }
 
+fn hold_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+async fn is_held_off(inbound: &Wires, keys: &[&str]) -> bool {
+    let held = inbound.held_off.lock().await;
+    keys.iter().any(|k| {
+        let k = k.trim();
+        !k.is_empty() && held.contains(&hold_key(k))
+    })
+}
+
+async fn release_hold(inbound: &Wires, keys: &[&str]) {
+    let mut held = inbound.held_off.lock().await;
+    for k in keys {
+        let k = k.trim();
+        if !k.is_empty() {
+            held.remove(&hold_key(k));
+        }
+    }
+}
+
 /// Back-off for redialing a controlled computer that was linked before.
 #[derive(Default)]
 struct Redial {
@@ -1817,7 +2170,7 @@ struct Redial {
 }
 
 impl Redial {
-    const FIRST: Duration = Duration::from_secs(2);
+    const FIRST: Duration = Duration::from_millis(500);
     const MAX: Duration = Duration::from_secs(10);
 
     fn due(&mut self, key: &str, now: Instant) -> bool {
@@ -2028,8 +2381,24 @@ async fn connect_peer(addr: SocketAddr) -> anyhow::Result<TcpStream> {
             .await
             .map_err(|_| anyhow::anyhow!("connect {addr} timed out"))??
     };
-    let _ = stream.set_nodelay(true);
+    prepare_tcp(&stream);
     Ok(stream)
+}
+
+/// Keep the socket from sitting half-dead when a VPN/TUN like Clash
+/// black-holes an established connection: no delay, and a short keepalive
+/// so the session fails in a few seconds instead of stalling the pointer.
+fn prepare_tcp(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(1))
+        .with_interval(Duration::from_secs(1));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let ka = ka.with_retries(3);
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        debug!("tcp keepalive: {e}");
+    }
 }
 
 async fn connect_tls(
@@ -2239,6 +2608,7 @@ where
             } else {
                 remote.host_name.clone()
             };
+            set_peer_note(app_status, format!("{who} 正在尝试连接…")).await;
             match client_pair(
                 &mut reader,
                 &writer,
@@ -2280,17 +2650,19 @@ where
         }
         write_locked(&writer, &encode_hello_bin(&hello)).await?;
         remember(&announced);
-        // Point last_peers at the hostname so discovery RTT keys match the UI.
-        if !name.eq_ignore_ascii_case(&peer) {
+        // Point last_peers at the hostname and the advertised control port.
+        {
             let mut last = inbound.last_peers.lock().await;
-            if let Some(addr) = last.remove(&peer) {
-                last.insert(name.clone(), addr);
-            } else {
-                last.insert(
-                    name.clone(),
-                    SocketAddr::new(remote_ip, announced.ports.control),
-                );
+            if !name.eq_ignore_ascii_case(&peer) {
+                last.remove(&peer);
             }
+            remember_control_addr(
+                &mut last,
+                &name,
+                remote_ip,
+                announced.ports.control,
+                cfg.control_port,
+            );
         }
         let _ = inbound.events.send(InboundEvent::Hello(announced)).await;
     } else {
@@ -2322,6 +2694,21 @@ where
                     }
                 } else {
                     info!("client {peer} did not accept control: {text}");
+                    if offer_ready(app_status).await
+                        || app_status.read().await.peer_note.contains("正在连接")
+                    {
+                        if text.contains("timed out") || text.contains("no data") {
+                            fail_offer(app_status, "连接超时，请重新输入配对码").await;
+                        } else if text.contains("cancelled") || text.contains("pairing cancelled") {
+                            // host_wait_hello already set 对方取消了这次配对
+                        } else if text.contains("pairing rejected") {
+                            // already set 配对码不对 / 已取消这次配对
+                        } else if text.contains("pairing refused") {
+                            fail_offer(app_status, "对方拒绝了这次连接").await;
+                        } else {
+                            fail_offer(app_status, "连接失败，请重新输入配对码").await;
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -2374,21 +2761,40 @@ where
                 info!("session {name} already live; dropping duplicate dial via {peer}");
                 {
                     let mut last = inbound.last_peers.lock().await;
-                    if let Some(addr) = last.remove(&peer) {
-                        last.entry(name.clone()).or_insert(addr);
-                    }
+                    last.remove(&peer);
+                    remember_control_addr(
+                        &mut last,
+                        &name,
+                        remote_ip,
+                        remote.ports.control,
+                        cfg.control_port,
+                    );
                 } // last_peers dropped before clear_offer .await
                 clear_offer(app_status).await;
                 return Ok(());
             }
             {
                 let mut last = inbound.last_peers.lock().await;
-                if let Some(addr) = last.remove(&peer) {
-                    last.insert(name.clone(), addr);
-                }
+                last.remove(&peer);
+                remember_control_addr(
+                    &mut last,
+                    &name,
+                    remote_ip,
+                    remote.ports.control,
+                    cfg.control_port,
+                );
             }
             info!("session {peer} is now {name}");
             peer = name.clone();
+        } else {
+            let mut last = inbound.last_peers.lock().await;
+            remember_control_addr(
+                &mut last,
+                &name,
+                remote_ip,
+                remote.ports.control,
+                cfg.control_port,
+            );
         }
         // Connected — stop offer redials that would open a second link.
         clear_offer(app_status).await;
@@ -2424,24 +2830,30 @@ where
     }
 
     let hb_writer = writer.clone();
-    let hb_enabled = cfg.network.heartbeat_enabled;
-    let hb_ms = cfg.network.heartbeat_ms.max(500) as u64;
+    // Always probe, even if the user turned the setting off: a black-holed
+    // socket can still accept tiny writes into the kernel buffer, so only a
+    // missing reply tells us the pointer must come back.
+    let probe_ms = if cfg.network.heartbeat_enabled {
+        (cfg.network.heartbeat_ms as u64).clamp(200, 500)
+    } else {
+        500
+    };
+    let (write_fail_tx, mut write_fail_rx) = watch::channel(false);
+    let hb_fail = write_fail_tx.clone();
     let _heartbeat = AbortOnDrop(tokio::spawn(async move {
-        if !hb_enabled {
-            return;
-        }
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(hb_ms));
+        let mut tick = tokio::time::interval(Duration::from_millis(probe_ms));
         loop {
             tick.tick().await;
             let frame = encode_frame(MsgType::Heartbeat, &[], 0);
-            let mut w = hb_writer.lock().await;
-            if w.write_all(&frame).await.is_err() || w.flush().await.is_err() {
+            if write_locked(&hb_writer, &frame).await.is_err() {
+                let _ = hb_fail.send(true);
                 break;
             }
         }
     }));
-    // A peer that vanished without closing TCP is noticed by its missing heartbeats.
-    let idle_limit = Duration::from_millis(hb_ms * 4);
+    // Two missed probes (~1 s) is long enough to ignore a brief hitch and
+    // short enough that a dead link cannot hold the pointer.
+    let idle_limit = Duration::from_millis(probe_ms * 2);
 
     let mut last_rx = tokio::time::Instant::now();
     // One transfer stays on one connection: data port once it is up, otherwise control.
@@ -2467,8 +2879,7 @@ where
                         None => break,
                         Some(frame) => {
                             if let Some(reply) = bench_answer(&frame) {
-                                let mut w = writer.lock().await;
-                                if w.write_all(&reply).await.is_err() {
+                                if write_locked(&writer, &reply).await.is_err() {
                                     break;
                                 }
                             } else {
@@ -2481,6 +2892,11 @@ where
             _ = outbound.kill.changed() => {
                 anyhow::bail!("replaced by a newer session");
             }
+            _ = write_fail_rx.changed() => {
+                if *write_fail_rx.borrow() {
+                    anyhow::bail!("control write failed");
+                }
+            }
             frame = outbound.rx.recv() => {
                 match frame {
                     Some(frame) => {
@@ -2492,8 +2908,7 @@ where
                         } else {
                             frame
                         };
-                        let mut w = writer.lock().await;
-                        if w.write_all(&frame).await.is_err() {
+                        if write_locked(&writer, &frame).await.is_err() {
                             break;
                         }
                     }
@@ -2502,8 +2917,7 @@ where
             }
             Some(frame) = outbound.bulk.recv(), if held_bulk.is_none() => {
                 if bulk_on_control {
-                    let mut w = writer.lock().await;
-                    if w.write_all(&frame).await.is_err() {
+                    if write_locked(&writer, &frame).await.is_err() {
                         break;
                     }
                 } else if bulk_on_data {
@@ -2521,8 +2935,7 @@ where
                     Err(frame) => {
                         if tokio::time::Instant::now() >= bulk_deadline {
                             bulk_on_control = true;
-                            let mut w = writer.lock().await;
-                            if w.write_all(&frame).await.is_err() {
+                            if write_locked(&writer, &frame).await.is_err() {
                                 break;
                             }
                         } else {
@@ -2531,7 +2944,7 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep_until(last_rx + idle_limit), if hb_enabled => {
+            _ = tokio::time::sleep_until(last_rx + idle_limit) => {
                 anyhow::bail!("no data from {peer} for {}s", idle_limit.as_secs());
             }
         }
@@ -2641,13 +3054,40 @@ fn random_nonce() -> [u8; 32] {
     buf
 }
 
+/// Floor for a stalled write. Grows with payload so a clipboard image
+/// on a slow link is not cut off; mouse and heartbeats stay at the floor.
+fn write_budget(len: usize) -> Duration {
+    Duration::from_millis(300 + len as u64 / 1024)
+}
+
 async fn write_locked<W>(writer: &Mutex<W>, frame: &[u8]) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut w = writer.lock().await;
-    w.write_all(frame).await?;
-    w.flush().await?;
+    let budget = write_budget(frame.len());
+    tokio::time::timeout(budget, async {
+        w.write_all(frame).await?;
+        w.flush().await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("control write timed out"))??;
+    Ok(())
+}
+
+async fn write_timeout<S>(stream: &mut S, frame: &[u8]) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let budget = write_budget(frame.len());
+    tokio::time::timeout(budget, async {
+        stream.write_all(frame).await?;
+        stream.flush().await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("data write timed out"))??;
     Ok(())
 }
 
@@ -2712,7 +3152,7 @@ async fn clear_offer(status: &Arc<RwLock<AppStatus>>) {
 async fn home_hit(status: &Arc<RwLock<AppStatus>>, typed: &str) -> bool {
     let s = status.read().await;
     let hit = |shown: &str| shown.len() == 6 && code_matches(typed, shown);
-    hit(&s.home_code) || hit(&s.home_code_prev)
+    hit(&s.home_code) || hit(&s.home_code_prev) || hit(&s.home_code_inflight)
 }
 
 /// Keep the socket moving while the user clicks confirm.
@@ -2735,8 +3175,7 @@ where
             biased;
             picked = &mut choice => return Ok(picked),
             _ = waiting.tick() => {
-                let mut w = writer.lock().await;
-                w.write_all(&encode_frame(MsgType::Heartbeat, &[], 0)).await?;
+                write_locked(writer, &encode_frame(MsgType::Heartbeat, &[], 0)).await?;
             }
             read = reader.read(&mut discard) => {
                 let n = read?;
@@ -2833,6 +3272,7 @@ where
             code: String::new(),
         };
         write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
+        set_peer_note(app_status, "配对码不对").await;
         anyhow::bail!("no_pair_code");
     } else if offer.len() == 6 {
         // We also typed a code (rare both-sides case): accept with our offer.
@@ -2852,17 +3292,23 @@ where
             code: String::new(),
         };
         write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &deny)?).await?;
+        set_peer_note(app_status, "配对码不对").await;
         anyhow::bail!("no_pair_code");
     };
     write_locked(writer, &encode_json_frame(MsgType::PairConfirm, &confirm)?).await?;
     if !confirm.accepted {
+        if typed_ours {
+            set_peer_note(app_status, "已取消这次配对").await;
+        } else {
+            set_peer_note(app_status, "配对码不对").await;
+        }
         anyhow::bail!("pairing cancelled");
     }
     let answer = read_typed(reader, buf, Duration::from_secs(120), MsgType::PairResult).await?;
     let result: csc_proto::PairResultPayload = serde_json::from_slice(&answer.payload)?;
     if result.status != "ok" {
         clear_offer(app_status).await;
-        app_status.write().await.peer_note = "对方没有确认这次配对".into();
+        set_peer_note(app_status, "对方没有确认这次配对").await;
         anyhow::bail!("pairing rejected");
     }
     clear_offer(app_status).await;
@@ -2876,6 +3322,15 @@ where
 async fn burn_home_code(status: &Arc<RwLock<AppStatus>>) {
     crate::burn_home_code(&mut *status.write().await);
     info!("pairing code used once; a new one is shown");
+}
+
+async fn begin_pair_attempt(status: &Arc<RwLock<AppStatus>>) {
+    crate::begin_pair_attempt(&mut *status.write().await);
+}
+
+async fn finish_pair_attempt(status: &Arc<RwLock<AppStatus>>) {
+    crate::finish_pair_attempt(&mut *status.write().await);
+    info!("pairing attempt finished; home code rotated if this computer was targeted");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2990,20 +3445,30 @@ where
                         || home_hit(app_status, &ask.code).await;
                     let confirmed_ours =
                         !offer.is_empty() && (ok.code.is_empty() || code_matches(&ok.code, &offer));
-                    let accept = if typed_ours {
+                    if typed_ours {
+                        begin_pair_attempt(app_status).await;
+                    }
+                    let choice_result = if typed_ours {
                         let who = if ask.name.is_empty() {
                             peer_label.to_string()
                         } else {
                             ask.name.clone()
                         };
-                        let choice = wait_choice(
+                        wait_choice(
                             reader,
                             writer,
                             buf,
                             prompt.ask(app_status, &who, &who, peer_label, true),
                         )
-                        .await?;
-                        matches!(choice, Choice::Trust { .. })
+                        .await
+                    } else {
+                        Ok(Choice::Reject)
+                    };
+                    let accept = if typed_ours {
+                        match &choice_result {
+                            Ok(choice) => matches!(choice, Choice::Trust { .. }),
+                            Err(_) => false,
+                        }
                     } else {
                         confirmed_ours
                     };
@@ -3022,11 +3487,16 @@ where
                             clear_offer(app_status).await;
                             app_status.write().await.peer_note = "配对码不对".into();
                         }
+                        if typed_ours {
+                            finish_pair_attempt(app_status).await;
+                        }
+                        choice_result?;
                         anyhow::bail!("pairing rejected");
                     }
                     clear_offer(app_status).await;
                     if typed_ours {
                         burn_home_code(app_status).await;
+                        finish_pair_attempt(app_status).await;
                     }
                     last = tokio::time::Instant::now();
                     continue;
@@ -3586,6 +4056,7 @@ async fn spawn_data_listener(identity: &Arc<crate::tls::Identity>, addr: SocketA
                     let Ok((tcp, from)) = listener.accept().await else {
                         break;
                     };
+                    prepare_tcp(&tcp);
                     let identity = identity.clone();
                     tokio::spawn(async move {
                         if let Err(e) = take_data(&identity, tcp, port).await {
@@ -3612,7 +4083,7 @@ async fn dial_data(
         data_port: addr.port(),
     };
     let frame = encode_json_frame(MsgType::DataAttach, &attach)?;
-    stream.write_all(&frame).await?;
+    write_timeout(&mut stream, &frame).await?;
     serve_data(stream, fingerprint, BytesMut::new()).await
 }
 
@@ -3637,7 +4108,7 @@ where
         tokio::select! {
             outgoing = rx.recv() => {
                 match outgoing {
-                    Some(frame) => stream.write_all(&frame).await?,
+                    Some(frame) => write_timeout(&mut stream, &frame).await?,
                     None => break,
                 }
             }
@@ -3816,14 +4287,14 @@ mod tests {
         let mut r = Redial::default();
         let t0 = Instant::now();
         assert!(r.due("B", t0));
-        assert!(!r.due("b", t0 + Duration::from_secs(1)));
-        assert!(r.due("B", t0 + Duration::from_secs(2)));
-        // Next wait is 4 s, then 8 s, then capped at 10 s.
-        assert!(!r.due("B", t0 + Duration::from_secs(5)));
-        assert!(r.due("B", t0 + Duration::from_secs(6)));
-        assert!(r.due("B", t0 + Duration::from_secs(14)));
-        assert!(!r.due("B", t0 + Duration::from_secs(23)));
-        assert!(r.due("B", t0 + Duration::from_secs(24)));
+        assert!(!r.due("b", t0 + Duration::from_millis(499)));
+        assert!(r.due("B", t0 + Duration::from_millis(500)));
+        // Next wait is 1 s, then 2 s, 4 s, 8 s, then capped at 10 s.
+        assert!(!r.due("B", t0 + Duration::from_millis(1499)));
+        assert!(r.due("B", t0 + Duration::from_millis(1500)));
+        assert!(r.due("B", t0 + Duration::from_millis(3500)));
+        assert!(!r.due("B", t0 + Duration::from_millis(7499)));
+        assert!(r.due("B", t0 + Duration::from_millis(7500)));
         r.reset("B");
         assert!(r.due("B", t0 + Duration::from_secs(25)));
     }
@@ -3834,6 +4305,18 @@ mod tests {
         let n = count_udp_failure(n, false).unwrap();
         assert_eq!(count_udp_failure(n, true).unwrap(), 0);
         assert!(count_udp_failure(n, false).is_err());
+    }
+
+    #[test]
+    fn redial_address_ignores_missing_advertised_port() {
+        let ip: std::net::IpAddr = "10.10.10.10".parse().unwrap();
+        assert_eq!(peer_control_addr(ip, 0, 45277).port(), 45277);
+        assert_eq!(peer_control_addr(ip, 45277, 1).port(), 45277);
+        // Callers must not pass an inbound ephemeral port as `advertised`.
+        assert_eq!(
+            peer_control_addr(ip, 0, 45277),
+            "10.10.10.10:45277".parse().unwrap()
+        );
     }
 
     #[test]

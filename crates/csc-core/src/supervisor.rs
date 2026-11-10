@@ -4,9 +4,9 @@
 
 use std::time::{Duration, Instant};
 
-const FIRST_RETRY: Duration = Duration::from_secs(10);
-const RETRY_STEP: Duration = Duration::from_secs(10);
-const MAX_RETRY: Duration = Duration::from_secs(30);
+const FIRST_RETRY: Duration = Duration::from_millis(500);
+const RETRY_STEP: Duration = Duration::from_millis(500);
+const MAX_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct Supervisor {
@@ -123,14 +123,14 @@ mod tests {
         );
         assert!(s.on_link(true, t).is_none());
         assert!(s.on_link(false, t).is_none());
-        assert!(s.on_link(false, t + Duration::from_secs(9)).is_none());
-        assert!(s.on_link(false, t + Duration::from_secs(10)).is_some());
-        assert!(s.on_link(false, t + Duration::from_secs(29)).is_none());
-        assert!(s.on_link(false, t + Duration::from_secs(30)).is_some());
-        assert!(s.on_link(false, t + Duration::from_secs(60)).is_some());
-        assert!(s.on_link(false, t + Duration::from_secs(89)).is_none());
-        assert!(s.on_link(true, t + Duration::from_secs(90)).is_none());
-        assert!(s.on_link(false, t + Duration::from_secs(91)).is_none());
-        assert!(s.on_link(false, t + Duration::from_secs(101)).is_some());
+        assert!(s.on_link(false, t + Duration::from_millis(499)).is_none());
+        assert!(s.on_link(false, t + Duration::from_millis(500)).is_some());
+        assert!(s.on_link(false, t + Duration::from_millis(1499)).is_none());
+        assert!(s.on_link(false, t + Duration::from_millis(1500)).is_some());
+        assert!(s.on_link(false, t + Duration::from_millis(2999)).is_none());
+        assert!(s.on_link(false, t + Duration::from_millis(3000)).is_some());
+        assert!(s.on_link(true, t + Duration::from_millis(3001)).is_none());
+        assert!(s.on_link(false, t + Duration::from_millis(3002)).is_none());
+        assert!(s.on_link(false, t + Duration::from_millis(3502)).is_some());
     }
 }

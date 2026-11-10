@@ -44,8 +44,8 @@ pub fn draw_home(app: &mut App, ui: &mut egui::Ui) {
         list.row(
             tr("本机配对码", "Pairing code"),
             tr(
-                "后三位是本机 IP 尾号；配对成功一次后自动更换。",
-                "Last three digits are this PC’s IP host; peers dial directly.",
+                "后三位是本机 IP 尾号；对方每次尝试连接后都会更换（不论成败）。",
+                "Last three digits are this PC’s IP host; a new code is issued after each attempt.",
             ),
             |ui| {
                 let code = app
@@ -109,7 +109,11 @@ pub fn draw_home(app: &mut App, ui: &mut egui::Ui) {
         });
     }
 
-    section_heading(ui, &p, tr("已信任设备", "Trusted devices"));
+    if is_server {
+        section_heading(ui, &p, tr("已连接设备", "Connected devices"));
+    } else {
+        section_heading(ui, &p, tr("已信任设备", "Trusted devices"));
+    }
     settings_card_body(ui, &p, |ui| {
         draw_device_table(app, ui, &p);
     });
@@ -226,9 +230,19 @@ fn draw_nic_combo(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 }
 
 fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
-    let peers = app.cfg.trusted_peers.clone();
+    let is_server = matches!(app.cfg.role, csc_config::Role::Server);
+    let peers = if is_server {
+        connected_peer_names(app)
+    } else {
+        app.cfg.trusted_peers.clone()
+    };
     if peers.is_empty() {
-        widgets::hint(ui, p, tr("还没有信任的电脑。", "No trusted computers yet."));
+        let hint = if is_server {
+            tr("还没有已连接的电脑。", "No computers connected yet.")
+        } else {
+            tr("还没有信任的电脑。", "No trusted computers yet.")
+        };
+        widgets::hint(ui, p, hint);
         return;
     }
 
@@ -240,7 +254,6 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         col_label(ui, c.name, tr("设备名", "Name"), p.text_2, false);
         col_label(ui, c.ip, tr("IP 地址", "IP"), p.text_2, false);
         col_label(ui, c.status, tr("状态", "Status"), p.text_2, false);
-        col_label(ui, c.latency, tr("延迟", "Latency"), p.text_2, false);
         col_label(ui, c.pointer, tr("指针灵敏度", "Pointer"), p.text_2, false);
         col_label(ui, c.action, tr("操作", "Action"), p.text_2, false);
     });
@@ -254,10 +267,10 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     for name in peers {
         let ip = peer_ip(app, &name);
         let online = peer_online(app, &name);
-        let latency = peer_latency_label(app, &name, online);
         let mut forget = false;
+        let mut disconnect = false;
         device_row(ui, ROW_H, GAP, &cols, |ui, c| {
-            col_label(ui, c.name, &name, Color32::WHITE, true);
+            col_label(ui, c.name, &name, p.text, true);
             col_label(ui, c.ip, &ip, p.text_2, false);
             let (text, color) = if online {
                 (tr("在线", "Online"), p.ok)
@@ -265,7 +278,6 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                 (tr("离线", "Offline"), p.text_2)
             };
             col_label(ui, c.status, text, color, false);
-            col_label(ui, c.latency, &latency, p.text_2, false);
 
             ui.allocate_ui_with_layout(
                 egui::vec2(c.pointer, ROW_H),
@@ -293,12 +305,26 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                 |ui| {
                     ui.set_min_size(egui::vec2(c.action, ROW_H));
                     ui.set_max_width(c.action);
-                    if widgets::danger_text_button(ui, p, tr("移除", "Remove")).clicked() {
+                    if is_server {
+                        if widgets::danger_text_button(ui, p, tr("断开", "Disconnect")).clicked()
+                        {
+                            disconnect = true;
+                        }
+                    } else if widgets::danger_text_button(ui, p, tr("移除", "Remove")).clicked() {
                         forget = true;
                     }
                 },
             );
         });
+        if disconnect {
+            match crate::ipc_client::disconnect_peer(&name) {
+                Ok(_) => {
+                    app.reload_status();
+                    app.set_ok(format!("{} {name}", tr("已断开", "Disconnected")));
+                }
+                Err(e) => app.set_err(e.to_string()),
+            }
+        }
         if forget {
             match crate::ipc_client::forget_peer(&name) {
                 Ok(_) => {
@@ -312,12 +338,12 @@ fn draw_device_table(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     }
 }
 
-const SPEED_MIN: f32 = 0.6;
-const SPEED_MAX: f32 = 2.0;
+const SPEED_MIN: f32 = csc_config::POINTER_SPEED_MIN;
+const SPEED_MAX: f32 = csc_config::POINTER_SPEED_MAX;
 const SPEED_STEP: f32 = 0.2;
 const SPEED_FIELD_W: f32 = 64.0;
 
-/// Slider (0.6–2.0 in steps of 0.2) plus a field for typing an exact value.
+/// Slider (0.4–4.0 in steps of 0.2) plus a field for typing an exact value.
 fn speed_control(ui: &mut egui::Ui, p: &Palette, w: f32, h: f32, speed: &mut f32) -> bool {
     let gap = 8.0;
     let slider_w = (w - SPEED_FIELD_W - gap).max(48.0);
@@ -326,7 +352,7 @@ fn speed_control(ui: &mut egui::Ui, p: &Palette, w: f32, h: f32, speed: &mut f32
     let visuals = &mut ui.visuals_mut().widgets;
     visuals.inactive.bg_fill = p.border_strong;
     visuals.inactive.fg_stroke.color = p.text;
-    visuals.hovered.fg_stroke.color = Color32::WHITE;
+    visuals.hovered.fg_stroke.color = p.text;
     ui.visuals_mut().selection.bg_fill = p.accent;
     let mut changed = ui
         .add(
@@ -352,21 +378,19 @@ struct DeviceCols {
     name: f32,
     ip: f32,
     status: f32,
-    latency: f32,
     pointer: f32,
     action: f32,
 }
 
 fn device_col_widths(total: f32) -> DeviceCols {
-    let action = 72.0;
-    let gaps = 12.0 * 5.0;
+    let action = 96.0;
+    let gaps = 12.0 * 4.0;
     let rest = (total - action - gaps).max(320.0);
     DeviceCols {
-        name: rest * 0.26,
-        ip: rest * 0.20,
-        status: rest * 0.12,
-        latency: rest * 0.12,
-        pointer: rest * 0.30,
+        name: rest * 0.30,
+        ip: rest * 0.22,
+        status: rest * 0.14,
+        pointer: rest * 0.34,
         action,
     }
 }
@@ -436,42 +460,29 @@ fn peer_ip(app: &App, name: &str) -> String {
 }
 
 fn peer_online(app: &App, name: &str) -> bool {
+    connected_peer_names(app)
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+fn connected_peer_names(app: &App) -> Vec<String> {
     let connected = app
         .status
         .get("connected")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !connected {
-        return false;
+        return Vec::new();
     }
-    let peer_name = app
-        .status
+    app.status
         .get("peerName")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    peer_name
+        .unwrap_or("")
         .split(',')
         .map(str::trim)
-        .any(|n| n.eq_ignore_ascii_case(name))
-}
-
-fn peer_latency_label(app: &App, name: &str, online: bool) -> String {
-    if !online {
-        return "—".into();
-    }
-    let Some(map) = app.status.get("peerLatencyMs").and_then(|v| v.as_object()) else {
-        return "…".into();
-    };
-    let ip = peer_ip(app, name);
-    for (k, v) in map {
-        let hit = k.eq_ignore_ascii_case(name) || (!ip.is_empty() && ip != "—" && k == &ip);
-        if hit {
-            if let Some(ms) = v.as_u64() {
-                return format!("{ms} ms");
-            }
-        }
-    }
-    "…".into()
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn try_send_pair_code(app: &mut App) {
@@ -613,6 +624,7 @@ fn draw_desk(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         .screens
         .iter()
         .filter(|s| !s.name.eq_ignore_ascii_case(&host))
+        .filter(|s| peer_online(app, &s.name))
         .filter(|s| {
             dragging
                 .as_ref()
@@ -662,7 +674,12 @@ fn draw_desk(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                     .cfg
                     .screens
                     .iter()
-                    .find(|s| s.x == sx && s.y == sy && !s.name.eq_ignore_ascii_case(&host))
+                    .find(|s| {
+                        s.x == sx
+                            && s.y == sy
+                            && !s.name.eq_ignore_ascii_case(&host)
+                            && peer_online(app, &s.name)
+                    })
                     .cloned()
                 {
                     let cell = cell_rect(rect, sx, sy);

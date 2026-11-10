@@ -1,9 +1,10 @@
-//! Application-center visual tokens — dark theme（对齐 Doc/界面设计.md §4 深色）。
+//! Application-center visual tokens. Dark is the default; light can be chosen in settings.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
     Style, TextStyle, Visuals,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -26,11 +27,27 @@ pub struct Palette {
     pub warn: Color32,
     pub danger: Color32,
     pub on_accent: Color32,
+    pub dark: bool,
+    pub faint: Color32,
+    pub hover_well: Color32,
 }
 
 impl Palette {
-    /// Cursor-style settings: near-black canvas, raised cards, blue accent.
+    /// The palette for the theme currently applied to the window.
     pub fn app() -> Self {
+        current()
+    }
+
+    pub fn named(name: &str) -> Self {
+        if name.eq_ignore_ascii_case("light") {
+            Self::light()
+        } else {
+            Self::dark()
+        }
+    }
+
+    /// Cursor-style settings: near-black canvas, raised cards, blue accent.
+    pub fn dark() -> Self {
         Self {
             bg: Color32::from_rgb(0x14, 0x14, 0x14),
             sidebar: Color32::from_rgb(0x1a, 0x1a, 0x1a),
@@ -50,13 +67,70 @@ impl Palette {
             warn: Color32::from_rgb(0xe0, 0xa2, 0x3b),
             danger: Color32::from_rgb(0xf0, 0x6a, 0x5d),
             on_accent: Color32::WHITE,
+            dark: true,
+            faint: Color32::from_rgb(0x28, 0x28, 0x28),
+            hover_well: Color32::from_rgb(0x1c, 0x1c, 0x1c),
         }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            bg: Color32::from_rgb(0xf5, 0xf6, 0xf8),
+            sidebar: Color32::from_rgb(0xee, 0xef, 0xf2),
+            card: Color32::from_rgb(0xff, 0xff, 0xff),
+            card_hover: Color32::from_rgb(0xf0, 0xf2, 0xf5),
+            input: Color32::from_rgb(0xee, 0xf0, 0xf3),
+            text: Color32::from_rgb(0x1f, 0x23, 0x29),
+            text_2: Color32::from_rgb(0x5c, 0x63, 0x70),
+            border: Color32::from_rgb(0xdd, 0xe1, 0xe6),
+            border_strong: Color32::from_rgb(0xc5, 0xca, 0xd1),
+            accent: Color32::from_rgb(0x3b, 0x82, 0xf6),
+            accent_hover: Color32::from_rgb(0x25, 0x6e, 0xeb),
+            accent_soft: Color32::from_rgba_unmultiplied(0x3b, 0x82, 0xf6, 48),
+            ok: Color32::from_rgb(0x1f, 0x9d, 0x55),
+            ok_soft: Color32::from_rgba_unmultiplied(0x1f, 0x9d, 0x55, 40),
+            warn: Color32::from_rgb(0xb7, 0x79, 0x1f),
+            danger: Color32::from_rgb(0xd2, 0x3f, 0x31),
+            on_accent: Color32::WHITE,
+            dark: false,
+            faint: Color32::from_rgb(0xe8, 0xea, 0xed),
+            hover_well: Color32::from_rgb(0xe4, 0xe6, 0xea),
+        }
+    }
+}
+
+static DARK: AtomicBool = AtomicBool::new(true);
+
+pub fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+pub fn current() -> Palette {
+    if is_dark() {
+        Palette::dark()
+    } else {
+        Palette::light()
     }
 }
 
 pub fn install(ctx: &egui::Context) {
     install_cjk_font(ctx);
-    apply_style(ctx, Palette::app());
+    apply(ctx, "dark");
+}
+
+/// Apply `dark` or `light`. Unknown values fall back to dark.
+pub fn apply(ctx: &egui::Context, name: &str) {
+    let p = Palette::named(name);
+    DARK.store(p.dark, Ordering::Relaxed);
+    apply_style(ctx, p);
+    csc_platform::set_popup_menu_dark(p.dark);
+}
+
+/// Re-apply only when the saved theme does not match the window.
+pub fn sync(ctx: &egui::Context, name: &str) {
+    if Palette::named(name).dark != is_dark() {
+        apply(ctx, name);
+    }
 }
 
 pub fn apply_style(ctx: &egui::Context, p: Palette) {
@@ -78,14 +152,18 @@ pub fn apply_style(ctx: &egui::Context, p: Palette) {
     ]
     .into();
 
-    let mut v = Visuals::dark();
-    v.dark_mode = true;
+    let mut v = if p.dark {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
+    v.dark_mode = p.dark;
     v.override_text_color = Some(p.text);
     v.panel_fill = p.bg;
     v.window_fill = p.card;
     v.extreme_bg_color = p.input;
     v.text_edit_bg_color = Some(p.input);
-    v.faint_bg_color = Color32::from_rgb(0x28, 0x28, 0x28);
+    v.faint_bg_color = p.faint;
     v.code_bg_color = p.input;
     v.hyperlink_color = p.accent;
     v.warn_fg_color = p.warn;
@@ -106,7 +184,7 @@ pub fn apply_style(ctx: &egui::Context, p: Palette) {
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.inactive.corner_radius = field_r;
     v.widgets.hovered.bg_fill = p.input;
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x1c, 0x1c, 0x1c);
+    v.widgets.hovered.weak_bg_fill = p.hover_well;
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
     v.widgets.hovered.corner_radius = field_r;
@@ -125,7 +203,11 @@ pub fn apply_style(ctx: &egui::Context, p: Palette) {
     v.button_frame = true;
 
     style.visuals = v;
-    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_theme(if p.dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     ctx.set_style_of(egui::Theme::Light, style);
 }

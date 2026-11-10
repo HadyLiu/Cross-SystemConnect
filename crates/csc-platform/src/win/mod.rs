@@ -1,4 +1,5 @@
 mod capture;
+mod dark_mode;
 pub mod hook;
 mod host_net;
 mod injector;
@@ -7,6 +8,7 @@ pub mod power;
 pub mod screen;
 
 pub use capture::WinInputCapture;
+pub use dark_mode::set as set_popup_menu_dark;
 pub use host_net::fill_host_net;
 pub use host_net::ipv4_if_index;
 pub use injector::WinInputInjector;

@@ -217,6 +217,10 @@ impl Default for KeyboardConfig {
     }
 }
 
+/// Inclusive range for pointer speed (default 1.0, which matches this computer).
+pub const POINTER_SPEED_MIN: f32 = 0.4;
+pub const POINTER_SPEED_MAX: f32 = 4.0;
+
 fn default_pointer_speed() -> f32 {
     1.0
 }
@@ -348,7 +352,7 @@ pub struct GuiConfig {
     pub auto_hide: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
-    /// `auto`, `zh-CN`, or `en-US`.
+    /// `zh-CN` (default), `en-US`, or `auto`.
     #[serde(default = "default_language")]
     pub language: String,
     /// False only on a config this program just created.
@@ -360,7 +364,7 @@ pub struct GuiConfig {
 }
 
 fn default_language() -> String {
-    "auto".into()
+    "zh-CN".into()
 }
 
 fn default_theme() -> String {
@@ -1062,6 +1066,13 @@ impl Config {
             self.clipboard.push_mode = "immediate".into();
         }
         self.switch_cfg.edge_push_px = self.switch_cfg.edge_push_px.clamp(0, 200);
+        self.pointer.speed = self
+            .pointer
+            .speed
+            .clamp(POINTER_SPEED_MIN, POINTER_SPEED_MAX);
+        for speed in self.pointer.peers.values_mut() {
+            *speed = speed.clamp(POINTER_SPEED_MIN, POINTER_SPEED_MAX);
+        }
         self.retire_old_hotkeys();
     }
 

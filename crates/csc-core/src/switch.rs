@@ -91,6 +91,14 @@ pub struct SwitchController {
     raw_misses: u8,
     /// The active remote reports its own edge contact (EdgeHit).
     remote_reports: bool,
+    /// After coming back, this local edge cannot switch again until the
+    /// pointer is seen moving anywhere off the landing point. No timer: a
+    /// stale event carries no movement, a real push back does.
+    /// (edge, landing x, landing y, seam coordinate on the edge's axis)
+    reentry_guard: Option<(Edge, i32, i32, i32)>,
+    /// After entering a remote, that arrival edge is ignored until the
+    /// pointer is seen moving off the landing point.
+    arrival_guard: Option<(Edge, i32, i32, i32)>,
 }
 
 /// Raw motion that missed this many cursor movements in a row is not used
@@ -117,6 +125,8 @@ impl Default for SwitchController {
             last_local: None,
             raw_misses: RAW_MISS_LIMIT,
             remote_reports: false,
+            reentry_guard: None,
+            arrival_guard: None,
         }
     }
 }
@@ -481,34 +491,261 @@ impl SwitchController {
         self.box_point(edge, pct)
     }
 
+    /// How far inside `side` (Left/Right/Top/Bottom) the pointer must sit so
+    /// it is off the barrier and, when we know it, past a panel or taskbar.
+    /// Linux often has no work-area data, so a fraction of the monitor is the
+    /// fallback — enough to clear a typical 32 logical-pixel GNOME bar at 200%.
+    fn axis_inset(&self, m: &Rect, side: Edge) -> i32 {
+        let work = self.work_for(m);
+        let from_work = match side {
+            Edge::Left => (work.left - m.left).max(0),
+            Edge::Right => (m.right - work.right).max(0),
+            Edge::Top => (work.top - m.top).max(0),
+            Edge::Bottom => (m.bottom - work.bottom).max(0),
+            _ => 0,
+        };
+        let span = if matches!(side, Edge::Left | Edge::Right) {
+            (m.right - m.left).max(1)
+        } else {
+            (m.bottom - m.top).max(1)
+        };
+        const MIN: i32 = 32;
+        const EXTRA: i32 = 16;
+        from_work.max((span / 25).max(MIN)) + EXTRA
+    }
+
+    fn apply_edge_inset(m: &Rect, edge: Edge, inset: i32, x: &mut i32, y: &mut i32) {
+        match edge {
+            Edge::Left | Edge::TopLeft | Edge::BottomLeft => {
+                *x = (m.left + inset).min(m.right - 1);
+            }
+            Edge::Right | Edge::TopRight | Edge::BottomRight => {
+                *x = (m.right - 1 - inset).max(m.left);
+            }
+            _ => {}
+        }
+        match edge {
+            Edge::Top | Edge::TopLeft | Edge::TopRight => {
+                *y = (m.top + inset).min(m.bottom - 1);
+            }
+            Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => {
+                *y = (m.bottom - 1 - inset).max(m.top);
+            }
+            _ => {}
+        }
+    }
+
+    fn clamp_along_work(&self, m: &Rect, edge: Edge, x: &mut i32, y: &mut i32) {
+        let work = self.work_for(m);
+        if work.left >= work.right || work.top >= work.bottom {
+            return;
+        }
+        let wx0 = work.left;
+        let wx1 = (work.right - 1).max(wx0);
+        let wy0 = work.top;
+        let wy1 = (work.bottom - 1).max(wy0);
+        match edge {
+            Edge::Left | Edge::TopLeft | Edge::BottomLeft => {
+                *x = (*x).max(wx0);
+                *y = (*y).clamp(wy0, wy1);
+            }
+            Edge::Right | Edge::TopRight | Edge::BottomRight => {
+                *x = (*x).min(wx1);
+                *y = (*y).clamp(wy0, wy1);
+            }
+            Edge::Top => {
+                *y = (*y).max(wy0);
+                *x = (*x).clamp(wx0, wx1);
+            }
+            Edge::Bottom => {
+                *y = (*y).min(wy1);
+                *x = (*x).clamp(wx0, wx1);
+            }
+        }
+    }
+
+    fn inset_axes(&self, m: &Rect, edge: Edge, x: &mut i32, y: &mut i32) {
+        match edge {
+            Edge::Left | Edge::Right | Edge::Top | Edge::Bottom => {
+                Self::apply_edge_inset(m, edge, self.axis_inset(m, edge), x, y);
+            }
+            Edge::TopLeft => {
+                Self::apply_edge_inset(m, Edge::Left, self.axis_inset(m, Edge::Left), x, y);
+                Self::apply_edge_inset(m, Edge::Top, self.axis_inset(m, Edge::Top), x, y);
+            }
+            Edge::TopRight => {
+                Self::apply_edge_inset(m, Edge::Right, self.axis_inset(m, Edge::Right), x, y);
+                Self::apply_edge_inset(m, Edge::Top, self.axis_inset(m, Edge::Top), x, y);
+            }
+            Edge::BottomLeft => {
+                Self::apply_edge_inset(m, Edge::Left, self.axis_inset(m, Edge::Left), x, y);
+                Self::apply_edge_inset(m, Edge::Bottom, self.axis_inset(m, Edge::Bottom), x, y);
+            }
+            Edge::BottomRight => {
+                Self::apply_edge_inset(m, Edge::Right, self.axis_inset(m, Edge::Right), x, y);
+                Self::apply_edge_inset(m, Edge::Bottom, self.axis_inset(m, Edge::Bottom), x, y);
+            }
+        }
+        self.clamp_along_work(m, edge, x, y);
+    }
+
     /// Pointer back on the local side opposite `remote_edge`, inset so the
-    /// crossing itself does not immediately switch again. On Wayland HiDPI the
-    /// portal maps core pixels to logical ones; one pixel is still on the barrier.
+    /// crossing itself does not immediately switch again. Lands past a known
+    /// panel, not just a fixed 32 core pixels (too short on a 200% display).
     pub fn local_reentry(&self, remote_edge: Edge, pct: f32) -> (i32, i32) {
         let local = remote_edge.opposite();
         let (mut x, mut y) = self.place_on_edge(local, pct);
         let m = self.monitor_at(x, y);
-        // ~16 logical px at 200% scale; clearly inside the InputCapture barrier.
-        const INSET: i32 = 32;
-        match local {
-            Edge::Left | Edge::TopLeft | Edge::BottomLeft => {
-                x = (x + INSET).min(m.right - 1);
-            }
-            Edge::Right | Edge::TopRight | Edge::BottomRight => {
-                x = (x - INSET).max(m.left);
-            }
-            _ => {}
+        self.inset_axes(&m, local, &mut x, &mut y);
+        (x, y)
+    }
+
+    /// Nudge a barrier hit inward, past a panel if we know one.
+    pub fn nudge_inside(&self, x: i32, y: i32) -> (i32, i32) {
+        let m = self.monitor_at(x, y);
+        let mut x = x.clamp(m.left, m.right - 1);
+        let mut y = y.clamp(m.top, m.bottom - 1);
+        let left = self.axis_inset(&m, Edge::Left);
+        let right = self.axis_inset(&m, Edge::Right);
+        let top = self.axis_inset(&m, Edge::Top);
+        let bottom = self.axis_inset(&m, Edge::Bottom);
+        if y <= m.top + top {
+            y = (m.top + top).min(m.bottom - 1);
+        } else if y >= m.bottom - 1 - bottom {
+            y = (m.bottom - 1 - bottom).max(m.top);
         }
-        match local {
-            Edge::Top | Edge::TopLeft | Edge::TopRight => {
-                y = (y + INSET).min(m.bottom - 1);
-            }
-            Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => {
-                y = (y - INSET).max(m.top);
-            }
-            _ => {}
+        if x <= m.left + left {
+            x = (m.left + left).min(m.right - 1);
+        } else if x >= m.right - 1 - right {
+            x = (m.right - 1 - right).max(m.left);
         }
         (x, y)
+    }
+
+    /// Pull a controlled-side landing off the shared seam, past a taskbar when known.
+    pub fn inset_from_edge(&self, edge: Edge, x: &mut i32, y: &mut i32) {
+        let m = self.monitor_at(*x, *y);
+        *x = (*x).clamp(m.left, m.right - 1);
+        *y = (*y).clamp(m.top, m.bottom - 1);
+        self.inset_axes(&m, edge, x, y);
+    }
+
+    /// Host-only estimate: the peer is just a width and height, so pull off
+    /// the entry seam with the same fallback inset used when work areas are
+    /// unknown. The controlled computer still does its own, more precise inset.
+    pub fn inset_remote_estimate(&self, edge: Edge, x: &mut i32, y: &mut i32, remote: ScreenSize) {
+        let w = remote.width.max(1);
+        let h = remote.height.max(1);
+        *x = (*x).clamp(0, w - 1);
+        *y = (*y).clamp(0, h - 1);
+        let ix = (w / 25).max(32) + 16;
+        let iy = (h / 25).max(32) + 16;
+        match edge {
+            Edge::Left | Edge::TopLeft | Edge::BottomLeft => *x = ix.min(w - 1),
+            Edge::Right | Edge::TopRight | Edge::BottomRight => *x = (w - 1 - ix).max(0),
+            _ => {}
+        }
+        match edge {
+            Edge::Top | Edge::TopLeft | Edge::TopRight => *y = iy.min(h - 1),
+            Edge::Bottom | Edge::BottomLeft | Edge::BottomRight => *y = (h - 1 - iy).max(0),
+            _ => {}
+        }
+    }
+
+    /// Remember the remote edge we just landed on, so its EdgeHit cannot
+    /// bounce the pointer straight back.
+    pub fn arm_arrival_guard(&mut self, entry_edge: Edge, at: (i32, i32), remote: ScreenSize) {
+        let seam = Self::seam_of(
+            entry_edge,
+            Rect {
+                left: 0,
+                top: 0,
+                right: remote.width.max(1),
+                bottom: remote.height.max(1),
+            },
+        );
+        self.arrival_guard = Some((entry_edge, at.0, at.1, seam));
+    }
+
+    pub fn note_arrival_progress(&mut self, x: i32, y: i32) {
+        Self::note_guard_progress(&mut self.arrival_guard, x, y);
+    }
+
+    /// A compositor barrier only fires after the pointer travelled from the
+    /// inset landing to the edge, so that hit is a real push, never a bounce.
+    pub fn clear_reentry_guard(&mut self) {
+        self.reentry_guard = None;
+    }
+
+    /// Coordinate of `edge` on its own axis inside `m`. Corners have none.
+    fn seam_of(edge: Edge, m: Rect) -> i32 {
+        match edge {
+            Edge::Top => m.top,
+            Edge::Bottom => m.bottom - 1,
+            Edge::Left => m.left,
+            Edge::Right => m.right - 1,
+            _ => i32::MIN,
+        }
+    }
+
+    pub fn arrival_blocks(&self, edge: Edge) -> bool {
+        self.arrival_guard
+            .is_some_and(|(g, _, _, _)| Self::shares_side(g, edge))
+    }
+
+    /// Remember the local edge we just landed inside, so a bounce cannot
+    /// immediately recross it.
+    pub fn arm_reentry_guard(&mut self, local_edge: Edge, at: (i32, i32)) {
+        let seam = Self::seam_of(local_edge, self.monitor_at(at.0, at.1));
+        self.reentry_guard = Some((local_edge, at.0, at.1, seam));
+    }
+
+    fn sides_of(edge: Edge) -> (bool, bool, bool, bool) {
+        match edge {
+            Edge::Left => (true, false, false, false),
+            Edge::Right => (false, true, false, false),
+            Edge::Top => (false, false, true, false),
+            Edge::Bottom => (false, false, false, true),
+            Edge::TopLeft => (true, false, true, false),
+            Edge::TopRight => (false, true, true, false),
+            Edge::BottomLeft => (true, false, false, true),
+            Edge::BottomRight => (false, true, false, true),
+        }
+    }
+
+    fn shares_side(a: Edge, b: Edge) -> bool {
+        let (al, ar, at, ab) = Self::sides_of(a);
+        let (bl, br, bt, bb) = Self::sides_of(b);
+        (al && bl) || (ar && br) || (at && bt) || (ab && bb)
+    }
+
+    fn note_reentry_progress(&mut self, x: i32, y: i32) {
+        Self::note_guard_progress(&mut self.reentry_guard, x, y);
+    }
+
+    fn note_guard_progress(guard: &mut Option<(Edge, i32, i32, i32)>, x: i32, y: i32) {
+        let Some((guarded, lx, ly, seam)) = *guard else {
+            return;
+        };
+        // Still on the landing point: nothing has moved since the switch.
+        if (x - lx).abs() + (y - ly).abs() < 2 {
+            return;
+        }
+        // A jump straight onto the guarded seam with no travel in between is
+        // the bounce this guard is for; any other position is real movement.
+        let on_seam = match guarded {
+            Edge::Top | Edge::Bottom => (y - seam).abs() <= 1,
+            Edge::Left | Edge::Right => (x - seam).abs() <= 1,
+            _ => false,
+        };
+        if !on_seam {
+            *guard = None;
+        }
+    }
+
+    fn reentry_blocks(&self, edge: Edge) -> bool {
+        self.reentry_guard
+            .is_some_and(|(g, _, _, _)| Self::shares_side(g, edge))
     }
 
     /// Bounding-box point. Used when this computer has no monitor geometry.
@@ -624,6 +861,7 @@ impl SwitchController {
     }
 
     pub fn confirm_returned(&mut self) {
+        self.arrival_guard = None;
         self.unlock_to_local();
     }
 
@@ -727,6 +965,7 @@ impl SwitchController {
             .map(|(lx, ly)| (x - lx, y - ly))
             .unwrap_or((0, 0));
         self.last_local = Some((x, y));
+        self.note_reentry_progress(x, y);
         // Inside the taskbar, but not on an outer edge that leads somewhere.
         // That edge is how the pointer reaches the other computer.
         if self.on_shell_bar(x, y) && !self.shell_edge_leads(x, y) {
@@ -756,6 +995,9 @@ impl SwitchController {
         let neighbor = self.layout.neighbor(&self.local_name, edge)?.to_string();
         // The cursor is on the outer pixel. That pixel is the other computer.
         self.push.reset();
+        if self.reentry_blocks(edge) {
+            return None;
+        }
 
         if self.cfg.double_tap_edge {
             if self.pending_edge == Some(edge) && self.pending_second_tap {
@@ -822,6 +1064,7 @@ impl SwitchController {
         if self.remote_reports {
             *cursor_x = (*cursor_x).clamp(0, remote.width.max(1) - 1);
             *cursor_y = (*cursor_y).clamp(0, remote.height.max(1) - 1);
+            self.note_arrival_progress(*cursor_x, *cursor_y);
             return None;
         }
         let past_left = *cursor_x < 0;
@@ -888,6 +1131,7 @@ impl SwitchController {
         let Some(edge) = leave_edge else {
             *cursor_x = (*cursor_x).clamp(0, w - 1);
             *cursor_y = (*cursor_y).clamp(0, h - 1);
+            self.note_arrival_progress(*cursor_x, *cursor_y);
             return None;
         };
         let pct = match edge {
@@ -1582,5 +1826,162 @@ mod tests {
         );
         sw.confirm_entered(Edge::Left, 0.5, gapped, &mut x, &mut y, "");
         assert_eq!((x, y), (0, 150));
+    }
+
+    fn upper_layout() -> SwitchController {
+        let mut layout_map = csc_config::LayoutMap::new();
+        let mut local = BTreeMap::new();
+        local.insert("top".into(), "UPPER".into());
+        layout_map.insert("LOCAL".into(), local);
+        let mut upper = BTreeMap::new();
+        upper.insert("bottom".into(), "LOCAL".into());
+        layout_map.insert("UPPER".into(), upper);
+        let mut sw = SwitchController::default();
+        sw.configure(
+            "LOCAL".into(),
+            ScreenSize {
+                width: 3840,
+                height: 2160,
+            },
+            SwitchConfig::default(),
+            ScreenLayout::load(&layout_map),
+        );
+        sw.set_screen(
+            ScreenSize {
+                width: 3840,
+                height: 2160,
+            },
+            vec![Rect {
+                left: 0,
+                top: 0,
+                right: 3840,
+                bottom: 2160,
+            }],
+        );
+        sw
+    }
+
+    #[test]
+    fn reentry_clears_a_top_panel_when_work_area_is_known() {
+        let mut sw = upper_layout();
+        // 64 core px top panel (32 logical at 200% scale).
+        sw.set_work_areas(vec![Rect {
+            left: 0,
+            top: 64,
+            right: 3840,
+            bottom: 2160,
+        }]);
+        let (x, y) = sw.local_reentry(Edge::Bottom, 0.5);
+        assert!(y >= 64, "must land on or below the panel, got y={y}");
+        assert!(
+            y > 32,
+            "old 32px inset would still sit in the panel, got y={y}"
+        );
+        assert!((x as f32 - 1920.0).abs() < 8.0, "x={x}");
+    }
+
+    #[test]
+    fn reentry_uses_a_deeper_fallback_when_work_area_is_missing() {
+        let sw = upper_layout();
+        let (_, y) = sw.local_reentry(Edge::Bottom, 0.5);
+        // 2160/25=86, plus 16 extra, so well past a 32 logical-pixel bar at 200%.
+        assert!(y >= 64, "fallback inset too shallow: y={y}");
+        assert!(y < 2160 / 4, "should not jump deep into the screen, y={y}");
+    }
+
+    #[test]
+    fn remote_bottom_landing_clears_a_taskbar() {
+        let mut sw = upper_layout();
+        sw.set_work_areas(vec![Rect {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160 - 80,
+        }]);
+        let mut x = 1920;
+        let mut y = 2159;
+        sw.inset_from_edge(Edge::Bottom, &mut x, &mut y);
+        assert!(y <= 2160 - 80, "must land above the taskbar, y={y}");
+        assert!(y < 2159 - 16, "must leave the seam, y={y}");
+    }
+
+    #[test]
+    fn same_edge_is_blocked_until_the_pointer_moves_inward() {
+        let mut sw = upper_layout();
+        let at = sw.local_reentry(Edge::Bottom, 0.5);
+        let now = Instant::now();
+        sw.arm_reentry_guard(Edge::Top, at);
+        // Still on the landing point, or back on the top barrier.
+        assert!(sw.on_local_cursor(at.0, at.1, Some((0, -8)), now).is_none());
+        assert!(sw.on_local_cursor(at.0, 0, Some((0, -20)), now).is_none());
+        // Move inward past the slack, then the top edge may switch again.
+        let later = now + std::time::Duration::from_millis(50);
+        assert!(sw
+            .on_local_cursor(at.0, at.1 + 20, Some((0, 20)), later)
+            .is_none());
+        let hit = touch_edge(&mut sw, at.0, 0, (0, -1));
+        assert_eq!(hit.edge, Edge::Top);
+        assert_eq!(hit.neighbor, "UPPER");
+    }
+
+    #[test]
+    fn turning_straight_back_is_not_refused() {
+        let mut sw = upper_layout();
+        let at = sw.local_reentry(Edge::Bottom, 0.5);
+        let now = Instant::now();
+        sw.arm_reentry_guard(Edge::Top, at);
+        // No inward move and no wait: head straight back up through the top.
+        assert!(sw
+            .on_local_cursor(at.0, at.1 / 2, Some((0, -20)), now)
+            .is_none());
+        let hit = touch_edge(&mut sw, at.0, 0, (0, -1));
+        assert_eq!(hit.edge, Edge::Top);
+
+        let remote = ScreenSize {
+            width: 3360,
+            height: 1080,
+        };
+        let (mut x, mut y) = (1680, 1079);
+        sw.inset_remote_estimate(Edge::Bottom, &mut x, &mut y, remote);
+        sw.arm_arrival_guard(Edge::Bottom, (x, y), remote);
+        sw.note_arrival_progress(x, y + 10);
+        assert!(!sw.arrival_blocks(Edge::Bottom));
+    }
+
+    #[test]
+    fn host_remote_estimate_leaves_a_1080_bottom_seam() {
+        let mut x = (3360.0 * 0.35) as i32;
+        let mut y = 1079;
+        SwitchController::default().inset_remote_estimate(
+            Edge::Bottom,
+            &mut x,
+            &mut y,
+            ScreenSize {
+                width: 3360,
+                height: 1080,
+            },
+        );
+        assert!(y <= 1079 - 48, "must leave the bottom pixel, y={y}");
+        assert!(y >= 1080 / 2, "should not jump to the middle, y={y}");
+    }
+
+    #[test]
+    fn arrival_edge_is_blocked_until_the_pointer_moves_inward() {
+        let mut sw = upper_layout();
+        let remote = ScreenSize {
+            width: 3360,
+            height: 1080,
+        };
+        let mut x = 1680;
+        let mut y = 1079;
+        sw.inset_remote_estimate(Edge::Bottom, &mut x, &mut y, remote);
+        sw.arm_arrival_guard(Edge::Bottom, (x, y), remote);
+        assert!(sw.arrival_blocks(Edge::Bottom));
+        // Still on the landing point: the seam report must not bounce us.
+        sw.note_arrival_progress(x, y);
+        assert!(sw.arrival_blocks(Edge::Bottom));
+        // Move inward past the slack, then Bottom may leave.
+        sw.note_arrival_progress(x, y - 20);
+        assert!(!sw.arrival_blocks(Edge::Bottom));
     }
 }

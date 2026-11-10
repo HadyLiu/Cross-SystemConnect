@@ -28,6 +28,8 @@ pub struct AppState {
     pub board: crate::progress::TransferBoard,
     /// Tray asked to paste another computer's files into the fallback folder.
     pub paste_here: tokio::sync::mpsc::Sender<()>,
+    /// Live sessions; set after discovery starts.
+    pub net: RwLock<Option<crate::net::NetHub>>,
 }
 
 fn param_u64(params: &serde_json::Value, keys: &[&str]) -> Option<u64> {
@@ -343,6 +345,24 @@ async fn dispatch(state: &AppState, req: IpcRequest) -> IpcResponse {
                 Ok(()) => IpcResponse::ok(req.id, json!({"ok": true})),
                 Err(e) => IpcResponse::err(req.id, e),
             }
+        }
+        "disconnect_peer" => {
+            let host = req
+                .params
+                .get("hostName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if host.is_empty() {
+                return IpcResponse::err(req.id, "hostName is required");
+            }
+            let net = state.net.read().await.clone();
+            let Some(net) = net else {
+                return IpcResponse::err(req.id, "network is not ready");
+            };
+            let dropped = net.disconnect_peer(&host).await;
+            IpcResponse::ok(req.id, json!({"ok": true, "disconnected": dropped}))
         }
         "forget_peer" => {
             let host = req

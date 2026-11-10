@@ -287,6 +287,10 @@ pub fn forget_peer(host_name: &str) -> anyhow::Result<Value> {
     call("forget_peer", json!({"hostName": host_name}))
 }
 
+pub fn disconnect_peer(host_name: &str) -> anyhow::Result<Value> {
+    call("disconnect_peer", json!({"hostName": host_name}))
+}
+
 pub fn resolve_peer(host_name: &str, decision: &str, code: &str) -> anyhow::Result<Value> {
     call(
         "resolve_peer",

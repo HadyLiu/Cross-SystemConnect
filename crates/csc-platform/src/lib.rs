@@ -30,6 +30,17 @@ pub enum PowerEvent {
     SecureDesktop,
 }
 
+/// Paint Win32 tray and popup menus in the same dark or light style as the window.
+/// No-op on other platforms. Call when the theme is applied, before the tray is built.
+pub fn set_popup_menu_dark(dark: bool) {
+    #[cfg(windows)]
+    win::set_popup_menu_dark(dark);
+    #[cfg(not(windows))]
+    {
+        let _ = dark;
+    }
+}
+
 /// Ask the OS not to idle-sleep while connected computers are in use.
 pub fn set_keep_awake(on: bool) {
     #[cfg(all(unix, not(target_os = "macos")))]

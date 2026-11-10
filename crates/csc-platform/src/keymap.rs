@@ -122,7 +122,7 @@ pub fn modifier_bit(hid: u32) -> u32 {
     }
 }
 
-/// HID usage for a key name as written in a hotkey such as `Ctrl+Alt+/`.
+/// HID usage for a key name as written in a hotkey such as `Ctrl+Shift+/`.
 /// Modifiers map to their left-hand usage. Case does not matter.
 pub fn hid_from_name(name: &str) -> Option<u32> {
     let n = name.trim().to_ascii_lowercase();

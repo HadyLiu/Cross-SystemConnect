@@ -258,11 +258,7 @@ pub fn mac_toggle(ui: &mut egui::Ui, p: &Palette, on: &mut bool) -> egui::Respon
     if resp.clicked() {
         *on = !*on;
     }
-    let fill = if *on {
-        p.ok
-    } else {
-        Color32::from_rgb(0x4a, 0x4e, 0x56)
-    };
+    let fill = if *on { p.ok } else { p.border_strong };
     let radius = (rect.height() * 0.5) as u8;
     ui.painter()
         .rect_filled(rect, CornerRadius::same(radius), fill);
@@ -317,7 +313,7 @@ pub fn nav_item(
         egui::pos2(rect.left() + 22.0, rect.center().y),
         Vec2::splat(16.0),
     );
-    paint_nav_icon(ui.painter(), icon_rect, icon, icon_color);
+    paint_nav_icon(ui.painter(), icon_rect, icon, icon_color, p.sidebar);
     ui.painter().text(
         egui::pos2(rect.left() + 42.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -328,7 +324,13 @@ pub fn nav_item(
     resp
 }
 
-fn paint_nav_icon(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, color: Color32) {
+fn paint_nav_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: NavIcon,
+    color: Color32,
+    fill: Color32,
+) {
     let stroke = Stroke::new(1.4, color);
     let c = rect.center();
     match icon {
@@ -356,7 +358,7 @@ fn paint_nav_icon(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, colo
             let front =
                 egui::Rect::from_min_size(egui::pos2(c.x - 3.0, c.y - 4.0), Vec2::new(9.0, 11.0));
             painter.rect_stroke(back, 1.0, stroke, egui::StrokeKind::Outside);
-            painter.rect_filled(front, 1.0, Color32::from_rgb(0x24, 0x26, 0x2a));
+            painter.rect_filled(front, 1.0, fill);
             painter.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Outside);
         }
         NavIcon::Switch => {
@@ -634,7 +636,7 @@ pub fn mac_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
 }
 
 /// Shortcut field: click it, then press the combination. Esc cancels,
-/// Backspace / Delete clears. Written as `Ctrl+Alt+/`, the core's hotkey syntax.
+/// Backspace / Delete clears. Written as `Ctrl+Shift+/`, the core's hotkey syntax.
 pub fn hotkey_field(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
     let p = Palette::app();
     let en = crate::locale::is_english();
@@ -851,7 +853,7 @@ fn title_btn(ui: &mut egui::Ui, p: &Palette, size: Vec2, kind: TitleIcon) -> egu
     let stroke_color = if matches!(kind, TitleIcon::Close) && hover {
         Color32::WHITE
     } else {
-        Color32::from_rgb(0xc8, 0xcc, 0xd4)
+        p.text_2
     };
     let stroke = Stroke::new(1.2, stroke_color);
     let c = rect.center();

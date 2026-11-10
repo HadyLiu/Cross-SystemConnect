@@ -31,6 +31,7 @@ pub struct App {
     pub message_ok: bool,
     pub pair_digits: [String; 6],
     pub last_pair_sent: String,
+    last_peer_note: String,
     /// Peer being dragged on the topology desk: name + pointer grab offset.
     pub desk_drag: Option<(String, egui::Vec2)>,
     /// Free-drag center while moving a peer (desk-local coords).
@@ -74,6 +75,7 @@ impl App {
         let logo = crate::icon::load_logo_texture(&cc.egui_ctx, 128);
 
         let cfg = load_config();
+        crate::theme::apply(&cc.egui_ctx, &cfg.gui.theme);
         crate::locale::apply(&cfg.gui.language);
         let _ = crate::autostart::apply(cfg.gui.launch_at_login);
 
@@ -123,6 +125,7 @@ impl App {
             message_ok: true,
             pair_digits: std::array::from_fn(|_| String::new()),
             last_pair_sent: String::new(),
+            last_peer_note: String::new(),
             desk_drag: None,
             desk_drag_pos: None,
             log_text: String::new(),
@@ -204,12 +207,17 @@ impl App {
         if before != after || trust_ui_stale(&self.status, &self.cfg) {
             self.sync_trusted_from_core();
         }
+        self.apply_peer_note();
         if self
             .status
             .get("connected")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-            && (self.message.contains("正在连接") || self.message.contains("Connecting"))
+            && (self.message.contains("正在连接")
+                || self.message.contains("Connecting")
+                || self.message.contains("尝试连接")
+                || self.message.contains("trying to connect")
+                || self.message.contains("Incoming connection"))
         {
             if let Some(peer) = self
                 .status
@@ -219,6 +227,45 @@ impl App {
             {
                 self.set_ok(format!("{} {peer}", self.t("已连接", "Connected")));
             }
+        }
+    }
+
+    /// Show core `peerNote` progress and failures (both sides, zh/en).
+    fn apply_peer_note(&mut self) {
+        let note = self
+            .status
+            .get("peerNote")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if note == self.last_peer_note {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.last_peer_note, note.to_string());
+        if note.is_empty() {
+            return;
+        }
+        if self
+            .status
+            .get("connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let (ok, text) = translate_peer_note(note, |zh, en| self.t(zh, en).to_string());
+        let in_pair_flow = !self.last_pair_sent.is_empty()
+            || self.message.is_empty()
+            || message_is_pairing_status(&self.message)
+            || !prev.is_empty()
+            || self.status.get("pendingPeer").is_some();
+        if !in_pair_flow && !looks_like_pair_note(note) {
+            return;
+        }
+        if ok {
+            self.set_ok(text);
+        } else {
+            self.last_pair_sent.clear();
+            self.set_err(text);
         }
     }
 
@@ -405,6 +452,7 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::theme::sync(ctx, &self.cfg.gui.theme);
         self.drain_events(ctx);
 
         if self.last_status_at.elapsed() >= Duration::from_millis(500) {
@@ -584,6 +632,129 @@ fn build_tray(bus: EventBus) -> Option<TrayParts> {
         settings: item_settings,
         quit: item_quit,
     })
+}
+
+fn message_is_pairing_status(msg: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "正在连接",
+        "Connecting",
+        "尝试连接",
+        "Incoming connection",
+        "trying to connect",
+        "配对",
+        "pair",
+        "握手",
+        "Handshake",
+        "回拨",
+        "dial back",
+        "超时",
+        "timed out",
+        "Timeout",
+        "失败",
+        "failed",
+        "取消",
+        "cancel",
+        "拒绝",
+        "refus",
+        "Wrong pairing",
+        "不对",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
+fn looks_like_pair_note(note: &str) -> bool {
+    message_is_pairing_status(note)
+        || note.contains("正在切换为从机")
+        || note.contains("还没有信任本机")
+}
+
+fn translate_peer_note(note: &str, t: impl Fn(&str, &str) -> String) -> (bool, String) {
+    let fail = [
+        ("配对码不对", "Wrong pairing code"),
+        ("对方取消了这次配对", "The other computer cancelled pairing"),
+        ("已取消这次配对", "Pairing cancelled"),
+        (
+            "对方没有确认这次配对",
+            "The other computer did not confirm pairing",
+        ),
+        (
+            "连接超时，请重新输入配对码",
+            "Connection timed out. Enter the pairing code again.",
+        ),
+        (
+            "连接握手失败，请重新输入配对码",
+            "Handshake failed. Enter the pairing code again.",
+        ),
+        (
+            "连接失败，请重新输入配对码",
+            "Connection failed. Enter the pairing code again.",
+        ),
+        (
+            "对方拒绝了这次连接",
+            "The other computer refused this connection",
+        ),
+    ];
+    for (zh, en) in fail {
+        if note == zh {
+            return (false, t(zh, en));
+        }
+    }
+    if let Some(who) = note.strip_suffix(" 正在尝试连接，但握手失败") {
+        return (
+            false,
+            format!(
+                "{} {who}",
+                t("正在尝试连接，但握手失败：", "Incoming connection failed:")
+            ),
+        );
+    }
+    if note.contains("正在尝试连接，但握手失败") {
+        return (
+            false,
+            t("正在尝试连接，但握手失败", "Incoming connection failed"),
+        );
+    }
+    let ok = [
+        ("正在连接…", "Connecting…"),
+        (
+            "正在连接，等待对方回拨…",
+            "Connecting, waiting for the other computer to dial back…",
+        ),
+    ];
+    for (zh, en) in ok {
+        if note == zh {
+            return (true, t(zh, en));
+        }
+    }
+    if let Some(who) = note.strip_suffix(" 正在尝试连接…") {
+        return (
+            true,
+            format!("{} {who}", t("正在尝试连接：", "Incoming connection:")),
+        );
+    }
+    if let Some(who) = note.strip_suffix(" 正在切换为从机…") {
+        return (
+            true,
+            format!("{} {who}", t("正在切换为从机：", "Switching to client:")),
+        );
+    }
+    if note.contains("还没有信任本机") {
+        return (
+            false,
+            t(
+                note,
+                "This computer is not trusted yet. Enter the six-digit pairing code shown on the other computer.",
+            ),
+        );
+    }
+    let failed = message_is_pairing_status(note)
+        && (note.contains("失败")
+            || note.contains("超时")
+            || note.contains("不对")
+            || note.contains("取消")
+            || note.contains("拒绝")
+            || note.contains("没有确认"));
+    (!failed, note.to_string())
 }
 
 #[cfg(test)]

@@ -166,31 +166,6 @@ fn x11_pointer() -> Option<(i32, i32)> {
     Some((ax - ox, ay - oy))
 }
 
-/// Land on the edge that was just crossed.
-fn inset_from_edge(edge: csc_proto::Edge, x: &mut i32, y: &mut i32, m: &csc_platform::Rect) {
-    // Land inside the shared edge pixel so the controlled side does not
-    // immediately EdgeHit the seam and bounce the host back.
-    const N: i32 = 16;
-    match edge {
-        csc_proto::Edge::Left | csc_proto::Edge::TopLeft | csc_proto::Edge::BottomLeft => {
-            *x = (*x + N).min(m.right - 1);
-        }
-        csc_proto::Edge::Right | csc_proto::Edge::TopRight | csc_proto::Edge::BottomRight => {
-            *x = (*x - N).max(m.left);
-        }
-        _ => {}
-    }
-    match edge {
-        csc_proto::Edge::Top | csc_proto::Edge::TopLeft | csc_proto::Edge::TopRight => {
-            *y = (*y + N).min(m.bottom - 1);
-        }
-        csc_proto::Edge::Bottom | csc_proto::Edge::BottomLeft | csc_proto::Edge::BottomRight => {
-            *y = (*y - N).max(m.top);
-        }
-        _ => {}
-    }
-}
-
 /// Follow the compositor pointer only when it actually moved.
 fn follow_real_pointer(logical: (i32, i32), real: (i32, i32), real_moved: bool) -> (i32, i32) {
     if real_moved {
@@ -451,6 +426,8 @@ struct Core {
     enter_point: (i32, i32),
     /// Just inside the edge the pointer left through, for returns that cross no edge.
     home_point: (i32, i32),
+    /// Local edge that `home_point` sits inside of.
+    home_edge: Option<csc_proto::Edge>,
     held: HeldInput,
     /// Keys and buttons this computer injected for a remote host, released if that host goes away.
     injected: HeldInput,
@@ -482,12 +459,6 @@ struct Core {
     last_real: Option<(i32, i32)>,
     /// Wayland: last position sent to the virtual pointer. The X cursor is not that position.
     commanded: Option<(i32, i32)>,
-    /// Ignore edge-leave until this moment, so the crossing itself does not bounce back.
-    control_ready: Instant,
-    /// Host: ignore local barrier enters until then (after returning to this screen).
-    edge_enter_ready: Instant,
-    /// Host: ignore remote EdgeHit leaves until then (right after entering a peer).
-    edge_leave_ready: Instant,
     /// Last Wayland barrier sides applied (skip portal work when unchanged).
     /// `None` until the first apply, so all-false still starts the portal.
     last_capture_edges: Option<(bool, bool, bool, bool)>,
@@ -595,12 +566,20 @@ impl Core {
         self.remap = cfg.keyboard.remap.iter().map(|r| (r.from, r.to)).collect();
         self.sync_locks = cfg.keyboard.sync_locks;
         self.block_fullscreen = cfg.switch_cfg.block_when_fullscreen;
-        self.pointer_speed = cfg.pointer.speed.clamp(0.25, 4.0);
+        self.pointer_speed = cfg
+            .pointer
+            .speed
+            .clamp(csc_config::POINTER_SPEED_MIN, csc_config::POINTER_SPEED_MAX);
         self.pointer_peers = cfg
             .pointer
             .peers
             .iter()
-            .map(|(k, v)| (k.clone(), v.clamp(0.25, 4.0)))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.clamp(csc_config::POINTER_SPEED_MIN, csc_config::POINTER_SPEED_MAX),
+                )
+            })
             .collect();
         notice::set_language(&cfg.gui.language);
     }
@@ -797,7 +776,7 @@ impl Core {
             self.held = HeldInput::default();
             release_pointer(&mut self.grab, Some(self.home_point));
             self.grab_armed = false;
-            self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+            self.settle_local(self.home_point, self.home_edge);
             self.set_active_screen(None).await;
             self.refresh_capture_edges().await;
         }
@@ -1118,6 +1097,11 @@ impl Core {
     /// Bring input back to this computer from the active remote, crossing no edge.
     async fn return_home(&mut self, why: &str) {
         let current = self.switch.active_remote().to_string();
+        // Hand the pointer back before any network I/O. A stalled session
+        // must not keep this computer's cursor frozen.
+        self.switch.unlock_to_local();
+        release_pointer(&mut self.grab, Some(self.home_point));
+        self.grab_armed = false;
         self.held.release_all(&self.net).await;
         if let Some(want) = self.virtual_locks.take() {
             self.match_locks(want);
@@ -1130,11 +1114,8 @@ impl Core {
         self.net
             .send_to(&current, encode_switch_leave_bin(&leave_msg))
             .await;
-        self.switch.unlock_to_local();
-        release_pointer(&mut self.grab, Some(self.home_point));
-        self.grab_armed = false;
         // Barrier still covers the seam; ignore hits until the pointer settles inside.
-        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+        self.settle_local(self.home_point, self.home_edge);
         self.set_active_screen(None).await;
         info!("{why}: input back from {current}");
     }
@@ -1174,7 +1155,6 @@ impl Core {
     /// The pointer leaves the active remote through `leave.edge`: hop to the
     /// next computer, or come back here. True when input is back on this computer.
     async fn leave_remote(&mut self, leave: EnterDecision) -> bool {
-        self.held.release_all(&self.net).await;
         let local_name = self.local_name().await;
         let current = self.switch.active_remote().to_string();
         let next = self.switch.neighbor_from_active(leave.edge);
@@ -1187,6 +1167,7 @@ impl Core {
             locks: None,
         };
         if let Some(next) = hop.cloned() {
+            self.held.release_all(&self.net).await;
             self.net
                 .send_to(&current, encode_switch_leave_bin(&leave_msg))
                 .await;
@@ -1203,6 +1184,14 @@ impl Core {
                 &mut self.remote_y,
                 &next,
             );
+            self.switch.inset_remote_estimate(
+                enter.edge,
+                &mut self.remote_x,
+                &mut self.remote_y,
+                remote,
+            );
+            self.switch
+                .arm_arrival_guard(enter.edge, (self.remote_x, self.remote_y), remote);
             let reports = self.net.peer_caps(&next).await & CAP_EDGE_REPORT != 0;
             self.switch.set_remote_reports(reports);
             self.set_active_screen(Some(&next)).await;
@@ -1212,6 +1201,12 @@ impl Core {
             );
             false
         } else {
+            self.switch.confirm_returned();
+            let back = self.switch.local_reentry(leave.edge, leave.position_pct);
+            release_pointer(&mut self.grab, Some(back));
+            self.grab_armed = false;
+            self.home_point = back;
+            self.held.release_all(&self.net).await;
             if current.is_empty() {
                 self.net.send_raw(encode_switch_leave_bin(&leave_msg)).await;
             } else {
@@ -1219,11 +1214,7 @@ impl Core {
                     .send_to(&current, encode_switch_leave_bin(&leave_msg))
                     .await;
             }
-            self.switch.confirm_returned();
-            let back = self.switch.local_reentry(leave.edge, leave.position_pct);
-            release_pointer(&mut self.grab, Some(back));
-            self.grab_armed = false;
-            self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+            self.settle_local(back, Some(leave.edge.opposite()));
             self.set_active_screen(None).await;
             info!(
                 "switch return from {current} at {:?} {:.2}, cursor to {back:?}",
@@ -1264,41 +1255,33 @@ impl Core {
             self.home_point
         };
         csc_platform::capture_return_to(Some((ox + x, oy + y)));
-        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+        self.settle_local((x, y), local_edge.map(|(edge, _)| edge));
     }
 
     /// Release from a barrier hit when the edge decision is unknown: nudge inward.
     fn release_capture_from_hit(&mut self, ax: i32, ay: i32) {
         let (ox, oy) = csc_platform::virtual_origin();
-        let w = self.screen.width.max(1);
-        let h = self.screen.height.max(1);
-        const INSET: i32 = 32;
-        let mut x = (ax - ox).clamp(0, w - 1);
-        let mut y = (ay - oy).clamp(0, h - 1);
-        if y <= INSET {
-            y = INSET.min(h - 1);
-        } else if y >= h - 1 - INSET {
-            y = (h - 1 - INSET).max(0);
-        }
-        if x <= INSET {
-            x = INSET.min(w - 1);
-        } else if x >= w - 1 - INSET {
-            x = (w - 1 - INSET).max(0);
-        }
+        let (x, y) = self.switch.nudge_inside(ax - ox, ay - oy);
         csc_platform::capture_return_to(Some((ox + x, oy + y)));
-        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+        self.settle_local((x, y), self.home_edge);
+    }
+
+    /// Ignore the seam for a moment and require an inward move before recrossing.
+    fn settle_local(&mut self, at: (i32, i32), local_edge: Option<csc_proto::Edge>) {
+        let edge = local_edge.or(self.home_edge);
+        if let Some(edge) = edge {
+            self.home_edge = Some(edge);
+            self.switch.arm_reentry_guard(edge, at);
+        }
     }
 
     /// The local pointer, while it is on this computer.
     async fn local_step(&mut self) {
         let hit = csc_platform::capture_edge_hit();
         if let Some(at) = hit {
-            if Instant::now() < self.edge_enter_ready {
-                // Just came back: release at the inset home so the barrier cannot
-                // re-capture and trap the pointer sliding along the outer edge.
-                self.release_capture_inside(None);
-                return;
-            }
+            // We always release capture inset from the seam, so a barrier hit
+            // means the pointer really travelled back to the edge.
+            self.switch.clear_reentry_guard();
             match self.local_step_at(Some(at)).await {
                 LocalEdge::Entered => {}
                 LocalEdge::Missed { edge, pct } => {
@@ -1416,10 +1399,15 @@ impl Core {
             &mut self.remote_y,
             &dec.neighbor,
         );
+        self.switch
+            .inset_remote_estimate(entry, &mut self.remote_x, &mut self.remote_y, remote);
+        self.switch
+            .arm_arrival_guard(entry, (self.remote_x, self.remote_y), remote);
         let reports = self.net.peer_caps(&dec.neighbor).await & CAP_EDGE_REPORT != 0;
         self.switch.set_remote_reports(reports);
         self.enter_point = (x, y);
         self.home_point = self.switch.local_reentry(entry, dec.position_pct);
+        self.home_edge = Some(dec.edge);
         self.held = HeldInput::default();
         // Leave the cursor on the edge it just crossed. Warping it to the
         // monitor center is the stutter, and clipping that center traps the
@@ -1443,16 +1431,16 @@ impl Core {
             csc_platform::set_host_cursor_hidden(true);
         }
         self.grab_armed = false;
-        // Peer lands on the shared seam; ignore its EdgeHit until it moves in.
-        self.edge_leave_ready = Instant::now() + Duration::from_millis(400);
         self.set_active_screen(Some(&dec.neighbor)).await;
         self.flush_pending_clip(&dec.neighbor).await;
         self.last_local_activity = Instant::now();
         info!(
-            "switch enter -> {} at {:?} {:.2} from ({x},{y}), return at {:?}{}",
+            "switch enter -> {} at {:?} {:.2} from ({x},{y}), land at ({}, {}), return at {:?}{}",
             dec.neighbor,
             dec.edge,
             dec.position_pct,
+            self.remote_x,
+            self.remote_y,
             self.home_point,
             if reports {
                 "; remote reports its edges"
@@ -1864,9 +1852,6 @@ impl Core {
         let (ox, oy) = csc_platform::virtual_origin();
         let (at, moved, real) = if csc_platform::wayland_session() {
             self.commanded = Some((self.remote_x, self.remote_y));
-            if Instant::now() < self.control_ready {
-                return;
-            }
             (
                 (self.remote_x, self.remote_y),
                 // Prefer host delta for edge probing when clamp ate applied.
@@ -1896,12 +1881,16 @@ impl Core {
             let moved = if real_moved { real_delta } else { applied };
             (at, moved, real)
         };
+        self.switch.note_arrival_progress(at.0, at.1);
         let Some(report) = self
             .switch
             .probe_edge(&mut self.probe, at.0, at.1, (dx, dy), moved)
         else {
             return;
         };
+        if self.switch.arrival_blocks(report.edge) {
+            return;
+        }
         if self.last_edge_sent.elapsed() < Duration::from_millis(16) {
             return;
         }
@@ -1930,7 +1919,7 @@ impl Core {
         if !self.grab || !self.switch.active_remote().eq_ignore_ascii_case(peer) {
             return;
         }
-        if Instant::now() < self.edge_leave_ready {
+        if self.switch.arrival_blocks(hit.edge) {
             return;
         }
         let report = EdgeReport {
@@ -2200,7 +2189,11 @@ impl Core {
                         self.held = HeldInput::default();
                         release_pointer(&mut self.grab, Some(self.home_point));
                         self.grab_armed = false;
-                        self.edge_enter_ready = Instant::now() + Duration::from_millis(400);
+                        // Field writes only: `settle_local` would reborrow all of `self`
+                        // while `s` still holds `self.status`.
+                        if let Some(edge) = self.home_edge {
+                            self.switch.arm_reentry_guard(edge, self.home_point);
+                        }
                         s.active_screen = s.local_name.clone();
                     }
                     if !self.grab {
@@ -2307,11 +2300,14 @@ impl Core {
                 let m = self.switch.monitor_at(self.remote_x, self.remote_y);
                 self.remote_x = self.remote_x.clamp(m.left, m.right - 1);
                 self.remote_y = self.remote_y.clamp(m.top, m.bottom - 1);
-                inset_from_edge(p.edge, &mut self.remote_x, &mut self.remote_y, &m);
+                self.switch
+                    .inset_from_edge(p.edge, &mut self.remote_x, &mut self.remote_y);
                 self.probe.reset();
-                // Ignore the tail of the crossing move so the shared-edge land
-                // does not EdgeHit straight back to the host.
-                self.control_ready = Instant::now() + Duration::from_millis(300);
+                // Do not report the arrival edge until the pointer is seen
+                // moving off the landing point. No timer, so turning straight
+                // back is never refused.
+                self.switch
+                    .arm_arrival_guard(p.edge, (self.remote_x, self.remote_y), screen);
                 // Seed with the pointer before the jump. If the jump is ignored,
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
@@ -2558,6 +2554,8 @@ pub async fn run() -> anyhow::Result<()> {
         offer_code: String::new(),
         offer_until: 0,
         offer_gen: 0,
+        home_code_inflight: String::new(),
+        pair_attempts: 0,
         pairing_open_until: 0,
         peer_note: String::new(),
         host_state: "no_host".into(),
@@ -2591,6 +2589,7 @@ pub async fn run() -> anyhow::Result<()> {
         net_reload: net_reload.clone(),
         layout_reload: layout_reload.clone(),
         log,
+        net: RwLock::new(None),
     });
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEvent>(256);
@@ -2654,6 +2653,7 @@ pub async fn run() -> anyhow::Result<()> {
         transfer.clone(),
     )
     .await?;
+    *state.net.write().await = Some(net.clone());
 
     let (paste_tx, mut paste_rx) = mpsc::channel::<LocatedPaste>(4);
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
@@ -2700,6 +2700,7 @@ pub async fn run() -> anyhow::Result<()> {
         park_y: 0,
         enter_point: (0, 0),
         home_point: (screen.width / 2, screen.height / 2),
+        home_edge: None,
         held: HeldInput::default(),
         injected: HeldInput::default(),
         return_hotkey,
@@ -2738,9 +2739,6 @@ pub async fn run() -> anyhow::Result<()> {
         probe: EdgePush,
         last_real: None,
         commanded: None,
-        control_ready: Instant::now(),
-        edge_enter_ready: Instant::now(),
-        edge_leave_ready: Instant::now(),
         last_capture_edges: None,
         last_edge_sent: Instant::now() - Duration::from_secs(5),
         power_rx: csc_platform::spawn_power_watch(),
@@ -2842,6 +2840,30 @@ pub(crate) fn burn_home_code(s: &mut csc_proto::AppStatus) {
     s.pairing_open_until = 0;
 }
 
+/// Remember the current home code so an in-flight confirm can still match it.
+pub(crate) fn begin_pair_attempt(s: &mut csc_proto::AppStatus) {
+    if s.pair_attempts == 0 && s.home_code.len() == 6 {
+        s.home_code_inflight = s.home_code.clone();
+    }
+    s.pair_attempts = s.pair_attempts.saturating_add(1);
+}
+
+/// After the attempt ends (ok, reject, cancel, mismatch, timeout, handshake
+/// error), issue a new home code and drop the previous one so the next try
+/// must use the new digits.
+pub(crate) fn finish_pair_attempt(s: &mut csc_proto::AppStatus) {
+    s.pair_attempts = s.pair_attempts.saturating_sub(1);
+    if s.pair_attempts > 0 {
+        return;
+    }
+    let start = std::mem::take(&mut s.home_code_inflight);
+    if start.len() == 6 && s.home_code == start {
+        burn_home_code(s);
+    } else {
+        s.home_code_prev.clear();
+    }
+}
+
 /// Prefer `search_address`, else the first local IPv4 on status.
 pub(crate) fn home_code_ip(search: &str, local_ipv4: &[String]) -> String {
     if crate::discover::ipv4_octets(search).is_some() {
@@ -2901,6 +2923,45 @@ mod tests {
         assert_ne!(s.home_code, "582243");
         assert!(s.home_code.ends_with("243"));
         assert_eq!(s.home_code.len(), 6);
+        assert!(s.home_code_prev.is_empty());
+    }
+
+    #[test]
+    fn pair_attempt_keeps_start_code_then_rotates() {
+        let mut s = csc_proto::AppStatus {
+            home_code: "582243".into(),
+            home_code_prev: "111243".into(),
+            ..Default::default()
+        };
+        super::begin_pair_attempt(&mut s);
+        assert_eq!(s.home_code_inflight, "582243");
+        assert_eq!(s.pair_attempts, 1);
+        // A second overlapping attempt still honors the first code.
+        super::begin_pair_attempt(&mut s);
+        assert_eq!(s.home_code, "582243");
+        assert_eq!(s.pair_attempts, 2);
+        super::finish_pair_attempt(&mut s);
+        assert_eq!(s.home_code, "582243");
+        assert_eq!(s.pair_attempts, 1);
+        super::finish_pair_attempt(&mut s);
+        assert_ne!(s.home_code, "582243");
+        assert!(s.home_code.ends_with("243"));
+        assert!(s.home_code_prev.is_empty());
+        assert!(s.home_code_inflight.is_empty());
+        assert_eq!(s.pair_attempts, 0);
+    }
+
+    #[test]
+    fn finish_after_success_burn_does_not_rotate_twice() {
+        let mut s = csc_proto::AppStatus {
+            home_code: "582243".into(),
+            ..Default::default()
+        };
+        super::begin_pair_attempt(&mut s);
+        super::burn_home_code(&mut s);
+        let after_burn = s.home_code.clone();
+        super::finish_pair_attempt(&mut s);
+        assert_eq!(s.home_code, after_burn);
         assert!(s.home_code_prev.is_empty());
     }
 

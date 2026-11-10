@@ -235,55 +235,6 @@ pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
 
     settings_card(ui, &p, |list| {
         list.row(
-            tr("延迟 (ms)", "Delay (ms)"),
-            tr(
-                "指针贴边多久后切换。",
-                "How long the pointer stays on an edge before switching.",
-            ),
-            |ui| {
-                if mac_number(ui, &mut app.cfg.switch_cfg.edge_delay_ms, 0..=2000).changed() {
-                    app.queue_save();
-                }
-            },
-        );
-        list.row(
-            tr("对角切换区 (px)", "Diagonal zone (px)"),
-            tr(
-                "角落斜向切换的感应宽度。",
-                "Corner zone width for diagonal switches.",
-            ),
-            |ui| {
-                if mac_number(ui, &mut app.cfg.switch_cfg.diagonal_zone_px, 1..=400).changed() {
-                    app.queue_save();
-                }
-            },
-        );
-        list.row(
-            tr("二次撞边切换", "Double-tap edge"),
-            tr(
-                "需要连续两次顶到边缘才切换。",
-                "Require two edge hits before switching.",
-            ),
-            |ui| {
-                if mac_toggle(ui, &p, &mut app.cfg.switch_cfg.double_tap_edge).clicked() {
-                    app.queue_save();
-                }
-            },
-        );
-        list.row(
-            tr("二次窗口 (ms)", "Double-tap window (ms)"),
-            tr(
-                "两次撞边的有效间隔。",
-                "Valid interval between the two edge hits.",
-            ),
-            |ui| {
-                if mac_number(ui, &mut app.cfg.switch_cfg.double_tap_window_ms, 50..=2000).changed()
-                {
-                    app.queue_save();
-                }
-            },
-        );
-        list.row(
             tr("按住不切换", "Hold to block"),
             tr(
                 "按住修饰键时忽略边缘切换。",
@@ -352,7 +303,13 @@ pub fn draw_switch(app: &mut App, ui: &mut egui::Ui) {
                 "Default sensitivity for the remote pointer.",
             ),
             |ui| {
-                if mac_number(ui, &mut app.cfg.pointer.speed, 0.25..=4.0).changed() {
+                if mac_number(
+                    ui,
+                    &mut app.cfg.pointer.speed,
+                    csc_config::POINTER_SPEED_MIN..=csc_config::POINTER_SPEED_MAX,
+                )
+                .changed()
+                {
                     app.queue_save();
                 }
             },
@@ -499,11 +456,43 @@ pub fn draw_system(app: &mut App, ui: &mut egui::Ui) {
         );
     });
 
-    section_heading(ui, &p, tr("界面语言", "Language"));
+    section_heading(ui, &p, tr("外观与语言", "Appearance & language"));
     settings_card(ui, &p, |list| {
         list.row(
+            tr("主题", "Theme"),
+            tr(
+                "深色为默认，可随时改为浅色。",
+                "Dark is the default; switch to light anytime.",
+            ),
+            |ui| {
+                let current = match app.cfg.gui.theme.as_str() {
+                    "light" => tr("浅色", "Light"),
+                    _ => tr("深色", "Dark"),
+                };
+                egui::ComboBox::from_id_salt("theme")
+                    .selected_text(current)
+                    .width(field_width(ui))
+                    .show_ui(ui, |ui| {
+                        for (v, label) in
+                            [("dark", tr("深色", "Dark")), ("light", tr("浅色", "Light"))]
+                        {
+                            if ui
+                                .selectable_value(&mut app.cfg.gui.theme, v.to_string(), label)
+                                .changed()
+                            {
+                                crate::theme::apply(ui.ctx(), &app.cfg.gui.theme);
+                                app.queue_save();
+                            }
+                        }
+                    });
+            },
+        );
+        list.row(
             tr("语言", "Language"),
-            tr("更改后立即生效。", "Takes effect immediately."),
+            tr(
+                "默认为简体中文，更改后立即生效。",
+                "Defaults to Chinese; takes effect immediately.",
+            ),
             |ui| {
                 let current = match app.cfg.gui.language.as_str() {
                     "zh-CN" => "简体中文",
@@ -515,9 +504,9 @@ pub fn draw_system(app: &mut App, ui: &mut egui::Ui) {
                     .width(field_width(ui))
                     .show_ui(ui, |ui| {
                         for (v, label) in [
-                            ("auto", tr("跟随系统", "Follow system")),
                             ("zh-CN", "简体中文"),
                             ("en-US", "English"),
+                            ("auto", tr("跟随系统", "Follow system")),
                         ] {
                             if ui
                                 .selectable_value(&mut app.cfg.gui.language, v.to_string(), label)

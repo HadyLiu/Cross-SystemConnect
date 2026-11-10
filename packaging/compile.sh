@@ -22,10 +22,13 @@ cp -f target/x86_64-pc-windows-gnu/release/Cross-SystemConnect.exe \
       dist/windows/
 rm -f dist/Cross-SystemConnect-linux-x86_64.tar.gz \
       dist/Cross-SystemConnect-windows-x86_64.zip
-tar -C dist/linux -czf dist/Cross-SystemConnect-linux-x86_64.tar.gz .
+# Only the program files. A running app may write log.txt into dist/linux.
+tar -C dist/linux -czf dist/Cross-SystemConnect-linux-x86_64.tar.gz \
+  Cross-SystemConnect Cross-SystemConnect-core app.png
 (
   cd dist/windows
-  zip -r ../Cross-SystemConnect-windows-x86_64.zip .
+  zip -r ../Cross-SystemConnect-windows-x86_64.zip \
+    Cross-SystemConnect.exe Cross-SystemConnect-core.exe app.ico
 )
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then

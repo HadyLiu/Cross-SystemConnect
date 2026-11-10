@@ -91,6 +91,13 @@ pub struct AppStatus {
     /// Bumps each time a code is typed, so discovery dials again at once.
     #[serde(skip)]
     pub offer_gen: u64,
+    /// Home code that was valid when a pairing attempt targeting this computer
+    /// started. Still accepted until that attempt finishes, then burned.
+    #[serde(skip)]
+    pub home_code_inflight: String,
+    /// Count of in-flight pairing attempts that should rotate the home code.
+    #[serde(skip)]
+    pub pair_attempts: u32,
     /// Unix seconds until which a new computer may start pairing. 0 means closed.
     #[serde(default)]
     pub pairing_open_until: u64,
