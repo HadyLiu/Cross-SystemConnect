@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "csc-config"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "dirs",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "csc-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "csc-platform"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "arboard",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "csc-proto"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytes",
  "serde",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "csc-ui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "csc-config",

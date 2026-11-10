@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-11-10
+
 ### 修复
 - 快速来回切换时不再像撞墙：去掉切换后的冻结时间（原来主机 0.8 秒、被控端 0.6 秒，加 2 秒内必须先往里退）。现在只要指针离开落点有真实移动，就能立刻从同一条边切回去；只挡切过去后指针还没动过时的旧事件。
 - 碰边即切：切过去后指针落在离边 2 像素处（紧挨着边，但不在边那一像素上，以免一动就被切回去）（以前离边几十到上百像素，还会跳过任务栏和顶栏），往回一碰边就切，不用再往外推一大段。
@@ -333,6 +335,7 @@
 - 控制通道 TCP 24900，TLS 1.3（OpenSSL）。
 
 [Unreleased]: TBD
+[0.2.8]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.8
 [0.2.7]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.7
 [0.2.6]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.6
 [0.2.5]: https://github.com/HadyLiu/Cross-SystemConnect/releases/tag/v0.2.5
