@@ -1191,7 +1191,7 @@ impl Core {
                 remote,
             );
             self.switch
-                .arm_arrival_guard(enter.edge, (self.remote_x, self.remote_y), remote);
+                .arm_arrival_guard(enter.edge, (self.remote_x, self.remote_y));
             let reports = self.net.peer_caps(&next).await & CAP_EDGE_REPORT != 0;
             self.switch.set_remote_reports(reports);
             self.set_active_screen(Some(&next)).await;
@@ -1402,7 +1402,7 @@ impl Core {
         self.switch
             .inset_remote_estimate(entry, &mut self.remote_x, &mut self.remote_y, remote);
         self.switch
-            .arm_arrival_guard(entry, (self.remote_x, self.remote_y), remote);
+            .arm_arrival_guard(entry, (self.remote_x, self.remote_y));
         let reports = self.net.peer_caps(&dec.neighbor).await & CAP_EDGE_REPORT != 0;
         self.switch.set_remote_reports(reports);
         self.enter_point = (x, y);
@@ -2307,7 +2307,7 @@ impl Core {
                 // moving off the landing point. No timer, so turning straight
                 // back is never refused.
                 self.switch
-                    .arm_arrival_guard(p.edge, (self.remote_x, self.remote_y), screen);
+                    .arm_arrival_guard(p.edge, (self.remote_x, self.remote_y));
                 // Seed with the pointer before the jump. If the jump is ignored,
                 // the pointer has not moved and later events must not snap back.
                 let (ox, oy) = csc_platform::virtual_origin();
