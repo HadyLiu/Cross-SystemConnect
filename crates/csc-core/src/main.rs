@@ -24,7 +24,7 @@ use crate::paste::{PasteAction, SharedClip};
 use crate::prompt::PeerPrompt;
 use crate::supervisor::Supervisor;
 use crate::switch::{EdgePush, EdgeReport, EnterDecision, SwitchController, SwitchState};
-use crate::transfer::TransferHandle;
+use crate::transfer::{PasteSink, TransferHandle};
 use csc_config::{default_config_path, Config};
 use csc_platform::{create_input_injector, create_screen_info, query_host_net_info, Captured};
 use csc_proto::{
@@ -393,6 +393,38 @@ fn popup(body: &str, error: bool) {
     notice::tell(notice::Kind::Error, "Cross-SystemConnect", body, error);
 }
 
+/// Files copied on another computer up to this size are fetched as soon as
+/// they are copied and put on the clipboard as real files. Placeholders are
+/// only for bigger batches: any program that reads a pasted file at once
+/// (chat apps, browsers, editors) would get the 48-byte marker instead.
+const PREFETCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Private folder for files fetched ahead for the clipboard.
+fn clip_stage_root() -> PathBuf {
+    csc_config::user_dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cross-systemconnect")
+        .join("clip")
+}
+
+/// Fetch ahead instead of placeholders when the whole batch is small enough.
+fn prefetch_copied(files: &[csc_proto::FileEntry]) -> bool {
+    !files.is_empty()
+        && files
+            .iter()
+            .try_fold(0u64, |sum, e| sum.checked_add(e.size))
+            .is_some_and(|total| total <= PREFETCH_MAX_BYTES)
+}
+
+/// Another computer's copied files arrived complete (`paths`), or failed (`None`).
+struct StagedPaste {
+    peer: String,
+    seq: u64,
+    paths: Option<Vec<PathBuf>>,
+    /// Filled placeholder copies rather than files fetched ahead.
+    in_place: bool,
+}
+
 /// A file manager pasted the placeholder copies of another computer's files.
 struct LocatedPaste {
     peer: String,
@@ -447,6 +479,9 @@ struct Core {
     supervisor: Supervisor,
     paste_gen: u64,
     paste_tx: mpsc::Sender<LocatedPaste>,
+    staged_tx: mpsc::Sender<StagedPaste>,
+    /// Remote copy whose files are on their way here, by peer and copy number.
+    staging: Option<(String, u64)>,
     clip_seq: u64,
     last_remote_clip: u64,
     shared: SharedClip,
@@ -1469,6 +1504,8 @@ impl Core {
     }
 
     async fn on_clip(&mut self, ev: ClipEvent) {
+        // Something copied here: files still on their way must not replace it.
+        self.staging = None;
         if !self.status.read().await.sharing_enabled {
             return;
         }
@@ -1614,6 +1651,7 @@ impl Core {
 
     /// An image copied on `peer`. The keyboard host passes it on like text.
     async fn on_clip_image(&mut self, peer: &str, payload: Vec<u8>) {
+        self.staging = None;
         let Some((seq, png)) = csc_proto::decode_clip_image_bin(&payload) else {
             warn!("bad clipboard image from {peer}");
             return;
@@ -1646,6 +1684,7 @@ impl Core {
     }
 
     async fn on_clip_offer(&mut self, peer: &str, offer: ClipOfferPayload) {
+        self.staging = None;
         if !self.status.read().await.sharing_enabled {
             return;
         }
@@ -1668,9 +1707,9 @@ impl Core {
                     csc_platform::paste_watch(true);
                 }
                 #[cfg(target_os = "linux")]
-                self.arm_paste_placeholders(peer, &offer);
+                self.arm_remote_paste(peer, &offer).await;
             } else if cfg!(target_os = "linux") {
-                self.arm_paste_placeholders(peer, &offer);
+                self.arm_remote_paste(peer, &offer).await;
             } else if cfg!(windows) {
                 // Windows client cannot build X11 placeholders; catch Ctrl+V.
                 csc_platform::paste_watch(true);
@@ -1695,6 +1734,103 @@ impl Core {
                 text.chars().count()
             );
             self.clip.set_text(text);
+        }
+    }
+
+    /// Make another computer's copied files pasteable here: fetch small
+    /// batches right away, offer placeholders for big ones.
+    async fn arm_remote_paste(&mut self, peer: &str, offer: &ClipOfferPayload) {
+        if prefetch_copied(&offer.files) {
+            self.prefetch_remote_files(peer, offer.seq).await;
+        } else {
+            self.arm_paste_placeholders(peer, offer);
+        }
+    }
+
+    /// Ask `peer` for its copied files now. Once every file arrived and passed
+    /// its hash check, they go on the clipboard, so any program pastes real data.
+    async fn prefetch_remote_files(&mut self, peer: &str, seq: u64) {
+        csc_platform::cancel_paste();
+        self.paste_gen = 0;
+        let root = clip_stage_root();
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(seq.to_string());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("cannot create {}: {e}; using placeholders", dir.display());
+            return;
+        }
+        info!("fetching the files {peer} copied so they can be pasted here");
+        let ready = self
+            .transfer
+            .expect_paste_ready(peer.to_string(), PasteSink::Stage(dir))
+            .await;
+        self.watch_paste_ready(peer, seq, ready, false);
+        let located = PasteLocatedPayload {
+            paste_id: seq,
+            ok: true,
+        };
+        if let Ok(frame) = encode_json_frame(MsgType::PasteLocated, &located) {
+            self.net.send_control(peer, frame).await;
+        }
+    }
+
+    fn watch_paste_ready(
+        &mut self,
+        peer: &str,
+        seq: u64,
+        ready: crate::transfer::PasteReady,
+        in_place: bool,
+    ) {
+        self.staging = Some((peer.to_string(), seq));
+        let tx = self.staged_tx.clone();
+        let peer = peer.to_string();
+        tokio::spawn(async move {
+            let paths = ready.await.ok();
+            let _ = tx
+                .send(StagedPaste {
+                    peer,
+                    seq,
+                    paths,
+                    in_place,
+                })
+                .await;
+        });
+    }
+
+    async fn on_staged_paste(&mut self, staged: StagedPaste) {
+        let current = self
+            .staging
+            .as_ref()
+            .is_some_and(|(p, s)| p.eq_ignore_ascii_case(&staged.peer) && *s == staged.seq);
+        if !current {
+            debug!(
+                "files from {} copy {} arrived after a newer copy; clipboard kept",
+                staged.peer, staged.seq
+            );
+            return;
+        }
+        self.staging = None;
+        match staged.paths {
+            Some(paths) if !paths.is_empty() => {
+                info!(
+                    "files {} copied are here and verified; clipboard now holds {} real item(s)",
+                    staged.peer,
+                    paths.len()
+                );
+                // Later pastes copy the real files, never the placeholders again.
+                self.clip.set_files(paths);
+            }
+            _ if staged.in_place => {}
+            _ => {
+                warn!("fetching the files {} copied failed", staged.peer);
+                popup(
+                    &format!(
+                        "没能从 {} 取到复制的文件，剪贴板里没有放入文件。请在那台电脑上重新复制。",
+                        staged.peer
+                    ),
+                    true,
+                );
+            }
         }
     }
 
@@ -1743,7 +1879,11 @@ impl Core {
             found.paths.len(),
             found.peer
         );
-        self.transfer.expect_paste(found.paths).await;
+        let ready = self
+            .transfer
+            .expect_paste_ready(found.peer.clone(), PasteSink::InPlace(found.paths))
+            .await;
+        self.watch_paste_ready(&found.peer, found.seq, ready, true);
         // The computer that was pasted on tells the keyboard host. The host sends the files.
         let located = PasteLocatedPayload {
             paste_id: found.seq,
@@ -1766,7 +1906,9 @@ impl Core {
                 );
                 return;
             }
-            self.transfer.expect_paste(Vec::new()).await;
+            self.transfer
+                .expect_paste(String::new(), PasteSink::ReceiveDir)
+                .await;
             let _ = self.paste(String::new()).await;
             return;
         }
@@ -1779,7 +1921,9 @@ impl Core {
             );
             return;
         };
-        self.transfer.expect_paste(Vec::new()).await;
+        self.transfer
+            .expect_paste(peer.clone(), PasteSink::ReceiveDir)
+            .await;
         info!("tray paste: telling {peer} the files were pasted here");
         let located = PasteLocatedPayload {
             paste_id: seq,
@@ -2472,17 +2616,101 @@ fn install_panic_hook(log_path: Option<PathBuf>) {
     }));
 }
 
+fn arg_config_path() -> PathBuf {
+    std::env::args()
+        .position(|a| a == "--config")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_path)
+}
+
+/// `--service`, `--install-service`, `--uninstall-service` (Windows elevated
+/// mode). Returns the exit code when one of them was given.
+pub fn service_cli() -> Option<i32> {
+    use csc_platform::elevated::{INSTALL_FLAG, SERVICE_FLAG, UNINSTALL_FLAG};
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = args
+        .iter()
+        .find(|a| [SERVICE_FLAG, INSTALL_FLAG, UNINSTALL_FLAG].contains(&a.as_str()))?
+        .clone();
+    #[cfg(windows)]
+    {
+        use csc_platform::win::service;
+        let config = arg_config_path();
+        let log_dir = config
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        init_service_log(&log_dir.join("service.log"));
+        let result = match mode.as_str() {
+            SERVICE_FLAG => service::run(config),
+            INSTALL_FLAG => std::env::current_exe().and_then(|exe| service::install(&exe, &config)),
+            _ => service::uninstall(),
+        };
+        Some(match result {
+            Ok(()) => {
+                info!("{mode}: ok");
+                0
+            }
+            Err(e) => {
+                warn!("{mode}: {e}");
+                eprintln!("{mode}: {e}");
+                1
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{mode}: only available on Windows");
+        Some(2)
+    }
+}
+
+#[cfg(windows)]
+fn init_service_log(path: &std::path::Path) {
+    use csc_config::logfile::{CappedLog, SharedLog};
+    let file = SharedLog::default();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    file.set(CappedLog::open(path).ok());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .with_ansi(false)
+        .with_writer(move || file.clone())
+        .try_init();
+}
+
+/// Tell the user once when an administrator window ignored our input.
+async fn watch_blocked_input() {
+    let mut every = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        every.tick().await;
+        if let Some(app) = csc_platform::take_input_blocked() {
+            let body = notice::text(
+                &format!(
+                    "前台窗口「{app}」以管理员身份运行，Windows 拦截了远程的鼠标和键盘操作。\
+                     如需操作管理员窗口，请在设置里打开「以管理员服务运行（可操作管理员窗口）」。"
+                ),
+                &format!(
+                    "The foreground window \"{app}\" runs as administrator, so Windows blocks \
+                     remote mouse and keyboard input. Turn on \"Run as admin service\" in \
+                     settings to control administrator windows."
+                ),
+            );
+            notice::tell(notice::Kind::Error, "Cross-SystemConnect", &body, true);
+        }
+    }
+}
+
 pub async fn run() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--uninstall") {
         let purge = std::env::args().any(|a| a == "--purge");
         uninstall(purge)?;
         return Ok(());
     }
-    let config_path = std::env::args()
-        .position(|a| a == "--config")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(default_config_path);
+    let config_path = arg_config_path();
+    let service_child = std::env::args().any(|a| a == csc_platform::elevated::CHILD_FLAG);
 
     let cfg = Config::load_or_create(&config_path).unwrap_or_else(|e| {
         eprintln!("config load failed, using defaults: {e:#}");
@@ -2505,6 +2733,12 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     info!("Cross-SystemConnect-core starting name={}", cfg.name);
+    if service_child {
+        info!(
+            "elevated service mode: running as SYSTEM in the user's session, following the input desktop"
+        );
+        csc_platform::set_follow_input_desktop(true);
+    }
 
     csc_platform::init_process();
     let screen_info = create_screen_info();
@@ -2656,9 +2890,11 @@ pub async fn run() -> anyhow::Result<()> {
     *state.net.write().await = Some(net.clone());
 
     let (paste_tx, mut paste_rx) = mpsc::channel::<LocatedPaste>(4);
+    let (staged_tx, mut staged_rx) = mpsc::channel::<StagedPaste>(4);
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipEvent>(16);
     let clip = crate::clipboard::spawn(clip_tx);
     tokio::spawn(watch_memory(state.clone(), board.clone()));
+    tokio::spawn(watch_blocked_input());
     {
         let search = config.read().await.search_address.clone();
         let mut s = state.status.write().await;
@@ -2731,6 +2967,8 @@ pub async fn run() -> anyhow::Result<()> {
         supervisor,
         paste_gen: 0,
         paste_tx: paste_tx.clone(),
+        staged_tx,
+        staging: None,
         clip_seq,
         last_remote_clip: 0,
         shared: SharedClip::default(),
@@ -2759,6 +2997,7 @@ pub async fn run() -> anyhow::Result<()> {
             _ = tick.tick() => core.tick().await,
             Some(ev) = clip_rx.recv() => core.on_clip(ev).await,
             Some(found) = paste_rx.recv() => core.on_located_paste(found).await,
+            Some(staged) = staged_rx.recv() => core.on_staged_paste(staged).await,
             Some(()) = paste_here_rx.recv() => core.paste_remote_here().await,
             ev = inbound_rx.recv() => {
                 if !core.on_inbound(ev).await {
@@ -2908,6 +3147,24 @@ async fn watch_memory(state: Arc<AppState>, board: crate::progress::TransferBoar
 #[cfg(test)]
 mod tests {
     use super::Hotkey;
+
+    #[test]
+    fn small_copies_are_fetched_ahead_big_ones_use_placeholders() {
+        let file = |size: u64| csc_proto::FileEntry {
+            relative_path: "a.bin".into(),
+            size,
+            mtime_unix: 0,
+            is_directory: false,
+            mode: 0,
+        };
+        assert!(super::prefetch_copied(&[file(48), file(10 << 20)]));
+        assert!(super::prefetch_copied(&[file(super::PREFETCH_MAX_BYTES)]));
+        assert!(!super::prefetch_copied(&[file(
+            super::PREFETCH_MAX_BYTES + 1
+        )]));
+        assert!(!super::prefetch_copied(&[file(u64::MAX), file(1)]));
+        assert!(!super::prefetch_copied(&[]));
+    }
     use csc_config::Config;
     use csc_proto::LocalNic;
     use std::collections::HashSet;

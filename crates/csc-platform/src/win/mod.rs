@@ -1,11 +1,15 @@
 mod capture;
 mod dark_mode;
+pub mod desktop;
+pub mod elevation;
 pub mod hook;
 mod host_net;
 mod injector;
 mod paste_dir;
 pub mod power;
 pub mod screen;
+pub mod security;
+pub mod service;
 
 pub use capture::WinInputCapture;
 pub use dark_mode::set as set_popup_menu_dark;

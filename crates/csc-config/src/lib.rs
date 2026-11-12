@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub mod logfile;
+pub mod user_dirs;
 
 /// Product data directory name (user-facing).
 pub const APP_DIR_NAME: &str = "Cross-SystemConnect";
@@ -821,13 +822,13 @@ fn name_needs_os_hostname(name: &str) -> bool {
 fn app_config_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        dirs::config_dir()
+        user_dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(APP_DIR_NAME)
     }
     #[cfg(not(windows))]
     {
-        dirs::config_dir()
+        user_dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("cross-systemconnect")
     }
@@ -836,13 +837,13 @@ fn app_config_dir() -> PathBuf {
 fn legacy_config_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        dirs::config_dir()
+        user_dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(LEGACY_APP_DIR_NAME)
     }
     #[cfg(not(windows))]
     {
-        dirs::config_dir()
+        user_dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("csc")
     }

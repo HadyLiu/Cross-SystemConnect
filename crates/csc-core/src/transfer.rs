@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tracing::{debug, info, warn};
 use xxhash_rust::xxh64::Xxh64;
 
@@ -43,6 +43,8 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const TITLE: &str = "Cross-SystemConnect 文件传输";
 /// Hidden temporary name used while replacing an existing file.
 const PART_SUFFIX: &str = ".csc-part";
+/// A paste waits this long for the other computer's offer, then is dropped.
+const EXPECT_TTL: Duration = Duration::from_secs(2 * 60);
 /// Placeholder marker prefix inside a dragged folder (Doc §14.6).
 pub const FOLDER_MARKER_PREFIX: &str = ".csc-drag-";
 
@@ -78,6 +80,64 @@ pub enum Sink {
     InPlace(Vec<PathBuf>),
 }
 
+/// Where the next pasted batch from a computer goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteSink {
+    /// The receive folder (tray paste).
+    ReceiveDir,
+    /// Over placeholder copies a file manager made.
+    InPlace(Vec<PathBuf>),
+    /// Fetched ahead into a private folder, then put on the clipboard as real files.
+    Stage(PathBuf),
+}
+
+/// Local paths of a finished paste batch, or why it failed.
+pub type PasteReady = oneshot::Receiver<Vec<PathBuf>>;
+
+/// A paste waiting for the other computer's FileOffer.
+struct Expect {
+    /// Only an offer from this computer fills it; empty accepts any.
+    peer: String,
+    sink: PasteSink,
+    at: Instant,
+    ready: Option<oneshot::Sender<Vec<PathBuf>>>,
+}
+
+impl Expect {
+    fn fits(&self, peer: &str, now: Instant) -> bool {
+        (self.peer.is_empty() || self.peer.eq_ignore_ascii_case(peer))
+            && now.duration_since(self.at) < EXPECT_TTL
+    }
+}
+
+impl Drop for Expect {
+    /// Never used: placeholder copies that were never filled are 48-byte marker
+    /// files with the real name. Remove them so they cannot be mistaken for the file.
+    fn drop(&mut self) {
+        if let PasteSink::InPlace(paths) = &self.sink {
+            remove_unfilled_placeholders(paths);
+        }
+    }
+}
+
+/// Delete placeholder copies that still hold only the marker.
+fn remove_unfilled_placeholders(paths: &[PathBuf]) {
+    for p in paths {
+        if csc_platform::is_paste_placeholder(p) {
+            warn!("removing unfilled paste placeholder {}", p.display());
+            let _ = std::fs::remove_file(p);
+        } else if p.is_dir() {
+            if let Ok(list) = std::fs::read_dir(p) {
+                for e in list.flatten() {
+                    if csc_platform::is_paste_placeholder(&e.path()) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub enum TransferCmd {
     Send {
         peer: String,
@@ -90,9 +150,11 @@ pub enum TransferCmd {
         from: String,
         to: String,
     },
-    /// Next paste offer overwrites these placeholder copies.
+    /// Where the next paste offer from `peer` goes.
     ExpectPaste {
-        paths: Vec<PathBuf>,
+        peer: String,
+        sink: PasteSink,
+        ready: Option<oneshot::Sender<Vec<PathBuf>>>,
     },
     Cancel {
         id: u64,
@@ -139,8 +201,27 @@ impl TransferHandle {
         .await;
     }
 
-    pub async fn expect_paste(&self, paths: Vec<PathBuf>) {
-        self.cmd(TransferCmd::ExpectPaste { paths }).await;
+    /// The next paste offer from `peer` (empty: any) goes to `sink`.
+    pub async fn expect_paste(&self, peer: String, sink: PasteSink) {
+        self.cmd(TransferCmd::ExpectPaste {
+            peer,
+            sink,
+            ready: None,
+        })
+        .await;
+    }
+
+    /// Like [`Self::expect_paste`], and report the local top-level paths once
+    /// every file arrived and passed its hash check. A dropped sender means it failed.
+    pub async fn expect_paste_ready(&self, peer: String, sink: PasteSink) -> PasteReady {
+        let (tx, rx) = oneshot::channel();
+        self.cmd(TransferCmd::ExpectPaste {
+            peer,
+            sink,
+            ready: Some(tx),
+        })
+        .await;
+        rx
     }
 
     pub async fn allow_relay(&self, from: String, to: String) {
@@ -189,8 +270,8 @@ pub fn receive_root(cfg: &Config) -> PathBuf {
     if !set.is_empty() {
         return PathBuf::from(set);
     }
-    dirs::desktop_dir()
-        .or_else(dirs::download_dir)
+    csc_config::user_dirs::desktop_dir()
+        .or_else(csc_config::user_dirs::download_dir)
         .or_else(|| default_config_path().parent().map(|p| p.join("received")))
         .unwrap_or_else(|| PathBuf::from("received"))
 }
@@ -217,7 +298,7 @@ fn apply_mode(preserve: bool, strip: bool, path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         let mut bits = mode & 0o777;
         if strip {
-            if let Some(desk) = dirs::desktop_dir() {
+            if let Some(desk) = csc_config::user_dirs::desktop_dir() {
                 if path.starts_with(&desk) {
                     bits &= !0o111;
                 }
@@ -516,12 +597,34 @@ struct Incoming {
     acked: u64,
     /// Bytes already on disk for an entry, filled when a partial file matches.
     resume: HashMap<u32, u64>,
+    /// Told the local top-level paths once the whole batch is verified.
+    ready: Option<oneshot::Sender<Vec<PathBuf>>>,
+    /// Fetched ahead for the clipboard, not saved for the user yet.
+    staged: bool,
+    /// Files whose FileEnd arrived with a matching size and hash.
+    verified: HashSet<u32>,
     /// Waiting for the user to choose, by top-level entry index.
     conflicts: Vec<TransferConflict>,
     renamed: Vec<RenamedName>,
 }
 
 impl Incoming {
+    /// A file the batch ended without: still open, or never verified.
+    fn missing(&self) -> Option<String> {
+        if let Some(cur) = &self.current {
+            return Some(cur.path.display().to_string());
+        }
+        self.entries
+            .iter()
+            .enumerate()
+            .find(|(i, e)| {
+                !e.is_directory
+                    && !self.skip.get(*i).copied().unwrap_or(false)
+                    && !self.verified.contains(&(*i as u32))
+            })
+            .map(|(_, e)| e.relative_path.clone())
+    }
+
     fn dest(&self) -> String {
         match &self.target {
             Target::Dir(d) => d.display().to_string(),
@@ -542,8 +645,8 @@ struct Engine {
     outgoing: HashMap<u64, Outgoing>,
     sending: HashMap<u64, Sending>,
     incoming: HashMap<u64, Incoming>,
-    /// Placeholder copies a file-manager paste already created.
-    expect_paste: Option<Vec<PathBuf>>,
+    /// Where the next pasted batch goes.
+    expect_paste: Option<Expect>,
     relay: Relay,
     next_id: u64,
 }
@@ -593,6 +696,14 @@ impl Engine {
         while let Some(cmd) = rx.recv().await {
             self.outgoing.retain(|_, o| o.created.elapsed() < OFFER_TTL);
             self.sending.retain(|_, s| Arc::strong_count(&s.cancel) > 1);
+            if self
+                .expect_paste
+                .as_ref()
+                .is_some_and(|e| e.at.elapsed() >= EXPECT_TTL)
+            {
+                debug!("paste expectation expired without an offer");
+                self.expect_paste = None;
+            }
             match cmd {
                 TransferCmd::Send {
                     peer,
@@ -601,7 +712,14 @@ impl Engine {
                     relay_to,
                 } => self.offer(peer, paths, purpose, relay_to).await,
                 TransferCmd::AllowRelay { from, to } => self.relay.allow(&from, &to),
-                TransferCmd::ExpectPaste { paths } => self.expect_paste = Some(paths),
+                TransferCmd::ExpectPaste { peer, sink, ready } => {
+                    self.expect_paste = Some(Expect {
+                        peer,
+                        sink,
+                        at: Instant::now(),
+                        ready,
+                    });
+                }
                 TransferCmd::Cancel { id } => self.cancel_incoming(id).await,
                 TransferCmd::Resolve { id, decisions } => self.resolve(id, decisions).await,
                 TransferCmd::Frame { peer, msg, payload } => {
@@ -918,10 +1036,23 @@ impl Engine {
         } else {
             self.label(peer).await
         };
+        let mut ready = None;
+        let mut staged = false;
         let sink = if matches!(purpose, TransferPurpose::Paste | TransferPurpose::Clipboard) {
-            match self.expect_paste.take() {
-                Some(paths) if paths.is_empty() => Sink::Dir(receive_root(&cfg)),
-                Some(paths) => Sink::InPlace(paths),
+            let expect = self.expect_paste.take_if(|e| e.fits(peer, Instant::now()));
+            match expect {
+                Some(mut e) => {
+                    ready = e.ready.take();
+                    // Taken out: the placeholders now belong to this batch.
+                    match std::mem::replace(&mut e.sink, PasteSink::ReceiveDir) {
+                        PasteSink::ReceiveDir => Sink::Dir(receive_root(&cfg)),
+                        PasteSink::InPlace(paths) => Sink::InPlace(paths),
+                        PasteSink::Stage(dir) => {
+                            staged = true;
+                            Sink::Dir(dir)
+                        }
+                    }
+                }
                 None => {
                     Sink::Dir(csc_platform::paste_folder().unwrap_or_else(|| receive_root(&cfg)))
                 }
@@ -946,6 +1077,9 @@ impl Engine {
                 };
                 popup(e.message.clone(), true);
                 self.send_json(peer, MsgType::FileError, &e).await;
+                if let Sink::InPlace(paths) = &sink {
+                    remove_unfilled_placeholders(paths);
+                }
                 return;
             }
         }
@@ -959,6 +1093,8 @@ impl Engine {
             from,
             via,
             offer.origin_device_id,
+            ready,
+            staged,
         )
         .await;
     }
@@ -975,13 +1111,21 @@ impl Engine {
         from: String,
         via: String,
         origin_device_id: String,
+        ready: Option<oneshot::Sender<Vec<PathBuf>>>,
+        staged: bool,
     ) {
         let cfg = self.config.read().await.clone();
         let title = batch_title(&entries);
         let files_total = entries.iter().filter(|e| !e.is_directory).count() as u32;
+        let placeholders = match &sink {
+            Sink::InPlace(paths) => paths.clone(),
+            Sink::Dir(_) => Vec::new(),
+        };
         match prepare_incoming(peer, purpose, entries, total, sink, &cfg) {
             Ok(mut inc) => {
                 inc.origin_device_id = origin_device_id;
+                inc.ready = ready;
+                inc.staged = staged;
                 info!(
                     "receiving {} entries ({}) from {from} into {}",
                     inc.entries.len(),
@@ -1012,6 +1156,7 @@ impl Engine {
                 }
             }
             Err(why) => {
+                remove_unfilled_placeholders(&placeholders);
                 popup(format!("拒绝接收来自 {from} 的文件：{why}"), true);
                 let e = FileErrorPayload {
                     transfer_id: id,
@@ -1227,6 +1372,7 @@ impl Engine {
             };
         };
         let Some(file) = cur.file else {
+            inc.verified.insert(end.index);
             return Ok(());
         };
         if cur.written != size {
@@ -1267,6 +1413,7 @@ impl Engine {
         let mode = inc.entries.get(i).map(|e| e.mode).unwrap_or(0);
         apply_mode(preserve, strip, &finished, mode);
         mark_of_web(motw, &finished, peer);
+        inc.verified.insert(end.index);
         board.file_done(end.transfer_id);
         Ok(())
     }
@@ -1285,12 +1432,26 @@ impl Engine {
             .zip(&inc.skip)
             .filter(|(e, s)| !**s && !e.is_directory)
             .count();
-        let message = format!("已接收 {files} 个文件，保存在 {}", inc.dest());
+        if let Some(missing) = inc.missing() {
+            let why = format!("{missing} 没有完整收到");
+            self.incoming.insert(id, inc);
+            self.fail_incoming(id, &why).await;
+            return;
+        }
+        let mut inc = inc;
+        if let Some(tx) = inc.ready.take() {
+            let _ = tx.send(inc.tops.clone());
+        }
+        let message = if inc.staged {
+            format!("已取到 {files} 个文件，可以粘贴了")
+        } else {
+            format!("已接收 {files} 个文件，保存在 {}", inc.dest())
+        };
         let open_path = match inc.tops.as_slice() {
-            [one] => one.display().to_string(),
+            [one] if !inc.staged => one.display().to_string(),
             _ => String::new(),
         };
-        info!("received {files} files from {peer}");
+        info!("received {files} files from {peer} (all hashes checked)");
         self.board.update(id, |p| p.open_path = open_path);
         self.board.finish(id, TransferState::Done, message);
     }
@@ -1602,6 +1763,9 @@ fn prepare_incoming(
         received: 0,
         acked: 0,
         resume: HashMap::new(),
+        ready: None,
+        staged: false,
+        verified: HashSet::new(),
         conflicts,
         renamed,
     })
@@ -1649,7 +1813,7 @@ fn write_meta(part: &Path, meta: &PartMeta) {
 /// Delete `.csc-part` files older than the resume window under the receive dir.
 fn cleanup_expired_parts(receive_dir: &str, window_min: u32) {
     let root = if receive_dir.trim().is_empty() {
-        dirs::desktop_dir().or_else(dirs::home_dir)
+        csc_config::user_dirs::desktop_dir().or_else(csc_config::user_dirs::home_dir)
     } else {
         Some(PathBuf::from(receive_dir))
     };
@@ -2217,6 +2381,187 @@ mod tests {
         place(&mut inc, &HashMap::new()).unwrap();
         assert_eq!(inc.targets[0], found);
         assert_eq!(inc.targets[2], dir.join("照片").join("a.jpg"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn engine(dir: &Path) -> Engine {
+        let mut cfg = Config::default();
+        cfg.clipboard.files = true;
+        cfg.file_transfer.receive_dir = dir.display().to_string();
+        cfg.file_transfer.resume_window_min = 0;
+        Engine {
+            net: NetHub::offline(),
+            config: Arc::new(RwLock::new(cfg)),
+            board: TransferBoard::default(),
+            outgoing: HashMap::new(),
+            sending: HashMap::new(),
+            incoming: HashMap::new(),
+            expect_paste: None,
+            relay: Relay::default(),
+            next_id: 1,
+        }
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        serde_json::to_vec(v).unwrap()
+    }
+
+    fn data(id: u64, index: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&id.to_le_bytes());
+        p.extend_from_slice(&index.to_le_bytes());
+        p.extend_from_slice(bytes);
+        p
+    }
+
+    fn digest(bytes: &[u8]) -> u64 {
+        let mut h = Xxh64::new(0);
+        h.update(bytes);
+        h.digest()
+    }
+
+    /// Offer one file, then send `sent` bytes and a FileEnd hashed over `real`.
+    async fn deliver(e: &mut Engine, id: u64, name: &str, real: &[u8], sent: &[u8], end: bool) {
+        let offer = FileOfferPayload {
+            transfer_id: id,
+            purpose: TransferPurpose::Paste,
+            entries: vec![entry(name, real.len() as u64, false)],
+            total_bytes: real.len() as u64,
+            origin: String::new(),
+            relay_to: String::new(),
+            origin_device_id: String::new(),
+        };
+        e.on_frame("win", MsgType::FileOffer, json(&offer))
+            .await
+            .unwrap();
+        let begin = FileBeginPayload {
+            transfer_id: id,
+            index: 0,
+        };
+        e.on_frame("win", MsgType::FileBegin, json(&begin))
+            .await
+            .unwrap();
+        for chunk in sent.chunks(7) {
+            e.on_frame("win", MsgType::FileData, data(id, 0, chunk))
+                .await
+                .unwrap();
+        }
+        if end {
+            let fin = FileEndPayload {
+                transfer_id: id,
+                index: 0,
+                xxhash64: digest(real),
+            };
+            e.on_frame("win", MsgType::FileEnd, json(&fin))
+                .await
+                .unwrap();
+        }
+        e.on_frame(
+            "win",
+            MsgType::FileDone,
+            json(&FileDonePayload { transfer_id: id }),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn expect(e: &mut Engine, peer: &str, sink: PasteSink) -> PasteReady {
+        let (tx, rx) = oneshot::channel();
+        e.expect_paste = Some(Expect {
+            peer: peer.into(),
+            sink,
+            at: Instant::now(),
+            ready: Some(tx),
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn fetched_ahead_files_arrive_whole_and_verified() {
+        let dir = temp("stage-ok");
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut e = engine(&dir);
+        let ready = expect(&mut e, "win", PasteSink::Stage(stage.clone()));
+        let body: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
+        deliver(&mut e, 11, "固件.bin", &body, &body, true).await;
+        let paths = ready.await.expect("batch reported ready");
+        assert_eq!(paths, vec![stage.join("固件.bin")]);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn corrupted_data_fails_and_leaves_no_file() {
+        let dir = temp("stage-bad");
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut e = engine(&dir);
+        let ready = expect(&mut e, "win", PasteSink::Stage(stage.clone()));
+        let body = b"0123456789abcdefghij".to_vec();
+        let mut bad = body.clone();
+        bad[5] ^= 0xff;
+        deliver(&mut e, 12, "a.hex", &body, &bad, true).await;
+        assert!(
+            ready.await.is_err(),
+            "a hash mismatch must not be reported ready"
+        );
+        assert!(!stage.join("a.hex").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_without_file_end_is_not_done() {
+        let dir = temp("stage-short");
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut e = engine(&dir);
+        let ready = expect(&mut e, "win", PasteSink::Stage(stage.clone()));
+        let body = b"0123456789".to_vec();
+        deliver(&mut e, 13, "a.md", &body, &body[..4], false).await;
+        assert!(ready.await.is_err());
+        assert!(!stage.join("a.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn placeholder_copy_is_filled_in_place() {
+        let dir = temp("inplace-fill");
+        let copy = dir.join("报告.docx");
+        let mut marker = b"CSC-PLACEHOLDER\0".to_vec();
+        marker.extend_from_slice(&[7u8; 32]);
+        std::fs::write(&copy, &marker).unwrap();
+        let mut e = engine(&dir);
+        let ready = expect(&mut e, "win", PasteSink::InPlace(vec![copy.clone()]));
+        let body = b"real document body".to_vec();
+        deliver(&mut e, 14, "报告.docx", &body, &body, true).await;
+        assert_eq!(ready.await.unwrap(), vec![copy.clone()]);
+        assert_eq!(std::fs::read(&copy).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unfilled_placeholders_are_removed_and_never_reused() {
+        let dir = temp("inplace-stale");
+        let copy = dir.join("Cat.hex");
+        let mut marker = b"CSC-PLACEHOLDER\0".to_vec();
+        marker.extend_from_slice(&[9u8; 32]);
+        std::fs::write(&copy, &marker).unwrap();
+        let mut e = engine(&dir);
+        // Placeholders for a paste whose offer never came (the link dropped).
+        let ready = expect(&mut e, "win", PasteSink::InPlace(vec![copy.clone()]));
+        // A later offer from another computer must not be written over them.
+        assert!(!e.expect_paste.as_ref().unwrap().fits("mac", Instant::now()));
+        let stale = Instant::now() + EXPECT_TTL;
+        assert!(!e.expect_paste.as_ref().unwrap().fits("win", stale));
+        e.expect_paste = None;
+        assert!(ready.await.is_err());
+        if cfg!(all(unix, not(target_os = "macos"))) {
+            assert!(
+                !copy.exists(),
+                "a 48-byte marker must not stay behind as the file"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

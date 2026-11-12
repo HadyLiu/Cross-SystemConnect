@@ -1,6 +1,7 @@
 //! Platform abstractions for input, clipboard, screen, and host info.
 
 pub mod clip;
+pub mod elevated;
 mod host;
 pub mod keymap;
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
@@ -9,6 +10,7 @@ mod lock;
 mod notify;
 mod rate;
 mod traits;
+pub mod uipi;
 pub mod vdrag;
 
 pub use lock::{
@@ -356,6 +358,21 @@ pub fn primary_button_down() -> bool {
 }
 
 /// Process-wide setup that must run before any screen or cursor call.
+/// Program name of an administrator window that ignored our injected input
+/// since the last call (Windows UIPI). Always `None` elsewhere.
+pub fn take_input_blocked() -> Option<String> {
+    uipi::take()
+}
+
+/// Service child: move the input thread to whichever desktop receives input
+/// (Default, the UAC prompt or the sign-in screen) before each injection.
+pub fn set_follow_input_desktop(on: bool) {
+    #[cfg(windows)]
+    win::desktop::set_follow_input_desktop(on);
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 pub fn init_process() {
     #[cfg(windows)]
     win::init_dpi_awareness();
@@ -493,6 +510,26 @@ pub fn prepare_paste(id: u64, items: &[vdrag::DragItem]) -> Option<(u64, Vec<std
         let _ = (id, items);
         None
     }
+}
+
+/// True for a paste placeholder this program wrote, or a copy of one that was
+/// never filled with the real data. Always false on Windows.
+pub fn is_paste_placeholder(path: &std::path::Path) -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux::paste_hold::is_placeholder(path)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Drop the placeholders from [`prepare_paste`] and stop watching for a paste.
+pub fn cancel_paste() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux::paste_hold::cancel_paste();
 }
 
 /// Wait until placeholders from [`prepare_paste`] have been copied.

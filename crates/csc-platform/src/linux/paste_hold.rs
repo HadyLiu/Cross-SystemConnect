@@ -86,6 +86,13 @@ pub(crate) fn file_uri(path: &Path) -> String {
     out
 }
 
+/// A placeholder this program wrote (or a copy of one): magic plus a 32-byte token.
+pub(crate) fn is_placeholder(path: &Path) -> bool {
+    let len = PLACEHOLDER_MAGIC.len() as u64 + 32;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == len)
+        && std::fs::read(path).is_ok_and(|b| b.starts_with(PLACEHOLDER_MAGIC))
+}
+
 fn is_marker(path: &Path, top: &Top) -> bool {
     std::fs::read(path).is_ok_and(|b| b == marker_bytes(&top.token))
 }
@@ -134,7 +141,7 @@ fn find_copies_until(
             return found.into_iter().collect();
         }
         if Instant::now() >= deadline {
-            warn!("paste {id}: copied placeholders not found");
+            // One scan round; the caller decides when to give up and says so once.
             return None;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -291,7 +298,23 @@ pub(crate) fn wait_paste(gen: u64, wait: Duration) -> Option<Vec<PathBuf>> {
             );
         }
         if Instant::now() >= deadline {
+            warn!(
+                "paste {}: placeholders were not pasted within {} min; stopped watching",
+                hold.id,
+                wait.as_secs() / 60
+            );
             return None;
+        }
+    }
+}
+
+/// Stop watching for a placeholder paste (the files are fetched ahead instead).
+pub(crate) fn cancel_paste() {
+    if let Ok(mut slot) = PASTE.lock() {
+        if let Some(hold) = slot.take() {
+            if let Some(dir) = hold.tops.first().and_then(|t| t.path.parent()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
         }
     }
 }
@@ -343,6 +366,14 @@ mod tests {
         let found =
             find_copies_until(7, &tops, since, Instant::now() + Duration::from_secs(20)).unwrap();
         assert_eq!(found.len(), 2);
+        assert!(is_placeholder(&dest.join("a (1).txt")));
+        std::fs::write(
+            dest.join("real.txt"),
+            b"CSC-PLACEHOLDER\0 but a real, longer file body",
+        )
+        .unwrap();
+        assert!(!is_placeholder(&dest.join("real.txt")));
+        assert!(!is_placeholder(&dest.join("d")));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

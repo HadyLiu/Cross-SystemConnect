@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod admin_service;
 mod app;
 mod autostart;
 mod events;
@@ -46,8 +47,13 @@ fn start_core_in_process() {
 }
 
 fn main() -> eframe::Result {
+    // Elevated mode: the core runs in the Windows service; connect to it.
     #[cfg(windows)]
-    start_core_in_process();
+    if admin_service::running() {
+        admin_service::set_active(true);
+    } else {
+        start_core_in_process();
+    }
 
     {
         use csc_config::logfile::{CappedLog, SharedLog};

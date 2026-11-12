@@ -1,10 +1,9 @@
 # check → build
 # 容器使用已发布的 ghcr.io/hadyliu/cross-systemconnect-toolchain:latest。
 # 本工作流不构建镜像；更新镜像时手动运行 toolchain-image.yml。
-# check：所有 push / PR / 手动触发都在镜像容器内执行 packaging/check.sh。
+# check：分支 push、PR、手动触发在镜像容器内执行 packaging/check.sh。
+#        推送 v* 标签时不跑 check，改为确认 master 上同一 commit 的 check 已通过。
 # build：仅打 v* 标签时运行，编译、生成 SHA256SUMS、上传 artifact 并发布 Release。
-# 去重：分支推送的 run 先由 plan 检查当前 commit 是否已有 v* 标签，有则整套跳过，
-#       交给标签 run 完整执行；标签 run 永远执行。详见 Doc/构建发布流程.md §8.1。
 name: ci
 
 on:
@@ -24,42 +23,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.plan.outputs.run }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'push' && github.ref_type == 'branch'
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: 当前 commit 是否已有 v* 标签
-        id: plan
-        env:
-          SHA: ${{ github.sha }}
-          IS_BRANCH_PUSH: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
-        run: |
-          if [ "$IS_BRANCH_PUSH" != "true" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git tag --points-at "$SHA" | grep -q '^v'; then
-            echo "本 commit 已有 v* 标签，交给标签 run"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          # 标签可能与分支同时推送而稍晚到达，等待并重试几次
-          for _ in 1 2 3 4; do
-            sleep 10
-            # 轻量标签与附注标签（^{}）都匹配
-            if git ls-remote --tags origin 'refs/tags/v*' | awk -v s="$SHA" '$1==s' | grep -q .; then
-              echo "远端发现指向本 commit 的 v* 标签，交给标签 run"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-          done
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
   check:
-    needs: plan
-    if: needs.plan.outputs.run == 'true'
+    if: github.event_name != 'push' || github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,9 +53,56 @@ jobs:
       - name: test / clippy / fmt / audit / deny
         run: bash packaging/check.sh
 
+  await-master-check:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: 等待 master 上同一 commit 的 check 通过
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "等待 master 上 $SHA 的 check 通过…"
+          deadline=$((SECONDS + 2400))
+          failed=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            ids=$(gh run list --repo "$REPO" --workflow ci.yml --commit "$SHA" --branch master --event push --limit 20 --json databaseId --jq '.[].databaseId' || true)
+            in_progress=0
+            if [ -n "${ids:-}" ]; then
+              for id in $ids; do
+                result=$(gh run view "$id" --repo "$REPO" --json jobs --jq '.jobs[] | select(.name=="check") | [.status, (.conclusion // "")] | join(" ")')
+                echo "run $id check: ${result:-<none>}"
+                if echo "$result" | grep -qx 'completed success'; then
+                  echo "master check 已通过 (run $id)"
+                  exit 0
+                fi
+                if echo "$result" | grep -qx 'completed failure'; then
+                  failed=1
+                fi
+                if echo "$result" | grep -Eq '^(queued|in_progress|waiting|pending|requested) '; then
+                  in_progress=1
+                fi
+              done
+            else
+              echo "还没有 master 上的 CI run"
+            fi
+            if [ "$failed" = 1 ] && [ "$in_progress" = 0 ]; then
+              echo "master 上同一 commit 的 check 失败，停止发布" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "等待超时：master 上没有通过的 check" >&2
+          exit 1
+
   build:
-    needs: [plan, check]
-    if: needs.plan.outputs.run == 'true' && startsWith(github.ref, 'refs/tags/v')
+    needs: await-master-check
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

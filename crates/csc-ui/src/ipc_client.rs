@@ -334,6 +334,10 @@ fn kill_core_by_lock(force: bool) {
 /// Ask the kernel to exit; if it is still alive shortly after, force-kill via lock PID.
 pub fn quit_core() -> anyhow::Result<()> {
     QUITTING.store(true, Ordering::SeqCst);
+    if crate::admin_service::active() {
+        // The service owns that core; it keeps running without the window.
+        return Ok(());
+    }
     let _ = call_raw("quit", &json!({})).and_then(decode_response);
     for _ in 0..15 {
         std::thread::sleep(Duration::from_millis(100));
@@ -353,6 +357,9 @@ pub fn quit_core() -> anyhow::Result<()> {
 /// then exit this process. Title-bar ✕ with `close_to_tray` must not call this.
 pub fn force_quit_now() -> ! {
     QUITTING.store(true, Ordering::SeqCst);
+    if crate::admin_service::active() {
+        std::process::exit(0);
+    }
     let _ = std::thread::Builder::new()
         .name("csc-quit-ipc".into())
         .spawn(|| {

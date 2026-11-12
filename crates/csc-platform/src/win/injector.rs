@@ -44,6 +44,7 @@ impl WinInputInjector {
 
 impl InputInjector for WinInputInjector {
     fn mouse_move_abs(&mut self, x: i32, y: i32) {
+        super::desktop::follow_input_desktop();
         self.last_pos = Some((x, y));
         let (dx, dy) = normalize(x, y);
         unsafe {
@@ -52,6 +53,7 @@ impl InputInjector for WinInputInjector {
     }
 
     fn mouse_move_rel(&mut self, dx: i32, dy: i32) {
+        super::desktop::follow_input_desktop();
         unsafe {
             let _ = SendInput(&[mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)], size_of_input());
         }
@@ -74,6 +76,10 @@ impl InputInjector for WinInputInjector {
             (4, false) => (MOUSEEVENTF_XUP, XBUTTON2),
             _ => return,
         };
+        super::desktop::follow_input_desktop();
+        if down {
+            super::elevation::check_foreground();
+        }
         let (dx, dy) = self.normalized_pos();
         // One SendInput: first park at the last absolute point, then press/release
         // with the same coordinates, so the events are not split across APIs.
@@ -89,6 +95,7 @@ impl InputInjector for WinInputInjector {
     }
 
     fn mouse_wheel(&mut self, v: i32, h: i32) {
+        super::desktop::follow_input_desktop();
         let (dx, dy) = self.normalized_pos();
         unsafe {
             if v != 0 {
@@ -116,6 +123,10 @@ impl InputInjector for WinInputInjector {
         }
         if !down {
             flags |= KEYEVENTF_KEYUP;
+        }
+        super::desktop::follow_input_desktop();
+        if down {
+            super::elevation::check_foreground();
         }
         unsafe {
             let input = INPUT {

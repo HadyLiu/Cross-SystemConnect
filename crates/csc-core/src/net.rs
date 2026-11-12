@@ -3,7 +3,11 @@
 //! The keyboard host (server) searches a UDP port and then connects to the client.
 //! The client sends an announce to that same port and accepts the TCP connection.
 //! The client also dials the host back when it hears a search, because a firewall
-//! often drops inbound TCP on one side only. Each side keeps one link per peer.
+//! often drops inbound TCP on one side only. A client that was linked with a
+//! trusted host before dials it outbound on its own (`known-hosts.json`), right
+//! after start and after every disconnect, like Deskflow; that connection wins
+//! over one the host opened. The client also opens the data connection to the
+//! host's data port. Each side keeps one link per peer.
 //! UDP only carries the computer name and port. The TCP session is always TLS 1.3,
 //! with the client as the TLS server whichever side opened the TCP connection.
 
@@ -55,6 +59,28 @@ pub struct Link {
     kill: watch::Sender<bool>,
     since: Instant,
     info: Arc<std::sync::Mutex<PeerInfo>>,
+    /// The controlled computer opened this TCP connection (outbound from it).
+    /// Like Deskflow, that direction passes a VPN/TUN on the controlled side
+    /// (Clash), so it wins over a connection the keyboard host opened.
+    client_opened: bool,
+}
+
+/// Whether an existing session stays when another connection to the same
+/// computer finishes its handshake. A connection the controlled computer opened
+/// always beats one the keyboard host opened, so both sides keep the same one.
+/// Between two of the same kind, a young session stays (the two sides dialed at
+/// once) and an older one is replaced (its peer has given it up).
+fn keep_existing(
+    old_client_opened: bool,
+    old_age: Duration,
+    new_client_opened: bool,
+    min_age: Duration,
+) -> bool {
+    match (old_client_opened, new_client_opened) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => old_age < min_age,
+    }
 }
 
 /// The session end of a `Link`.
@@ -65,7 +91,7 @@ pub struct LinkRx {
     info: Arc<std::sync::Mutex<PeerInfo>>,
 }
 
-fn new_link() -> (Link, LinkRx) {
+fn new_link(client_opened: bool) -> (Link, LinkRx) {
     let (tx, rx) = mpsc::channel(64);
     let (btx, brx) = mpsc::channel(4);
     let (ktx, krx) = watch::channel(false);
@@ -77,6 +103,7 @@ fn new_link() -> (Link, LinkRx) {
             kill: ktx,
             since: Instant::now(),
             info: info.clone(),
+            client_opened,
         },
         LinkRx {
             rx,
@@ -138,7 +165,14 @@ impl PeerTable {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(k, l)| (k.clone(), l.clone()));
             if let Some((key, old)) = old {
-                if !old.same(&link) && old.since.elapsed() < min_age {
+                if !old.same(&link)
+                    && keep_existing(
+                        old.client_opened,
+                        old.since.elapsed(),
+                        link.client_opened,
+                        min_age,
+                    )
+                {
                     return false;
                 }
                 if !old.same(&link) {
@@ -153,6 +187,12 @@ impl PeerTable {
             *active = name.to_string();
         }
         true
+    }
+
+    /// Who opened the session kept for `name`, and how old it is.
+    async fn link_meta(&self, name: &str) -> Option<(bool, Duration)> {
+        let txs = self.txs.lock().await;
+        Self::find(&txs, name).map(|l| (l.client_opened, l.since.elapsed()))
     }
 
     /// Insert only when no link to `name` exists yet.
@@ -334,6 +374,16 @@ pub struct NetHub {
 }
 
 impl NetHub {
+    /// A hub with no connections, for tests: every send goes nowhere.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        Self {
+            peers: PeerTable::new(),
+            last_peers: Arc::new(Mutex::new(HashMap::new())),
+            held_off: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     /// Send to `peer` without making it the target of forwarded input.
     pub async fn send_control(&self, peer: &str, frame: Vec<u8>) {
         self.peers.send_to(peer, frame).await;
@@ -1294,6 +1344,62 @@ async fn already_greeted_at_ip(peers: &PeerTable, inbound: &Wires, ip: IpAddr) -
     false
 }
 
+fn unreachable_dial(text: &str) -> bool {
+    text.contains("timed out")
+        || text.contains("Connection refused")
+        || text.contains("Network is unreachable")
+        || text.contains("No route to host")
+}
+
+/// Unreachable-dial notes per IP: at most one every `DIAL_NOTE_EVERY`.
+const DIAL_NOTE_EVERY: Duration = Duration::from_secs(10 * 60);
+
+fn dial_failure_worth_noting(ip: IpAddr, now: Instant) -> bool {
+    static LAST: std::sync::Mutex<Option<HashMap<IpAddr, Instant>>> = std::sync::Mutex::new(None);
+    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get(&ip) {
+        Some(at) if now.saturating_duration_since(*at) < DIAL_NOTE_EVERY => false,
+        _ => {
+            map.insert(ip, now);
+            true
+        }
+    }
+}
+
+/// Keyboard host: a trusted controlled computer dialed in while a session to its
+/// IP exists. If every existing session is one this host opened, or the
+/// controlled side's own older one, close them so the new connection is the one
+/// both sides keep. Never during pairing: a typed code owns that slot.
+/// True when the slot is free for the new connection.
+async fn take_over_for_client_dial(
+    live: &Arc<RwLock<Config>>,
+    peers: &PeerTable,
+    inbound: &Wires,
+    app_status: &Arc<RwLock<AppStatus>>,
+    ip: IpAddr,
+) -> bool {
+    let keys = session_keys_for_ip(peers, inbound, ip).await;
+    if keys.is_empty()
+        || offer_ready(app_status).await
+        || !ip_looks_trusted(live, inbound, ip).await
+    {
+        return false;
+    }
+    for key in &keys {
+        if let Some((client_opened, age)) = peers.link_meta(key).await {
+            if keep_existing(client_opened, age, true, DUPLICATE_LINK) {
+                return false;
+            }
+        }
+    }
+    for key in keys {
+        info!("{ip} dialed in; replacing session {key} that this host opened");
+        peers.kill_remove(&key).await;
+    }
+    true
+}
+
 /// Drop incomplete (or any) sessions to `ip` so a typed pairing-code dial can own the slot.
 async fn drop_sessions_to_ip(peers: &PeerTable, inbound: &Wires, ip: IpAddr) {
     for key in session_keys_for_ip(peers, inbound, ip).await {
@@ -1540,17 +1646,20 @@ fn spawn_server_link(
                     .await;
                 }
                 Err(e) => {
-                    warn!(
-                        "connect {addr}: {e:#} (the client's firewall may block inbound TCP; waiting for it to dial back)"
-                    );
                     let text = format!("{e:#}");
-                    if text.contains("timed out")
-                        || text.contains("Connection refused")
-                        || text.contains("Network is unreachable")
-                        || text.contains("No route to host")
-                    {
+                    if unreachable_dial(&text) {
+                        // Expected when the controlled computer drops inbound TCP
+                        // (Clash TUN): it dials this host itself. Say so once.
+                        if dial_failure_worth_noting(addr.ip(), Instant::now()) {
+                            info!(
+                                "connect {addr}: {text} (inbound TCP to {key} looks blocked; it dials this host itself; further failures are logged at debug)"
+                            );
+                        } else {
+                            debug!("connect {addr}: {text}");
+                        }
                         note_waiting_dialback(&app_status).await;
                     } else {
+                        warn!("connect {addr}: {text}");
                         note_handshake_failed(&app_status, &text).await;
                     }
                 }
@@ -1616,10 +1725,15 @@ async fn host_link_session<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, rx) = new_link();
+    // Accepted here means the controlled computer dialed us.
+    let (tx, rx) = new_link(!dialed);
     if replace {
         // Who typed the code initiates — own the slot.
         drop_sessions_to_ip(peers, &inbound, peer_addr.ip()).await;
+    } else if !dialed
+        && take_over_for_client_dial(live, peers, &inbound, app_status, peer_addr.ip()).await
+    {
+        // The controlled computer's own connection replaced ours (see `keep_existing`).
     } else if already_linked_to_ip(peers, &inbound, peer_addr.ip()).await {
         // Discovery/redial must not fight an existing (or offer) session.
         debug!(
@@ -1754,8 +1868,23 @@ async fn run_client(
         inbound: inbound.clone(),
         rejected: rejected.clone(),
         stop: stop_rx.clone(),
+        hosts: KnownHosts::load(config_path.parent().unwrap_or_else(|| Path::new("."))),
     };
     let dialing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Trusted hosts are dialed outbound from here first, without waiting for UDP.
+    let mut host_redial = Redial::fast();
+    let mut redial_tick = tokio::time::interval(Duration::from_millis(250));
+    redial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let known = ctx.hosts.list();
+    if !known.is_empty() {
+        info!(
+            "dialing known keyboard host(s) {:?} outbound",
+            known
+                .iter()
+                .map(|(n, a)| format!("{n}@{a}"))
+                .collect::<Vec<_>>()
+        );
+    }
     // Inbound TCP that has not finished yet. Do not dial the host again meanwhile.
     let incoming: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     // Dial the host only if its own connection has not arrived within a second.
@@ -1770,6 +1899,34 @@ async fn run_client(
     let kick = inbound.kick.clone();
     loop {
         tokio::select! {
+            _ = redial_tick.tick() => {
+                let now = Instant::now();
+                let pairing = offer_ready(&ctx.app_status).await;
+                for (name, addr) in ctx.hosts.list() {
+                    let key = addr.ip().to_string();
+                    if ctx.peers.contains(&key).await {
+                        host_redial.reset(&key);
+                        continue;
+                    }
+                    // A typed pairing code owns the next dial.
+                    if pairing || !live.read().await.is_trusted_peer(&name) {
+                        continue;
+                    }
+                    if is_held_off(&inbound, &[&key, &name]).await {
+                        continue;
+                    }
+                    if incoming.lock().await.contains_key(&key)
+                        || dialing.lock().await.contains(&key)
+                        || !host_redial.due(&key, now)
+                    {
+                        continue;
+                    }
+                    if dialing.lock().await.insert(key.clone()) {
+                        debug!("dialing keyboard host {name} at {addr}");
+                        spawn_client_dial(ctx.clone(), dialing.clone(), key, addr);
+                    }
+                }
+            }
             _ = tick.tick() => {
                 expire_stale_offer(app_status).await;
                 manual_tick = manual_tick.wrapping_add(1);
@@ -1921,6 +2078,7 @@ struct ClientCtx {
     inbound: Wires,
     rejected: Arc<Mutex<HashMap<String, RejectMark>>>,
     stop: watch::Receiver<bool>,
+    hosts: KnownHosts,
 }
 
 async fn dial_client_manual(ctx: &ClientCtx, dialing: &Arc<Mutex<HashSet<String>>>) {
@@ -1975,7 +2133,7 @@ fn spawn_client_dial(
 /// Outbound dials are the TLS client; inbound accepts are the TLS server.
 async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr, dialed: bool) {
     let key = peer.ip().to_string();
-    let (tx, rx) = new_link();
+    let (tx, rx) = new_link(dialed);
     let registered = Arc::new(AtomicBool::new(false));
     let link = ClientLink {
         peers: ctx.peers.clone(),
@@ -1983,6 +2141,7 @@ async fn client_link(ctx: ClientCtx, tcp: TcpStream, peer: SocketAddr, dialed: b
         key: key.clone(),
         tx: tx.clone(),
         registered: registered.clone(),
+        hosts: ctx.hosts.clone(),
     };
     let admit = Admit {
         app_status: ctx.app_status.clone(),
@@ -2164,25 +2323,42 @@ async fn release_hold(inbound: &Wires, keys: &[&str]) {
 }
 
 /// Back-off for redialing a controlled computer that was linked before.
-#[derive(Default)]
 struct Redial {
     next: HashMap<String, (Instant, Duration)>,
+    first: Duration,
+    max: Duration,
+}
+
+impl Default for Redial {
+    fn default() -> Self {
+        Self {
+            next: HashMap::new(),
+            first: Duration::from_millis(500),
+            max: Duration::from_secs(10),
+        }
+    }
 }
 
 impl Redial {
-    const FIRST: Duration = Duration::from_millis(500);
-    const MAX: Duration = Duration::from_secs(10);
+    /// Controlled computer dialing its keyboard host: 0.5 s, 1 s, 2 s, then every 3 s.
+    fn fast() -> Self {
+        Self {
+            max: Duration::from_secs(3),
+            ..Self::default()
+        }
+    }
 
     fn due(&mut self, key: &str, now: Instant) -> bool {
+        let first = self.first;
         let entry = self
             .next
             .entry(key.to_ascii_lowercase())
-            .or_insert((now, Self::FIRST));
+            .or_insert((now, first));
         if now < entry.0 {
             return false;
         }
         entry.0 = now + entry.1;
-        entry.1 = (entry.1 * 2).min(Self::MAX);
+        entry.1 = (entry.1 * 2).min(self.max);
         true
     }
 
@@ -2449,6 +2625,111 @@ struct ClientLink {
     tx: Link,
     /// Set once the session is in the peer table.
     registered: Arc<AtomicBool>,
+    /// Trusted keyboard hosts this computer dials on its own.
+    hosts: KnownHosts,
+}
+
+/// Controlled computer: keyboard hosts it was linked with, by name, kept in
+/// `known-hosts.json` beside the config. It dials them outbound right after
+/// start and after every disconnect, like Deskflow, so a VPN/TUN that drops
+/// inbound TCP on this computer (Clash) does not keep the link down.
+#[derive(Clone)]
+struct KnownHosts {
+    path: Option<PathBuf>,
+    map: Arc<std::sync::Mutex<HashMap<String, SocketAddr>>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct KnownHostsFile {
+    #[serde(default)]
+    hosts: Vec<KnownHostEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KnownHostEntry {
+    name: String,
+    address: SocketAddr,
+}
+
+impl KnownHosts {
+    const FILE: &'static str = "known-hosts.json";
+
+    fn load(dir: &Path) -> Self {
+        let path = dir.join(Self::FILE);
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<KnownHostsFile>(&t).ok())
+            .map(|f| {
+                f.hosts
+                    .into_iter()
+                    .filter(|h| !h.name.trim().is_empty())
+                    .map(|h| (h.name, h.address))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            path: Some(path),
+            map: Arc::new(std::sync::Mutex::new(map)),
+        }
+    }
+
+    #[cfg(test)]
+    fn in_memory() -> Self {
+        Self {
+            path: None,
+            map: Arc::default(),
+        }
+    }
+
+    /// Remember where host `name` listens. Saved only when something changed.
+    fn note(&self, name: &str, addr: SocketAddr) {
+        let name = name.trim();
+        if name.is_empty() || addr.port() == 0 {
+            return;
+        }
+        let snapshot = {
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let old = map
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(k, a)| (k.clone(), *a));
+            if old.as_ref().is_some_and(|(_, a)| *a == addr) {
+                return;
+            }
+            if let Some((k, _)) = old {
+                map.remove(&k);
+            }
+            // One host per address: a renamed host replaces the old name.
+            map.retain(|_, a| *a != addr);
+            map.insert(name.to_string(), addr);
+            map.iter()
+                .map(|(k, a)| KnownHostEntry {
+                    name: k.clone(),
+                    address: *a,
+                })
+                .collect::<Vec<_>>()
+        };
+        let Some(path) = &self.path else {
+            return;
+        };
+        match serde_json::to_string_pretty(&KnownHostsFile { hosts: snapshot }) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(path, text) {
+                    warn!("save {}: {e}", path.display());
+                }
+            }
+            Err(e) => warn!("encode known hosts: {e}"),
+        }
+    }
+
+    fn list(&self) -> Vec<(String, SocketAddr)> {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, a)| (k.clone(), *a))
+            .collect()
+    }
 }
 
 struct Admit {
@@ -2501,6 +2782,7 @@ where
         status: status.clone(),
         bulk: std::sync::Mutex::new(None),
         fingerprint: peer_fp.clone(),
+        gen: 0,
     });
     let is_host = admit.is_none();
     let (mut reader, writer) = tokio::io::split(stream);
@@ -2541,6 +2823,8 @@ where
 
     let mut buf = BytesMut::with_capacity(64 * 1024);
     let peer_data_port;
+    // Controlled computer: where the keyboard host listens, for dialing it later.
+    let mut host_listen: Option<(String, u16)> = None;
     if let Some(admit) = admit {
         let (remote, _early) = match tokio::time::timeout(
             Duration::from_secs(5),
@@ -2584,6 +2868,9 @@ where
             return Ok(());
         }
         let announced = remote.clone();
+        if !remote.host_name.is_empty() && remote.ports.control != 0 {
+            host_listen = Some((remote.host_name.clone(), remote.ports.control));
+        }
         let name = if remote.host_name.is_empty() {
             admit.address.clone()
         } else {
@@ -2804,16 +3091,12 @@ where
         let _ = inbound.events.send(InboundEvent::Hello(remote)).await;
     }
 
-    if is_host && peer_data_port != cfg.control_port {
+    if peer_data_port != 0 && peer_data_port != cfg.control_port {
         let addr = SocketAddr::new(remote_ip, peer_data_port);
         let identity = identity.clone();
         let token = data_token;
         let who = peer_fp.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dial_data(&identity, addr, &token, &who).await {
-                warn!("data connection to {addr}: {e:#}");
-            }
-        });
+        tokio::spawn(open_data_channel(identity, addr, token, who, is_host));
     }
 
     if let Some(link) = link {
@@ -2826,6 +3109,9 @@ where
             return Ok(());
         }
         link.registered.store(true, Ordering::Release);
+        if let Some((name, port)) = &host_listen {
+            link.hosts.note(name, SocketAddr::new(remote_ip, *port));
+        }
         refresh_link_status(&link.status, &link.peers).await;
     }
 
@@ -2860,7 +3146,7 @@ where
     let mut held_bulk: Option<Vec<u8>> = None;
     let mut bulk_on_control = false;
     let mut bulk_on_data = false;
-    let bulk_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let bulk_deadline = tokio::time::Instant::now() + BULK_WAIT_FOR_DATA;
 
     let mut tmp = [0u8; 16 * 1024];
     loop {
@@ -3927,6 +4213,8 @@ struct DataSlot {
     is_host: bool,
     status: Arc<RwLock<NetStatus>>,
     bulk: std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Set by `DataReg::insert`.
+    gen: u64,
 }
 
 fn data_open() -> &'static std::sync::Mutex<HashMap<String, DataSlot>> {
@@ -3935,16 +4223,22 @@ fn data_open() -> &'static std::sync::Mutex<HashMap<String, DataSlot>> {
     CELL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-struct DataReg(String);
+/// One session's entry in `data_open`. A newer session to the same computer
+/// (same certificate) replaces the entry; the older one ending must not remove it.
+struct DataReg(String, u64);
+
+static DATA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DataReg {
-    fn insert(slot: DataSlot) -> Self {
+    fn insert(mut slot: DataSlot) -> Self {
         let fingerprint = slot.fingerprint.clone();
+        let gen = DATA_GEN.fetch_add(1, Ordering::Relaxed);
+        slot.gen = gen;
         data_open()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(fingerprint.clone(), slot);
-        DataReg(fingerprint)
+        DataReg(fingerprint, gen)
     }
 }
 
@@ -4002,19 +4296,28 @@ fn attach_bulk(fingerprint: &str, tx: mpsc::UnboundedSender<Vec<u8>>) -> bool {
     true
 }
 
-fn detach_bulk(fingerprint: &str) {
+fn detach_bulk(fingerprint: &str, mine: &mpsc::WeakUnboundedSender<Vec<u8>>) {
     let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = map.get(fingerprint) {
-        *slot.bulk.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut bulk = slot.bulk.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = match (bulk.as_ref(), mine.upgrade()) {
+            (Some(cur), Some(me)) => cur.same_channel(&me),
+            // Our sender is gone: whatever is attached now belongs to another connection.
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if ours {
+            *bulk = None;
+        }
     }
 }
 
 impl Drop for DataReg {
     fn drop(&mut self) {
-        data_open()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+        let mut map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.0).is_some_and(|slot| slot.gen == self.1) {
+            map.remove(&self.0);
+        }
     }
 }
 
@@ -4070,6 +4373,69 @@ async fn spawn_data_listener(identity: &Arc<crate::tls::Identity>, addr: SocketA
     }
 }
 
+/// Queued file data waits this long for the data connection, then uses control.
+const BULK_WAIT_FOR_DATA: Duration = Duration::from_secs(3);
+/// Keyboard host: give the controlled computer this long to open the data
+/// connection itself before dialing its data port (older builds never do).
+const HOST_DATA_GRACE: Duration = Duration::from_millis(1200);
+/// Controlled computer: tries to open the data connection to the host.
+const CLIENT_DATA_TRIES: u32 = 4;
+
+/// Open the data connection for one control session. The controlled computer
+/// dials the host's data port outbound right away (passes Clash TUN on it); the
+/// host dials only when nothing attached within `HOST_DATA_GRACE`.
+async fn open_data_channel(
+    identity: Arc<crate::tls::Identity>,
+    addr: SocketAddr,
+    token: [u8; 32],
+    who: String,
+    is_host: bool,
+) {
+    if is_host {
+        tokio::time::sleep(HOST_DATA_GRACE).await;
+    }
+    let tries = if is_host { 1 } else { CLIENT_DATA_TRIES };
+    for attempt in 1..=tries {
+        if !data_session_open(&who) || data_attached(&who) {
+            return;
+        }
+        match dial_data(&identity, addr, &token, &who).await {
+            Ok(()) => return,
+            Err(e) if attempt == tries => {
+                if is_host {
+                    debug!("data connection to {addr}: {e:#} (file data uses the control connection unless the other side connects)");
+                } else {
+                    warn!("data connection to keyboard host {addr}: {e:#}; file data uses the control connection");
+                }
+            }
+            Err(e) => {
+                debug!("data connection to {addr} (try {attempt}): {e:#}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+fn data_session_open(fingerprint: &str) -> bool {
+    data_open()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(fingerprint)
+}
+
+fn data_attached(fingerprint: &str) -> bool {
+    let map = data_open().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(fingerprint).is_some_and(|slot| {
+        slot.bulk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed())
+    })
+}
+
+/// Err only when the connection or its handshake failed; once attached, the
+/// data connection ending is Ok (the session decides what happens next).
 async fn dial_data(
     identity: &crate::tls::Identity,
     addr: SocketAddr,
@@ -4084,7 +4450,11 @@ async fn dial_data(
     };
     let frame = encode_json_frame(MsgType::DataAttach, &attach)?;
     write_timeout(&mut stream, &frame).await?;
-    serve_data(stream, fingerprint, BytesMut::new()).await
+    info!("data channel to {addr} open");
+    if let Err(e) = serve_data(stream, fingerprint, BytesMut::new()).await {
+        debug!("data connection to {addr} closed: {e:#}");
+    }
+    Ok(())
 }
 
 /// File frames travel on this socket once DATA_ATTACH has succeeded.
@@ -4093,16 +4463,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let mine = tx.downgrade();
     if !attach_bulk(fingerprint, tx) {
         anyhow::bail!("no control session for data channel");
     }
-    struct Detach<'a>(&'a str);
+    // A second data connection (both sides dialed) replaces this one's sender;
+    // closing this one must not detach the newer connection.
+    struct Detach<'a>(&'a str, mpsc::WeakUnboundedSender<Vec<u8>>);
     impl Drop for Detach<'_> {
         fn drop(&mut self) {
-            detach_bulk(self.0);
+            detach_bulk(self.0, &self.1);
         }
     }
-    let _detach = Detach(fingerprint);
+    let _detach = Detach(fingerprint, mine);
     let mut tmp = [0u8; 16 * 1024];
     loop {
         tokio::select! {
@@ -4262,9 +4635,9 @@ mod tests {
     #[tokio::test]
     async fn a_young_session_is_not_replaced_by_the_other_dial() {
         let peers = PeerTable::new();
-        let (first, rx1) = new_link();
+        let (first, rx1) = new_link(false);
         assert!(peers.adopt("hady", first, DUPLICATE_LINK).await);
-        let (second, rx2) = new_link();
+        let (second, rx2) = new_link(false);
         assert!(!peers.adopt("hady", second, DUPLICATE_LINK).await);
         assert!(!*rx1.kill.borrow());
         assert!(!*rx2.kill.borrow());
@@ -4274,12 +4647,100 @@ mod tests {
     #[tokio::test]
     async fn an_old_session_is_replaced_when_the_peer_dials_again() {
         let peers = PeerTable::new();
-        let (first, rx1) = new_link();
+        let (first, rx1) = new_link(false);
         assert!(peers.adopt("hady", first, Duration::ZERO).await);
-        let (second, _rx2) = new_link();
+        let (second, _rx2) = new_link(false);
         assert!(peers.adopt("hady", second, Duration::ZERO).await);
         assert!(*rx1.kill.borrow());
         assert!(peers.contains("hady").await);
+    }
+
+    #[test]
+    fn the_controlled_sides_connection_always_wins() {
+        let young = Duration::from_millis(10);
+        let old = Duration::from_secs(60);
+        // Existing host-opened, new client-opened: replaced, however young.
+        assert!(!keep_existing(false, young, true, DUPLICATE_LINK));
+        // Existing client-opened, new host-opened: kept, however old.
+        assert!(keep_existing(true, old, false, DUPLICATE_LINK));
+        // Same kind: the young one stays, an old one is replaced.
+        assert!(keep_existing(true, young, true, DUPLICATE_LINK));
+        assert!(!keep_existing(true, old, true, DUPLICATE_LINK));
+        assert!(keep_existing(false, young, false, DUPLICATE_LINK));
+    }
+
+    #[tokio::test]
+    async fn a_client_dial_replaces_the_hosts_fresh_session() {
+        let peers = PeerTable::new();
+        let (host_opened, rx1) = new_link(false);
+        assert!(peers.adopt("SH-NB-246", host_opened, DUPLICATE_LINK).await);
+        let (client_opened, rx2) = new_link(true);
+        assert!(
+            peers
+                .adopt("SH-NB-246", client_opened, DUPLICATE_LINK)
+                .await
+        );
+        assert!(*rx1.kill.borrow(), "the host-opened session is closed");
+        assert!(!*rx2.kill.borrow());
+        assert_eq!(peers.link_meta("sh-nb-246").await.map(|m| m.0), Some(true));
+        // And a later host dial never takes it back.
+        let (again, rx3) = new_link(false);
+        assert!(!peers.adopt("SH-NB-246", again, Duration::ZERO).await);
+        assert!(!*rx2.kill.borrow());
+        drop(rx3);
+    }
+
+    #[test]
+    fn controlled_side_redials_its_host_fast() {
+        let mut r = Redial::fast();
+        let t0 = Instant::now();
+        assert!(r.due("10.10.10.9", t0), "first dial is immediate");
+        let mut at = t0;
+        for gap in [500u64, 1000, 2000, 3000, 3000] {
+            assert!(!r.due("10.10.10.9", at + Duration::from_millis(gap - 1)));
+            at += Duration::from_millis(gap);
+            assert!(r.due("10.10.10.9", at));
+        }
+        r.reset("10.10.10.9");
+        assert!(
+            r.due("10.10.10.9", at),
+            "after a session, the next dial is immediate"
+        );
+    }
+
+    #[test]
+    fn known_hosts_are_saved_and_loaded() {
+        let dir = std::env::temp_dir().join(format!("csc-known-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let addr: SocketAddr = "10.10.10.9:45277".parse().unwrap();
+        let hosts = KnownHosts::load(&dir);
+        assert!(hosts.list().is_empty());
+        hosts.note("hady-one", addr);
+        hosts.note("", addr);
+        let again = KnownHosts::load(&dir);
+        assert_eq!(again.list(), vec![("hady-one".to_string(), addr)]);
+        // A renamed host at the same address replaces the old name.
+        again.note("hady-two", addr);
+        assert_eq!(
+            KnownHosts::load(&dir).list(),
+            vec![("hady-two".to_string(), addr)]
+        );
+        let mem = KnownHosts::in_memory();
+        mem.note("x", addr);
+        assert_eq!(mem.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreachable_dials_are_noted_once_in_a_while() {
+        let ip: IpAddr = "10.99.0.1".parse().unwrap();
+        let t0 = Instant::now();
+        assert!(dial_failure_worth_noting(ip, t0));
+        assert!(!dial_failure_worth_noting(ip, t0 + Duration::from_secs(4)));
+        assert!(dial_failure_worth_noting(ip, t0 + DIAL_NOTE_EVERY));
+        assert!(unreachable_dial("connect 10.10.10.10:45277 timed out"));
+        assert!(!unreachable_dial("tls handshake eof"));
     }
 
     #[test]
@@ -4341,9 +4802,9 @@ mod tests {
     #[tokio::test]
     async fn rekey_keeps_existing_hostname_session() {
         let peers = PeerTable::new();
-        let (host_link, host_rx) = new_link();
+        let (host_link, host_rx) = new_link(false);
         assert!(peers.insert_new("Desk", host_link).await);
-        let (ip_link, ip_rx) = new_link();
+        let (ip_link, ip_rx) = new_link(false);
         assert!(peers.insert_new("192.168.1.26", ip_link).await);
         // Newcomer must not kill the hostname session.
         assert!(!peers.rekey("192.168.1.26", "Desk").await);
@@ -4357,7 +4818,7 @@ mod tests {
     #[tokio::test]
     async fn rekey_moves_ip_session_to_hostname() {
         let peers = PeerTable::new();
-        let (ip_link, rx) = new_link();
+        let (ip_link, rx) = new_link(false);
         assert!(peers.insert_new("192.168.1.26", ip_link).await);
         assert!(peers.rekey("192.168.1.26", "Desk").await);
         assert!(peers.contains("Desk").await);

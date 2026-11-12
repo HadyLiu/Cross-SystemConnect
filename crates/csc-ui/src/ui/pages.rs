@@ -551,6 +551,29 @@ pub fn draw_system(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
+        if cfg!(windows) {
+            if let Some(err) = crate::admin_service::take_error() {
+                app.set_err(err);
+            }
+            list.row(
+                tr(
+                    "以管理员服务运行（可操作管理员窗口）",
+                    "Run as admin service (control admin windows)",
+                ),
+                tr(
+                    "安装系统服务，让对方能操作以管理员运行的程序、UAC 提示和登录界面。切换时会弹出 UAC 并重启本程序。",
+                    "Installs a system service so the other side can control admin apps, UAC prompts and the sign-in screen. Asks for UAC and restarts the app.",
+                ),
+                |ui| {
+                    let mut on = crate::admin_service::installed();
+                    let busy = crate::admin_service::busy();
+                    let resp = ui.add_enabled_ui(!busy, |ui| mac_toggle(ui, &p, &mut on)).inner;
+                    if resp.clicked() && !busy {
+                        crate::admin_service::toggle(on);
+                    }
+                },
+            );
+        }
     });
 
     section_heading(ui, &p, tr("隐私与诊断", "Privacy & diagnostics"));

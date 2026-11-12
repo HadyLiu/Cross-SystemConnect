@@ -40,7 +40,7 @@ unsafe fn folder_of_foreground() -> Option<PathBuf> {
 unsafe fn desktop_dir() -> Option<PathBuf> {
     let pw = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None).ok()?;
     let path = pw.to_string().ok()?;
-    let _ = windows::Win32::System::Com::CoTaskMemFree(Some(pw.0 as *const _));
+    windows::Win32::System::Com::CoTaskMemFree(Some(pw.0 as *const _));
     if path.is_empty() {
         None
     } else {

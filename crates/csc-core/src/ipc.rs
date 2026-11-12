@@ -101,13 +101,27 @@ pub async fn serve_ipc(bound: IpcBound, state: Arc<AppState>) -> anyhow::Result<
 fn claim_pipe() -> anyhow::Result<IpcBound> {
     use tokio::net::windows::named_pipe::ServerOptions;
     const PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
-    match ServerOptions::new().first_pipe_instance(true).create(PIPE) {
+    match create_pipe(ServerOptions::new().first_pipe_instance(true)) {
         Ok(server) => {
             info!("IPC listening on {PIPE}");
             Ok(IpcBound::Pipe(server))
         }
         Err(err) if pipe_busy(&err) => Err(IpcBusy.into()),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// An elevated (service mode) core opens the pipe to the signed-in user;
+/// a normal core keeps the default descriptor.
+#[cfg(windows)]
+fn create_pipe(
+    opts: &mut tokio::net::windows::named_pipe::ServerOptions,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    const PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
+    match csc_platform::win::security::user_pipe_security() {
+        // SAFETY: the attributes live until `sec` drops after the call.
+        Some(mut sec) => unsafe { opts.create_with_security_attributes_raw(PIPE, sec.as_ptr()) },
+        None => opts.create(PIPE),
     }
 }
 
@@ -125,13 +139,12 @@ async fn serve_pipe(
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    const PIPE: &str = r"\\.\pipe\Cross-SystemConnect-core";
     let mut pending = Some(first);
     loop {
         let server = if let Some(server) = pending.take() {
             server
         } else {
-            ServerOptions::new().create(PIPE)?
+            create_pipe(&mut ServerOptions::new())?
         };
         server.connect().await?;
         let st = state.clone();
